@@ -68,13 +68,13 @@ WORKDIR /app
 # Dependencies before source: editing a Python file must not re-resolve or
 # re-download the dependency set.
 COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
 COPY src ./src
 # --no-editable installs a real copy into site-packages, so the runtime image
 # does not need /app/src on disk and nothing in the image points at a build path.
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable
 
 
