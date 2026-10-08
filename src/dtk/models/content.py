@@ -115,6 +115,14 @@ class Author(_Base):
     avatar: Image | None = None
     web_url: str | None = None
     verified: bool = False
+    #: When TikTok itself last recorded a change to the ``unique_id`` handle
+    #: (``uniqueIdModifyTime``) / ``nickname`` (``nickNameModifyTime``), as
+    #: timezone-aware UTC datetimes. TikTok sends 0 for "never changed",
+    #: which normalizes to ``None`` - absent is None, never 0, per this
+    #: module's rules. There is no equivalent field for the bio
+    #: (``signature``): TikTok does not expose when it last changed.
+    unique_id_changed_at: datetime | None = None
+    nickname_changed_at: datetime | None = None
     #: Usually absent in list endpoints, which return an abbreviated author.
     stats: AuthorStats | None = None
     raw: dict | None = None
