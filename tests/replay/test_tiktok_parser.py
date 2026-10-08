@@ -329,6 +329,14 @@ def test_empty_post_list_is_not_risk_control() -> None:
     assert page.items == []
 
 
+def test_an_absent_post_list_is_an_empty_page_not_a_broken_payload() -> None:
+    """An account with no posts gets no itemList key at all, not an empty list."""
+    page = parser.parse_author_posts({"hasMore": False, "statusCode": 0}, fetched_at=FETCHED_AT)
+    assert page.items == []
+    assert page.has_more is False
+    assert page.cursor is None
+
+
 # --------------------------------------------------------------------------
 # Author bookmark folders (collections)
 #

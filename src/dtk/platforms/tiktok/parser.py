@@ -461,7 +461,14 @@ def parse_author_list(payload: Mapping[str, Any]) -> Page[Author]:
 def parse_author_posts(payload: Mapping[str, Any], *, fetched_at: datetime) -> Page[Content]:
     """Parse ``/api/post/item_list/``."""
     root = _guard(payload)
-    items = [content_from_node(item, fetched_at=fetched_at) for item in root.children("itemList")]
+    # An account with no posts omits `itemList` entirely rather than sending
+    # `[]` — the same absent-means-empty convention as `userList` and
+    # `collectionList`. Absent is therefore an empty page; a list that IS
+    # present stays strict, so a malformed entry is still reported rather than
+    # silently dropped.
+    items = ([content_from_node(item, fetched_at=fetched_at)
+              for item in root.children("itemList")]
+             if root.has("itemList") else [])
     has_more = optional_bool(root.present("hasMore"))
     cursor = optional_id(root.get("cursor")) if has_more else None
     if has_more and cursor is None:
