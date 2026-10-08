@@ -295,6 +295,26 @@ def test_verified_flag_is_read_from_the_user_object() -> None:
     assert parser.parse_author(payload).verified is True
 
 
+def test_modify_times_come_from_tiktok_itself() -> None:
+    """uniqueIdModifyTime/nickNameModifyTime are TikTok's own last-change stamps."""
+    payload = fixture("user_profile")
+    payload["userInfo"]["user"]["uniqueIdModifyTime"] = 1700000000
+    payload["userInfo"]["user"]["nickNameModifyTime"] = 1638559600
+    author = parser.parse_author(payload)
+    assert author.unique_id_changed_at == datetime(2023, 11, 14, 22, 13, 20, tzinfo=UTC)
+    assert author.nickname_changed_at == datetime(2021, 12, 3, 19, 26, 40, tzinfo=UTC)
+
+
+def test_zero_modify_time_means_never_changed() -> None:
+    """TikTok sends 0 for "never changed since account creation" -> None."""
+    payload = fixture("user_profile")
+    payload["userInfo"]["user"]["uniqueIdModifyTime"] = 0
+    # nickNameModifyTime absent entirely
+    author = parser.parse_author(payload)
+    assert author.unique_id_changed_at is None
+    assert author.nickname_changed_at is None
+
+
 # --------------------------------------------------------------------------
 # Author post list
 # --------------------------------------------------------------------------
