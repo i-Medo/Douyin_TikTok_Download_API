@@ -158,6 +158,10 @@ def author_from_web_node(
         ),
         web_url=author_web_url(unique_id),
         verified=optional_bool(node.get("verified")),
+        # TikTok reports when the handle/nickname last changed; 0/missing
+        # means "never changed" and normalizes to None via epoch_to_datetime.
+        unique_id_changed_at=epoch_to_datetime(node.get("uniqueIdModifyTime")),
+        nickname_changed_at=epoch_to_datetime(node.get("nickNameModifyTime")),
         stats=_web_author_stats(stats),
         raw=node.raw() if include_raw else None,
     )
