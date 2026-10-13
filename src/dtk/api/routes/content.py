@@ -911,6 +911,79 @@ async def user_reposts(
 
 
 @router.get(
+    "/{platform}/user/stories",
+    summary="Stories an author has posted (24h)",
+    openapi_extra={I18N_KEY: "author_stories", **ASYNC_RESPONSES},
+)
+async def user_stories(
+    request: Request,
+    platform: Platform = PLATFORM_PATH,
+    url: str | None = URL_QUERY,
+    sec_user_id: str | None = SEC_USER_ID_QUERY,
+    cursor: str | None = CURSOR_QUERY,
+    count: int | None = COUNT_QUERY,
+    include_raw: bool = RAW_QUERY,
+    wait: float | None = WAIT_QUERY,
+    proxy: str | None = PROXY_QUERY,
+    identity: str | None = IDENTITY_QUERY,
+    refresh: bool = REFRESH_QUERY,
+    explain: bool = EXPLAIN_QUERY,
+    principal: Principal = Depends(enforce_rate_limit),
+) -> Any:
+    """Stories an author has posted - the 24h disappearing posts.
+
+    **TikTok only.** These are ordinary video/photo items carrying a
+    `story` field (expiry time, viewed flag); TikTok surfaces them as a
+    ring on the avatar rather than a profile tab.
+
+    A guest identity reads public stories, no import needed.
+
+    **Parameters**
+
+    - `platform` - must be `tiktok`.
+    - `url` - a link to the author's profile page.
+    - `sec_user_id` - the author's stable id, if you already have it.
+    - `cursor` - the cursor returned by the previous page. Omit it for the
+      first page; a response with no cursor is the last page.
+    - `count` - stories per page.
+    - `include_raw` - include each story's untouched platform payload.
+    - `wait` - seconds to wait for the result. Omit it to get `202` and a task
+      id to poll.
+    - `identity` - send the request as this identity and no other. Requires
+      `identity:manage`.
+    - `refresh` - ignore any cached or in-flight answer and ask upstream
+      again.
+    - `explain` - include the upstream request/response envelope for
+      debugging the story params shape.
+
+    **Returns**
+
+    The same post shape as `/video`, one entry per story, plus the cursor
+    for the next page.
+    """
+    authorize(principal, platform)
+    params = _author_params(platform, url=url, sec_user_id=sec_user_id)
+    params.update(
+        {
+            "cursor": cursor,
+            "count": resolve_count(count, maximum=max_page_size(platform)),
+            "include_raw": include_raw,
+        }
+    )
+    return await operations.submit_and_wait(
+        request,
+        principal,
+        endpoint=supported(platform, Operation.AUTHOR_STORIES),
+        params=params,
+        wait=resolve_wait(request, wait),
+        proxy=await resolve_request_proxy(request, proxy),
+        refresh=refresh,
+        explain=await resolve_explain(request, principal, explain),
+        identity=await resolve_request_identity(request, principal, identity, platform=platform),
+    )
+
+
+@router.get(
     "/{platform}/user/collections",
     summary="The folders an author has organized bookmarked posts into",
     openapi_extra={I18N_KEY: "author_collections", **ASYNC_RESPONSES},

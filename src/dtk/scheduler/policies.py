@@ -77,6 +77,7 @@ _POLICIES: dict[str, EndpointPolicy] = {
         EndpointPolicy("tiktok.collection_posts", capacity=3, refill_per_sec=0.15, risk_weight=1.5),
         EndpointPolicy("tiktok.mix_posts", capacity=3, refill_per_sec=0.15, risk_weight=1.5),
         EndpointPolicy("tiktok.author_reposts", capacity=3, refill_per_sec=0.15, risk_weight=1.5),
+        EndpointPolicy("tiktok.author_stories", capacity=3, refill_per_sec=0.15, risk_weight=1.5),
         # One small object, not a page: closer to author_profile than to a list.
         EndpointPolicy(
             "tiktok.collection_detail", capacity=4, refill_per_sec=0.20, risk_weight=1.2
