@@ -24,6 +24,7 @@ from dtk.platforms.tiktok.params import (
     author_posts_params,
     author_profile_params,
     author_reposts_params,
+    author_stories_params,
     collection_detail_params,
     collection_posts_params,
     comment_replies_params,
@@ -67,6 +68,9 @@ class TikTokAPIEndpoints:
 
     # Other people's posts the user reposted onto their own profile
     USER_REPOST: Final = f"{TIKTOK_DOMAIN}/api/repost/item_list/"
+
+    # Stories the user has posted (24h disappearing posts)
+    USER_STORY: Final = f"{TIKTOK_DOMAIN}/api/story/item_list/"
 
     # The folders a user has organized bookmarked posts into
     USER_COLLECTION_LIST: Final = f"{TIKTOK_DOMAIN}/api/user/collection_list/"
@@ -117,6 +121,7 @@ AUTHOR_COLLECTIONS: Final = "tiktok.author_collections"
 AUTHOR_BOOKMARKS: Final = "tiktok.author_bookmarks"
 COLLECTION_POSTS: Final = "tiktok.collection_posts"
 AUTHOR_REPOSTS: Final = "tiktok.author_reposts"
+AUTHOR_STORIES: Final = "tiktok.author_stories"
 COLLECTION_DETAIL: Final = "tiktok.collection_detail"
 MIX_POSTS: Final = "tiktok.mix_posts"
 AUTHOR_FOLLOWERS: Final = "tiktok.author_followers"
@@ -196,6 +201,19 @@ ENDPOINTS: Final = EndpointTable.of(
         # Response side is the itemList/hasMore/cursor envelope, so
         # parse_author_posts answers for it; measured, not assumed.
         summary="Other people's posts an author reposted",
+    ),
+    EndpointSpec(
+        name=AUTHOR_STORIES,
+        path=TikTokAPIEndpoints.USER_STORY,
+        required=("sec_uid",),
+        build=author_stories_params,
+        risk_weight=1.5,
+        # Response is the itemList/hasMore/cursor envelope shared by every
+        # item_list path on this host; stories are ordinary aweme items with
+        # a `story` field (ExpiredAt/Viewed), so parse_author_posts answers.
+        # Measured 2026-10-13: the path answers "missing required fields"
+        # (not 404) to an unsigned probe, i.e. the endpoint exists.
+        summary="Stories an author has posted (24h)",
     ),
     EndpointSpec(
         name=AUTHOR_BOOKMARKS,

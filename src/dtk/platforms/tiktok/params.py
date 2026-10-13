@@ -346,6 +346,32 @@ def author_reposts_params(
     }
 
 
+def author_stories_params(
+    *,
+    sec_uid: str,
+    cursor: str | None = None,
+    count: int = DEFAULT_PAGE_SIZE,
+    profile: ClientProfile = DEFAULT_PROFILE,
+) -> dict[str, str]:
+    """Parameters for ``/api/story/item_list/``.
+
+    Stories an author has posted - the 24h disappearing posts. TikTok
+    surfaces them as a ring on the avatar, not a profile tab.
+
+    Request shape mirrors ``author_reposts_params`` (secUid/cursor/count/
+    coverFormat); the exact story-specific fields are unconfirmed - the
+    endpoint answers "missing required fields" to unsigned probes, so the
+    shape is refined against live signed responses.
+    """
+    return {
+        **base_params(profile),
+        "secUid": str(sec_uid),
+        "cursor": _cursor(cursor),
+        "count": str(count),
+        "coverFormat": COVER_FORMAT,
+    }
+
+
 def author_collections_params(
     *,
     sec_uid: str,
