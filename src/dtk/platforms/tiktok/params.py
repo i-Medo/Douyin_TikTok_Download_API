@@ -348,7 +348,7 @@ def author_reposts_params(
 
 def author_stories_params(
     *,
-    sec_uid: str,
+    author_id: str,
     cursor: str | None = None,
     count: int = DEFAULT_PAGE_SIZE,
     profile: ClientProfile = DEFAULT_PROFILE,
@@ -358,17 +358,15 @@ def author_stories_params(
     Stories an author has posted - the 24h disappearing posts. TikTok
     surfaces them as a ring on the avatar, not a profile tab.
 
-    Request shape mirrors ``author_reposts_params`` (secUid/cursor/count/
-    coverFormat); the exact story-specific fields are unconfirmed - the
-    endpoint answers "missing required fields" to unsigned probes, so the
-    shape is refined against live signed responses.
+    Per gallery-dl's reverse engineering, this endpoint requires
+    ``authorId`` (numeric user ID, NOT secUid) and ``loadBackward``.
     """
     return {
         **base_params(profile),
-        "secUid": str(sec_uid),
+        "authorId": str(author_id),
+        "loadBackward": "true",
         "cursor": _cursor(cursor),
         "count": str(count),
-        "coverFormat": COVER_FORMAT,
     }
 
 

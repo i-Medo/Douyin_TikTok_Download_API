@@ -235,7 +235,7 @@ _ARGUMENTS: Final[Mapping[Platform, Mapping[Capability, Mapping[str, str]]]] = {
             COUNT: "count",
         },
         Capability.AUTHOR_REPOSTS: {AUTHOR_ID: "sec_uid", CURSOR: "cursor", COUNT: "count"},
-        Capability.AUTHOR_STORIES: {AUTHOR_ID: "sec_uid", CURSOR: "cursor", COUNT: "count"},
+        Capability.AUTHOR_STORIES: {AUTHOR_ID: "author_id", CURSOR: "cursor", COUNT: "count"},
         Capability.COLLECTION_DETAIL: {COLLECTION_ID: "collection_id"},
         Capability.MIX_POSTS: {MIX_ID: "mix_id", CURSOR: "cursor", COUNT: "count"},
         Capability.AUTHOR_FOLLOWERS: {AUTHOR_ID: "sec_uid", CURSOR: "cursor", COUNT: "count"},

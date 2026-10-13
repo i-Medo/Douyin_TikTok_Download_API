@@ -205,7 +205,7 @@ ENDPOINTS: Final = EndpointTable.of(
     EndpointSpec(
         name=AUTHOR_STORIES,
         path=TikTokAPIEndpoints.USER_STORY,
-        required=("sec_uid",),
+        required=("author_id",),
         build=author_stories_params,
         risk_weight=1.5,
         # Response is the itemList/hasMore/cursor envelope shared by every

@@ -737,14 +737,14 @@ async def user_posts(
     the next page.
     """
     authorize(principal, platform)
-    params = _author_params(platform, url=url, sec_user_id=sec_user_id)
-    params.update(
-        {
-            "cursor": cursor,
-            "count": resolve_count(count, maximum=max_page_size(platform)),
-            "include_raw": include_raw,
-        }
-    )
+    if not author_id:
+        raise InvalidParam("author_id is required", details={"param": "author_id"})
+    params = {
+        "author_id": author_id,
+        "cursor": cursor,
+        "count": resolve_count(count, maximum=max_page_size(platform)),
+        "include_raw": include_raw,
+    }
     return await operations.submit_and_wait(
         request,
         principal,
@@ -814,14 +814,14 @@ async def user_likes(
     The same post shape as `/video`, plus the cursor for the next page.
     """
     authorize(principal, platform)
-    params = _author_params(platform, url=url, sec_user_id=sec_user_id)
-    params.update(
-        {
-            "cursor": cursor,
-            "count": resolve_count(count, maximum=max_page_size(platform)),
-            "include_raw": include_raw,
-        }
-    )
+    if not author_id:
+        raise InvalidParam("author_id is required", details={"param": "author_id"})
+    params = {
+        "author_id": author_id,
+        "cursor": cursor,
+        "count": resolve_count(count, maximum=max_page_size(platform)),
+        "include_raw": include_raw,
+    }
     return await operations.submit_and_wait(
         request,
         principal,
@@ -889,14 +889,14 @@ async def user_reposts(
     the next page.
     """
     authorize(principal, platform)
-    params = _author_params(platform, url=url, sec_user_id=sec_user_id)
-    params.update(
-        {
-            "cursor": cursor,
-            "count": resolve_count(count, maximum=max_page_size(platform)),
-            "include_raw": include_raw,
-        }
-    )
+    if not author_id:
+        raise InvalidParam("author_id is required", details={"param": "author_id"})
+    params = {
+        "author_id": author_id,
+        "cursor": cursor,
+        "count": resolve_count(count, maximum=max_page_size(platform)),
+        "include_raw": include_raw,
+    }
     return await operations.submit_and_wait(
         request,
         principal,
@@ -919,7 +919,7 @@ async def user_stories(
     request: Request,
     platform: Platform = PLATFORM_PATH,
     url: str | None = URL_QUERY,
-    sec_user_id: str | None = SEC_USER_ID_QUERY,
+    author_id: str | None = None,
     cursor: str | None = CURSOR_QUERY,
     count: int | None = COUNT_QUERY,
     include_raw: bool = RAW_QUERY,
@@ -941,8 +941,7 @@ async def user_stories(
     **Parameters**
 
     - `platform` - must be `tiktok`.
-    - `url` - a link to the author's profile page.
-    - `sec_user_id` - the author's stable id, if you already have it.
+    - `author_id` - the author's numeric user ID (required).
     - `cursor` - the cursor returned by the previous page. Omit it for the
       first page; a response with no cursor is the last page.
     - `count` - stories per page.
@@ -962,14 +961,14 @@ async def user_stories(
     for the next page.
     """
     authorize(principal, platform)
-    params = _author_params(platform, url=url, sec_user_id=sec_user_id)
-    params.update(
-        {
-            "cursor": cursor,
-            "count": resolve_count(count, maximum=max_page_size(platform)),
-            "include_raw": include_raw,
-        }
-    )
+    if not author_id:
+        raise InvalidParam("author_id is required", details={"param": "author_id"})
+    params = {
+        "author_id": author_id,
+        "cursor": cursor,
+        "count": resolve_count(count, maximum=max_page_size(platform)),
+        "include_raw": include_raw,
+    }
     return await operations.submit_and_wait(
         request,
         principal,
@@ -1121,14 +1120,14 @@ async def user_bookmarks(
     for the next page.
     """
     authorize(principal, platform)
-    params = _author_params(platform, url=url, sec_user_id=sec_user_id)
-    params.update(
-        {
-            "cursor": cursor,
-            "count": resolve_count(count, maximum=max_page_size(platform)),
-            "include_raw": include_raw,
-        }
-    )
+    if not author_id:
+        raise InvalidParam("author_id is required", details={"param": "author_id"})
+    params = {
+        "author_id": author_id,
+        "cursor": cursor,
+        "count": resolve_count(count, maximum=max_page_size(platform)),
+        "include_raw": include_raw,
+    }
     return await operations.submit_and_wait(
         request,
         principal,
