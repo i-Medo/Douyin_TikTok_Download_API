@@ -475,8 +475,13 @@ def parse_author_stories(payload: Mapping[str, Any], *, fetched_at: datetime) ->
     Per gallery-dl's reverse engineering, the story endpoint paginates with
     ``HasMoreAfter``/``MaxCursor`` instead of the ``hasMore``/``cursor`` keys
     every other item_list endpoint uses.
+
+    When the author has no active stories, TikTok returns a payload without
+    ``itemList`` at all — that is an empty page, not an upstream change.
     """
     root = _guard(payload)
+    if not root.present("itemList"):
+        return Page(items=[], cursor=None, has_more=False)
     items = [content_from_node(item, fetched_at=fetched_at) for item in root.children("itemList")]
     has_more = optional_bool(root.present("HasMoreAfter"))
     cursor = optional_id(root.get("MaxCursor")) if has_more else None
