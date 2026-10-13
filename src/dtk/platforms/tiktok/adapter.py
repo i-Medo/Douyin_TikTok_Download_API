@@ -54,6 +54,11 @@ class TikTokAdapter:
     ) -> Page[Content]:
         return parser.parse_author_posts(payload, fetched_at=fetched_at)
 
+    def parse_author_stories(
+        self, payload: Mapping[str, Any], *, fetched_at: datetime
+    ) -> Page[Content]:
+        return parser.parse_author_stories(payload, fetched_at=fetched_at)
+
     def parse_author_list(self, payload: Mapping[str, Any]) -> Page[Author]:
         return parser.parse_author_list(payload)
 

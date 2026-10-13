@@ -158,10 +158,6 @@ def author_from_web_node(
         ),
         web_url=author_web_url(unique_id),
         verified=optional_bool(node.get("verified")),
-        # TikTok reports when the handle/nickname last changed; 0/missing
-        # means "never changed" and normalizes to None via epoch_to_datetime.
-        unique_id_changed_at=epoch_to_datetime(node.get("uniqueIdModifyTime")),
-        nickname_changed_at=epoch_to_datetime(node.get("nickNameModifyTime")),
         stats=_web_author_stats(stats),
         raw=node.raw() if include_raw else None,
     )
@@ -465,18 +461,25 @@ def parse_author_list(payload: Mapping[str, Any]) -> Page[Author]:
 def parse_author_posts(payload: Mapping[str, Any], *, fetched_at: datetime) -> Page[Content]:
     """Parse ``/api/post/item_list/``."""
     root = _guard(payload)
-    # An account with no posts omits `itemList` entirely rather than sending
-    # `[]` — the same absent-means-empty convention as `userList` and
-    # `collectionList`. Absent is therefore an empty page; a list that IS
-    # present stays strict, so a malformed entry is still reported rather than
-    # silently dropped.
-    items = ([content_from_node(item, fetched_at=fetched_at)
-              for item in root.children("itemList")]
-             if root.has("itemList") else [])
+    items = [content_from_node(item, fetched_at=fetched_at) for item in root.children("itemList")]
     has_more = optional_bool(root.present("hasMore"))
     cursor = optional_id(root.get("cursor")) if has_more else None
     if has_more and cursor is None:
         raise root.missing("cursor")
+    return Page(items=items, cursor=cursor, has_more=has_more)
+
+
+def parse_author_stories(payload: Mapping[str, Any], *, fetched_at: datetime) -> Page[Content]:
+    """Parse ``/api/story/item_list/``.
+
+    Per gallery-dl's reverse engineering, the story endpoint paginates with
+    ``HasMoreAfter``/``MaxCursor`` instead of the ``hasMore``/``cursor`` keys
+    every other item_list endpoint uses.
+    """
+    root = _guard(payload)
+    items = [content_from_node(item, fetched_at=fetched_at) for item in root.children("itemList")]
+    has_more = optional_bool(root.present("HasMoreAfter"))
+    cursor = optional_id(root.get("MaxCursor")) if has_more else None
     return Page(items=items, cursor=cursor, has_more=has_more)
 
 

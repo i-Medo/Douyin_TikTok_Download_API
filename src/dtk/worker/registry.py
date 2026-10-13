@@ -432,12 +432,15 @@ class EndpointDefinition:
                 | Capability.MIX_POSTS
                 | Capability.AUTHOR_BOOKMARKS
                 | Capability.AUTHOR_REPOSTS
-                | Capability.AUTHOR_STORIES
             ):
                 # All five are a page of posts in the platform's own list
                 # envelope - `aweme_list`/`max_cursor` on Douyin, `itemList`/
                 # `cursor` on TikTok - so one parser answers for all of them.
                 return adapter.parse_author_posts(payload, fetched_at=when)
+            case Capability.AUTHOR_STORIES:
+                # Stories paginate with HasMoreAfter/MaxCursor, not the
+                # hasMore/cursor keys the other endpoints use.
+                return adapter.parse_author_stories(payload, fetched_at=when)
             case Capability.AUTHOR_FOLLOWERS | Capability.AUTHOR_FOLLOWING:
                 # One endpoint answers both, selected by a `scene` parameter, so
                 # one parser answers for both too.
