@@ -740,7 +740,7 @@ async def user_posts(
     if not author_id:
         raise InvalidParam("author_id is required", details={"param": "author_id"})
     params = {
-        "author_id": author_id,
+        "story_author_id": author_id,
         "cursor": cursor,
         "count": resolve_count(count, maximum=max_page_size(platform)),
         "include_raw": include_raw,
@@ -817,7 +817,7 @@ async def user_likes(
     if not author_id:
         raise InvalidParam("author_id is required", details={"param": "author_id"})
     params = {
-        "author_id": author_id,
+        "story_author_id": author_id,
         "cursor": cursor,
         "count": resolve_count(count, maximum=max_page_size(platform)),
         "include_raw": include_raw,
@@ -892,7 +892,7 @@ async def user_reposts(
     if not author_id:
         raise InvalidParam("author_id is required", details={"param": "author_id"})
     params = {
-        "author_id": author_id,
+        "story_author_id": author_id,
         "cursor": cursor,
         "count": resolve_count(count, maximum=max_page_size(platform)),
         "include_raw": include_raw,
@@ -964,7 +964,7 @@ async def user_stories(
     if not author_id:
         raise InvalidParam("author_id is required", details={"param": "author_id"})
     params = {
-        "author_id": author_id,
+        "story_author_id": author_id,
         "cursor": cursor,
         "count": resolve_count(count, maximum=max_page_size(platform)),
         "include_raw": include_raw,
@@ -1123,7 +1123,7 @@ async def user_bookmarks(
     if not author_id:
         raise InvalidParam("author_id is required", details={"param": "author_id"})
     params = {
-        "author_id": author_id,
+        "story_author_id": author_id,
         "cursor": cursor,
         "count": resolve_count(count, maximum=max_page_size(platform)),
         "include_raw": include_raw,
