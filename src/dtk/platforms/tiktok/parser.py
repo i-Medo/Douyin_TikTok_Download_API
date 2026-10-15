@@ -465,7 +465,7 @@ def parse_author_posts(payload: Mapping[str, Any], *, fetched_at: datetime) -> P
     that is an empty page, not an upstream change.
     """
     root = _guard(payload)
-    if not root.present("itemList"):
+    if not root.has("itemList"):
         return Page(items=[], cursor=None, has_more=False)
     items = [content_from_node(item, fetched_at=fetched_at) for item in root.children("itemList")]
     has_more = optional_bool(root.present("hasMore"))
@@ -486,7 +486,7 @@ def parse_author_stories(payload: Mapping[str, Any], *, fetched_at: datetime) ->
     ``itemList`` at all — that is an empty page, not an upstream change.
     """
     root = _guard(payload)
-    if not root.present("itemList"):
+    if not root.has("itemList"):
         return Page(items=[], cursor=None, has_more=False)
     items = [content_from_node(item, fetched_at=fetched_at) for item in root.children("itemList")]
     has_more = optional_bool(root.present("HasMoreAfter"))
@@ -608,7 +608,7 @@ def _comment_page(
     parent_id: str | None,
 ) -> Page[Comment]:
     root = _guard(payload)
-    if not root.present("comments"):
+    if not root.has("comments"):
         return Page(items=[], cursor=None, has_more=False)
     items = [
         comment_from_node(item, content_id=content_id, parent_id=parent_id)
