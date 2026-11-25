@@ -7,11 +7,13 @@ Layout, in the order a caller meets it:
 
 ======================  ===================================================
 ``system``              ``/healthz``, ``/readyz``, ``/api/v1/system/status``
+``capabilities``        ``/api/v1/system/capabilities`` - what each platform serves
 ``setup``               ``/api/setup/*`` - the one-time bootstrap
 ``auth``                ``/api/v1/auth/*`` - console sessions
 ``ios``                 ``/api/v1/ios/shortcut``
 ``tasks``               ``/api/v1/tasks/{id}`` and its event stream
 ``content``             ``/api/v1/parse`` and the per-platform reads
+``discovery``           related posts, sounds, hashtags, search, live rooms
 ``tools``               ``/api/v1/tools/*`` - signing, link parsing
 ``archive``             ``/api/v1/archive/*`` - what this instance has stored
 ``downloads``           ``/api/v1/downloads/*`` - media stored on the local disk
@@ -32,7 +34,9 @@ from dtk.api.routes import (
     admin,
     archive,
     auth,
+    capabilities,
     content,
+    discovery,
     downloads,
     ios,
     openapi,
@@ -40,6 +44,7 @@ from dtk.api.routes import (
     system,
     tasks,
     tools,
+    transcriptions,
 )
 from dtk.core.logging import get_logger
 from dtk.mcp import mount as mount_mcp
@@ -49,13 +54,16 @@ log = get_logger(__name__)
 #: Routers in registration order.
 ROUTERS = (
     system.router,
+    capabilities.router,
     setup.router,
     auth.router,
     ios.router,
     tasks.router,
     content.router,
+    discovery.router,
     archive.router,
     downloads.router,
+    transcriptions.router,
     tools.router,
     admin.router,
 )

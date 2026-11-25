@@ -5,7 +5,8 @@ cause can be in the proxy, the cookies, the signature or the network. Guessing
 costs a round trip per guess, so the console and the CLI run the same six steps
 and print one report (docs/design/15-operations.md):
 
-1. component connectivity - postgres, redis, browser-rpc
+1. component connectivity - postgres, redis, browser-rpc, and the downloader
+   and transcriber sidecars where their profiles are configured
 2. egress - can this machine reach the platform domains directly
 3. proxies - probe each one for reachability, exit IP and GeoIP
 4. identity pool - how many usable identities, and how stale the oldest is
@@ -42,6 +43,7 @@ from typing import Any, Final
 
 import httpx
 from redis.asyncio import Redis
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from dtk import __version__
@@ -50,19 +52,31 @@ from dtk.core.logging import get_logger
 from dtk.core.types import DEFAULT_LANGUAGE, IdentityState, Language, Platform
 from dtk.i18n.catalog import t
 from dtk.identity.minting.client import BrowserRpcClient
+from dtk.identity.minting.native import NATIVE_MINT_PLATFORMS
+from dtk.ops import sidecars
 from dtk.ops._sql import safe_execute, safe_scalar
-from dtk.ops.health import ComponentHealth, check_browser_rpc, check_postgres, check_redis
+from dtk.ops.health import (
+    POSTGRES,
+    ComponentHealth,
+    check_browser_rpc,
+    check_postgres,
+    check_redis,
+)
 from dtk.platforms.douyin.endpoints import DouyinAPIEndpoints
 from dtk.platforms.tiktok.endpoints import TikTokAPIEndpoints
 from dtk.signing.base import RequestSpec, StaticFingerprint
-from dtk.signing.registry import SignerRegistry
+from dtk.signing.registry import Comparison, ShadowSkip, SignerRegistry
 
 log = get_logger(__name__)
 
 #: Reached directly, without a proxy, to tell "no internet" from "bad proxy".
+#: One per platform. Bilibili was served for a release before it was listed
+#: here, so an instance that only spoke to Bilibili was graded on two domains
+#: it never used and not on the one it did.
 DEFAULT_EGRESS_TARGETS: Final[tuple[str, ...]] = (
     "https://www.douyin.com/",
     "https://www.tiktok.com/",
+    "https://www.bilibili.com/",
 )
 
 #: Echo service used to learn a proxy's exit address. Overridable because some
@@ -84,6 +98,9 @@ PROBE_USER_AGENT: Final[str] = (
 
 STEP_TIMEOUT_SECONDS: Final[float] = 15.0
 MAX_PROXIES_PROBED: Final[int] = 20
+#: Longer than the System page allows itself: nobody is polling this, and a
+#: downloader still measuring a large volume is slow, not down.
+SIDECAR_STEP_TIMEOUT_SECONDS: Final[float] = 8.0
 
 MASK: Final[str] = "[REDACTED]"
 
@@ -101,7 +118,8 @@ _HEADER_RE = re.compile(
 # Cookie and signature parameters wherever they appear in free text.
 _PARAM_RE = re.compile(
     r"(?i)\b(sessionid(?:_ss)?|sid_guard|sid_tt|uid_tt|odin_tt|passport_csrf_token|ttwid|"
-    r"msToken|a_bogus|X-Bogus|X-Dynosaur|X-Gnarly|_signature|verifyFp|s_v_web_id)"
+    r"msToken|a_bogus|X-Bogus|X-Dynosaur|X-Gnarly|_signature|verifyFp|s_v_web_id|"
+    r"SESSDATA|bili_jct|buvid3|buvid4|w_rid)"
     r"\s*[=:]\s*([^\s;,&\"'\]}]+)"
 )
 # Full API keys: dtk_<prefix>_<secret>. The prefix is public and is kept so a
@@ -187,6 +205,8 @@ class StepCode(StrEnum):
 
     COMPONENTS_UNREACHABLE = "components_unreachable"
     COMPONENTS_BROWSER_RPC_DOWN = "components_browser_rpc_down"
+    COMPONENTS_SIDECAR_DOWN = "components_sidecar_down"
+    COMPONENTS_DB_CONNECTIONS = "components_db_connections"
     COMPONENTS_OK = "components_ok"
 
     EGRESS_UNREACHABLE = "egress_unreachable"
@@ -209,6 +229,9 @@ class StepCode(StrEnum):
     SIGNING_NO_REGISTRY = "signing_no_registry"
     SIGNING_NO_BROWSER_RPC = "signing_no_browser_rpc"
     SIGNING_MISMATCH = "signing_mismatch"
+    SIGNING_NATIVE_FAILED = "signing_native_failed"
+    SIGNING_REFERENCE_FAILED = "signing_reference_failed"
+    SIGNING_BUILD_DRIFT = "signing_build_drift"
     SIGNING_NOT_COMPARABLE = "signing_not_comparable"
     SIGNING_OK = "signing_ok"
 
@@ -232,6 +255,8 @@ ACTIONABLE_CODES: Final[frozenset[str]] = frozenset(
     for code in (
         StepCode.COMPONENTS_UNREACHABLE,
         StepCode.COMPONENTS_BROWSER_RPC_DOWN,
+        StepCode.COMPONENTS_SIDECAR_DOWN,
+        StepCode.COMPONENTS_DB_CONNECTIONS,
         StepCode.EGRESS_UNREACHABLE,
         StepCode.EGRESS_PARTIAL,
         StepCode.PROXIES_NONE,
@@ -241,6 +266,9 @@ ACTIONABLE_CODES: Final[frozenset[str]] = frozenset(
         StepCode.POOL_BELOW_MINIMUM,
         StepCode.SIGNING_NO_BROWSER_RPC,
         StepCode.SIGNING_MISMATCH,
+        StepCode.SIGNING_NATIVE_FAILED,
+        StepCode.SIGNING_REFERENCE_FAILED,
+        StepCode.SIGNING_BUILD_DRIFT,
         # The sentence for this one was written and never wired up, so the step
         # showed a warning and the terse per-platform detail under it with
         # nothing saying what it meant or whether anything was broken. It is the
@@ -430,23 +458,51 @@ class DiagnoseContext:
     #: (setup wizard or CLI) together with the link it should use.
     smoke: SmokeRunner | None = None
     smoke_url: str | None = None
+    #: Which platform ``smoke_url`` belongs to, when the caller chose one. Shown
+    #: beside the result, because "the smoke test passed" says little until it
+    #: says on which platform.
+    smoke_platform: Platform | None = None
+    #: The optional sidecars. None is "this profile is not running here", which
+    #: the components step reports and does not hold against the instance.
+    downloader: sidecars.DownloaderProbe | None = None
+    transcriber: sidecars.TranscriberProbe | None = None
     egress_targets: tuple[str, ...] = DEFAULT_EGRESS_TARGETS
     proxy_probe_url: str = DEFAULT_PROXY_PROBE_URL
     #: Low-water mark the pool step compares against; doc 10's pool.min_size.
     min_active: int = 3
+    #: The most connections the api and the worker can open between them
+    #: (:func:`dtk.core.db.connection_budget`). None skips the comparison with
+    #: Postgres' own limit.
+    connection_budget: int | None = None
 
 
 async def check_components(ctx: DiagnoseContext) -> StepResult:
-    """Step 1: can this process reach postgres, redis and browser-rpc."""
+    """Step 1: can this process reach postgres, redis, browser-rpc and the sidecars."""
     result = _step(1, "components")
     components: list[ComponentHealth] = [
         await check_postgres(ctx.engine),
         await check_redis(ctx.redis),
         await check_browser_rpc(ctx.rpc),
     ]
-    details = {c.name: c.as_dict() for c in components}
+    details: dict[str, Any] = {c.name: c.as_dict() for c in components}
     broken = [c for c in components if not c.ok and c.name != "browser_rpc"]
     rpc = next(c for c in components if c.name == "browser_rpc")
+    # The same shape the System page shows, so the report and the page cannot
+    # describe one sidecar two ways.
+    optional = {
+        sidecars.DOWNLOADER: await sidecars.downloader_status(
+            ctx.downloader, timeout=SIDECAR_STEP_TIMEOUT_SECONDS
+        ),
+        sidecars.TRANSCRIBER: await sidecars.transcriber_status(
+            ctx.transcriber, timeout=SIDECAR_STEP_TIMEOUT_SECONDS
+        ),
+    }
+    details.update(optional)
+    # Configured and not answering only. A profile nobody started is a choice,
+    # and grading it would put a warning on every instance that made it.
+    sidecars_down = [
+        name for name, status in optional.items() if status["configured"] and not status["ok"]
+    ]
 
     if broken:
         # Names only. Why each one is down is already in the details, and a
@@ -473,7 +529,44 @@ async def check_components(ctx: DiagnoseContext) -> StepResult:
             ),
             details=details,
         )
+    if sidecars_down:
+        return result(
+            StepStatus.WARN,
+            StepCode.COMPONENTS_SIDECAR_DOWN,
+            args={"components": ", ".join(sidecars_down)},
+            details=details,
+        )
+    limit = await _max_connections(ctx.engine) if ctx.connection_budget is not None else None
+    if limit is not None and ctx.connection_budget is not None:
+        details[POSTGRES]["max_connections"] = limit
+        details[POSTGRES]["connection_budget"] = ctx.connection_budget
+        if ctx.connection_budget > limit:
+            # Everything answers today; this is the load at which it stops.
+            # Measured on the demo: pools of 10 + 20 against the 25 TimescaleDB
+            # tunes a 1 GB container to, and "too many clients already" as 500s.
+            return result(
+                StepStatus.WARN,
+                StepCode.COMPONENTS_DB_CONNECTIONS,
+                args={"budget": ctx.connection_budget, "max_connections": limit},
+                details=details,
+            )
     return result(StepStatus.PASS, StepCode.COMPONENTS_OK, details=details)
+
+
+async def _max_connections(engine: AsyncEngine | None) -> int | None:
+    """Postgres' ``max_connections``, or None when it cannot be read."""
+    if engine is None:
+        return None
+    try:
+        async with engine.connect() as connection:
+            value = await connection.scalar(text("SHOW max_connections"))
+    except Exception as exc:
+        log.debug("ops.diagnose.max_connections_unreadable", error=type(exc).__name__)
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 async def check_egress(ctx: DiagnoseContext) -> StepResult:
@@ -612,6 +705,13 @@ async def check_signing(ctx: DiagnoseContext) -> StepResult:
     fingerprint = StaticFingerprint(user_agent=PROBE_USER_AGENT)
     details: dict[str, Any] = {}
     mismatched: list[str] = []
+    # Skips, by what they say. One bucket used to hold them all, under one
+    # sentence: "the browser reference implements a different version of the
+    # algorithm". In #830 the browser had failed to sign at all, and that
+    # sentence sent the reporter after a bundle that had not moved.
+    native_failed: dict[str, str] = {}
+    reference_failed: dict[str, str] = {}
+    drifted: dict[str, str] = {}
     skipped: list[str] = []
     for platform, url in SIGNING_PROBE_URLS.items():
         spec = RequestSpec.get(url, params={"aweme_id": "0", "device_platform": "webapp"})
@@ -619,11 +719,33 @@ async def check_signing(ctx: DiagnoseContext) -> StepResult:
             agreed = await ctx.registry.compare_shadow(spec, fingerprint, platform=platform)
         except Exception as exc:
             details[platform.value] = f"comparison failed: {type(exc).__name__}: {exc}"
+            # A comparison that never happened is a skip. Falling through to
+            # nothing at all let a step whose every platform crashed report
+            # "native and browser signatures agree".
+            skipped.append(platform.value)
             continue
         shadow = ctx.registry.shadow_result(platform, spec.endpoint)
         if shadow is not None and not shadow.compared:
             details[platform.value] = f"not compared: {shadow.detail}"
-            skipped.append(platform.value)
+            error = shadow.error or shadow.detail or ""
+            if shadow.skip is ShadowSkip.NATIVE_FAILED:
+                native_failed[platform.value] = error
+            elif shadow.skip in (ShadowSkip.REFERENCE_FAILED, ShadowSkip.REFERENCE_UNUSABLE):
+                reference_failed[platform.value] = error
+            else:
+                skipped.append(platform.value)
+            continue
+        if agreed and shadow is not None and Comparison.DRIFT in shadow.verdicts.values():
+            # Compared, and the browser signs as another build of the SDK: the
+            # native signer still serves (and is not switched off for this),
+            # but it is stamping a build the platform no longer ships.
+            #
+            # Only when the sample agreed otherwise. A build bump is exactly
+            # when another parameter changes beside it, and a sample with a
+            # mismatch has already switched the native signer off: filing it
+            # here said "keeps serving" about a signer that had just stopped.
+            drifted[platform.value] = shadow.detail or ""
+            details[platform.value] = f"build drift: {shadow.detail}"
             continue
         details[platform.value] = (
             "match" if agreed else f"mismatch: {shadow.detail if shadow else ''}"
@@ -638,11 +760,40 @@ async def check_signing(ctx: DiagnoseContext) -> StepResult:
             args={"platforms": ", ".join(mismatched)},
             details=details,
         )
+    if native_failed:
+        # The signer that serves requests could not sign a probe: a fault in
+        # the path traffic takes, which is a failure and not a note.
+        return result(
+            StepStatus.FAIL,
+            StepCode.SIGNING_NATIVE_FAILED,
+            args={"platforms": ", ".join(native_failed), "error": _one_error(native_failed)},
+            details=details,
+        )
+    if drifted:
+        # Ahead of the reference failures: it is a finding about dtk itself,
+        # and the one an operator can only fix by updating it.
+        return result(
+            StepStatus.WARN,
+            StepCode.SIGNING_BUILD_DRIFT,
+            args={"platforms": ", ".join(drifted), "drift": _one_error(drifted)},
+            details=details,
+        )
+    # Every skip below is a warning, never a pass, and any skip at all - not
+    # only a total one. "native and browser signatures agree" is the overclaim
+    # this step exists to avoid: with one platform compared and one not, it
+    # reads as evidence about both, and the one it says nothing about is
+    # exactly the one an operator needs told.
+    if reference_failed:
+        return result(
+            StepStatus.WARN,
+            StepCode.SIGNING_REFERENCE_FAILED,
+            args={
+                "platforms": ", ".join(reference_failed),
+                "error": _one_error(reference_failed),
+            },
+            details=details,
+        )
     if skipped:
-        # Any skip at all, not only a total one. "native and browser signatures
-        # agree" is the overclaim this step exists to avoid: with one platform
-        # compared and one not, it reads as evidence about both, and the one it
-        # says nothing about is exactly the one an operator needs told.
         return result(
             StepStatus.WARN,
             StepCode.SIGNING_NOT_COMPARABLE,
@@ -652,11 +803,22 @@ async def check_signing(ctx: DiagnoseContext) -> StepResult:
     return result(StepStatus.PASS, StepCode.SIGNING_OK, details=details)
 
 
+def _one_error(errors: Mapping[str, str]) -> str:
+    """One line for the reason sentence: the error, or each platform's when they differ."""
+    distinct = set(errors.values())
+    if len(distinct) == 1:
+        return next(iter(distinct))
+    return "; ".join(f"{platform}: {error}" for platform, error in errors.items())
+
+
 async def check_smoke(ctx: DiagnoseContext) -> StepResult:
     """Step 6: one public link through the whole pipeline."""
     result = _step(6, "smoke")
     if ctx.smoke is None or not ctx.smoke_url:
         return result(StepStatus.SKIP, StepCode.SMOKE_NOT_CONFIGURED)
+    where: dict[str, Any] = {"url": ctx.smoke_url}
+    if ctx.smoke_platform is not None:
+        where = {"platform": ctx.smoke_platform.value, **where}
     try:
         outcome = await ctx.smoke(ctx.smoke_url)
     except Exception as exc:
@@ -664,13 +826,49 @@ async def check_smoke(ctx: DiagnoseContext) -> StepResult:
             StepStatus.FAIL,
             StepCode.SMOKE_FAILED,
             args={"error": f"{type(exc).__name__}: {exc}"},
-            details={"url": ctx.smoke_url},
+            details=where,
         )
     return result(
         StepStatus.PASS,
         StepCode.SMOKE_OK,
-        details={"url": ctx.smoke_url, "result": _summarize(outcome)},
+        details={**where, "result": _summarize(outcome)},
     )
+
+
+async def choose_smoke_platform(session: AsyncSession | None, *, browser: bool) -> Platform:
+    """The platform the end-to-end step should fetch from, when nobody said.
+
+    It was always Douyin. On an instance that only keeps Bilibili identities -
+    which is any instance without the browser container, since Bilibili is the
+    one platform minted over plain HTTP - the smoke step then failed with "no
+    usable douyin identity": true, and about a platform the instance was never
+    meant to serve, while the one it does serve went untested.
+
+    So: the platform with the most active identities in rotation, because that
+    is the traffic this instance actually carries and a reserved account is
+    not one rotation would hand out. Ties go to the platform listed first. With
+    no usable identity anywhere, the platform the instance could still mint for
+    - Douyin with a browser, a natively minted one without.
+    """
+    rows = (
+        await safe_execute(
+            session,
+            "SELECT platform, count(*) FROM identities "
+            "WHERE state = 'active' AND rotation_endpoints IS NULL GROUP BY platform",
+            event="ops.diagnose.smoke_platform_failed",
+        )
+        if session is not None
+        else None
+    )
+    counts = {str(platform): int(count) for platform, count in rows or ()}
+    busiest = max(Platform, key=lambda platform: counts.get(platform.value, 0))
+    if counts.get(busiest.value, 0) > 0:
+        return busiest
+    if not browser:
+        native = [platform for platform in Platform if platform in NATIVE_MINT_PLATFORMS]
+        if native:
+            return native[0]
+    return Platform.DOUYIN
 
 
 #: The six steps, in the order doc 15 defines them.
@@ -877,6 +1075,7 @@ __all__ = [
     "MASK",
     "REASON_KEY_PREFIX",
     "SENSITIVE_DETAIL_KEYS",
+    "SIDECAR_STEP_TIMEOUT_SECONDS",
     "SIGNING_PROBE_URLS",
     "STEPS",
     "DiagnoseContext",
@@ -892,6 +1091,7 @@ __all__ = [
     "check_proxies",
     "check_signing",
     "check_smoke",
+    "choose_smoke_platform",
     "localize_report",
     "reason_key",
     "redact",

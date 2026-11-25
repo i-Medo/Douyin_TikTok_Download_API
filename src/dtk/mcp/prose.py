@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Final
 
 from dtk.core.errors import NON_RETRYABLE, DtkError, ErrorCode
 from dtk.core.types import Language
@@ -37,6 +37,34 @@ TOOL_LANGUAGE = Language.EN
 _IDENTIFIER_HEAD = re.compile(r"^[a-z][a-z0-9]*[._][a-z0-9]")
 
 
+#: Attached to a result a guest identity served on an endpoint that gives
+#: guests less. The data is real and complete-looking, which is the problem.
+#: Keyed by endpoint because what a guest misses differs: one sentence about
+#: Douyin's feed was attached to Bilibili's comments too, once they were the
+#: second endpoint to prefer a signed-in identity.
+_GUEST_FALLBACK = "No signed-in identity was available, so a guest answered."
+_GUEST_MISSES: Final[dict[str, str]] = {
+    "douyin.author_posts": (
+        "Douyin leaves an author's newest posts out of what it shows a guest: the "
+        "first items here may not be the latest, and later pages need a logged-in "
+        "cookie."
+    ),
+    "bilibili.comments": (
+        "Bilibili shows a guest only the three hottest comments (the three newest "
+        "with sort='new') and no further page; the full thread needs a logged-in "
+        "cookie."
+    ),
+}
+
+
+def guest_fallback_note(endpoint: str) -> str:
+    """What an agent should know about a guest's answer from ``endpoint``."""
+    misses = _GUEST_MISSES.get(endpoint)
+    if misses is None:
+        return f"{_GUEST_FALLBACK} It may hold less than a signed-in identity would see."
+    return f"{_GUEST_FALLBACK} {misses}"
+
+
 def _sentence(text: str | None) -> str:
     """Normalize a raw message into one sentence, or nothing."""
     stripped = (text or "").strip()
@@ -52,6 +80,13 @@ def _retry_sentence(code: ErrorCode, retry_after: int | None) -> str:
         return (
             "Retrying will not help: this is a parser bug in dtk, not something a "
             "different request can work around."
+        )
+    if code is ErrorCode.IDENTITY_LOGIN_REQUIRED:
+        # Not "the request has to change": it is a fine request this instance
+        # cannot serve until someone gives it a signed-in account.
+        return (
+            "Retrying will not help until an operator imports a logged-in cookie for "
+            "this platform. The first page of the same feed does not need one."
         )
     if code in NON_RETRYABLE:
         return "Retrying will not help; the request has to change."
@@ -247,6 +282,24 @@ def unfinished_task_message(task_id: str, state: str, snapshot: PoolSnapshot | N
     return text
 
 
+def unsettled_media_message(kind: str, identifier: str, state: str, error: str | None) -> str:
+    """Answer for a download or transcription that ended without its result.
+
+    Both workers record these as an outcome rather than raising - a post with no
+    fetchable mirror, a video ffmpeg cannot read - so the task itself succeeds.
+    Reading only the task, the tools answered status "ok" for a download that
+    stored nothing and a transcription that has no text.
+    """
+    if kind == "download":
+        again = "Call download_media again to start over; it re-reads the post for fresh links."
+    else:
+        again = "Call transcribe_video again with refresh=true once the cause is fixed."
+    if state == "cancelled":
+        return f"The {kind} {identifier} was cancelled before it finished. {again}"
+    reason = _sentence(error) or "No reason was recorded."
+    return f"The {kind} {identifier} failed. {reason} {again}"
+
+
 __all__ = [
     "TOOL_LANGUAGE",
     "describe",
@@ -254,7 +307,9 @@ __all__ = [
     "describe_health",
     "describe_task_error",
     "expired_result_message",
+    "guest_fallback_note",
     "summarize_pool",
     "timeout_message",
     "unfinished_task_message",
+    "unsettled_media_message",
 ]

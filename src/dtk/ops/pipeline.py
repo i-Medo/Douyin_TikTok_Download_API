@@ -48,15 +48,23 @@ from dtk.platforms import get_adapter
 from dtk.services.fetch import strip_raw
 from dtk.signing import RequestSpec as SigningRequest
 from dtk.signing import SignerRegistry, SigningSession, StaticFingerprint, native_signers
-from dtk.transport.base import Fingerprint, RawResponse, RequestSpec, TransportIdentity
+from dtk.transport.base import (
+    Fingerprint,
+    RawResponse,
+    RequestSpec,
+    TransportIdentity,
+    with_signed_cookies,
+)
 from dtk.urls import ResourceKind, UrlKind, resolve
 from dtk.worker import registry
 from dtk.worker.parsing import (
     EXPAND_TIMEOUT_SECONDS,
+    LINKED_RESOURCES,
     ProxySource,
     egress_fetcher,
     pick_egress,
     redirect_fetcher,
+    to_call,
 )
 from dtk.worker.registry import Capability, ResolvedCall
 
@@ -102,10 +110,11 @@ class Target:
 def target_for(kind: UrlKind) -> Target:
     """Map a recognized URL onto the endpoint that answers it.
 
-    Only the two resources a URL can identify on its own are routed. A live
-    room or a music page is recognized by the URL parser but has no endpoint in
-    the P0 set, and saying which resource was refused is more useful than a
-    generic parse failure.
+    A post and a profile are mapped here; every other link /parse answers goes
+    through /parse's own table. This used to stop at the post and the profile,
+    so once /parse learned sounds, hashtags and live rooms, `dtk fetch` went on
+    telling an operator those links had no endpoint. Saying which resource was
+    refused is still more useful than a generic parse failure.
     """
     if kind.platform is None or (kind.resource_id is None and kind.handle is None):
         raise UnsupportedContent("the URL does not identify a fetchable resource")
@@ -121,6 +130,15 @@ def target_for(kind: UrlKind) -> Target:
         key = registry.UNIQUE_ID if platform is Platform.TIKTOK else registry.AUTHOR_ID
         params = {key: identifier.lstrip("@")}
         capability = Capability.AUTHOR_PROFILE
+    elif kind.resource in LINKED_RESOURCES:
+        endpoint, linked = to_call(kind)
+        return Target(
+            platform=platform,
+            endpoint=endpoint,
+            capability=Capability(endpoint.partition(".")[2]),
+            params=linked,
+            kind=kind,
+        )
     else:
         raise UnsupportedContent(
             f"{kind.resource.value} links have no endpoint yet",
@@ -229,6 +247,10 @@ async def pick_identity(
             platform=platform,
             states=(IdentityState.ACTIVE, IdentityState.COOLING, IdentityState.DEGRADED),
             limit=1,
+            # The probe stands in for rotation, so it draws only what rotation
+            # may: an account an operator reserved is not the one to spend on
+            # a self-check or an ad-hoc `dtk fetch`.
+            in_rotation=True,
         )
         if not rows:
             raise IdentityPoolExhausted(
@@ -346,7 +368,9 @@ async def call_endpoint(
         cookies=identity.cookies,
     )
     signed = await signers.sign(
-        SigningRequest(method=spec["method"], url=spec["url"], params=spec["params"]),
+        # The whole request, body included, for the reason the worker's own
+        # sign function gives: a_bogus hashes a POST's body.
+        SigningRequest.of(spec),
         signing_view(identity.fingerprint),
         SigningSession(
             cookies=identity.cookies,
@@ -359,12 +383,16 @@ async def call_endpoint(
     url = signed.signed_url(spec["url"]) if signed.query else spec["url"]
 
     return await transport.request(
-        sender,
+        # The browser page seals its own msToken; the Cookie header follows it.
+        with_signed_cookies(sender, signed.cookies),
         RequestSpec(
             url=url,
             method=spec["method"],
             params=None if signed.query else spec["params"],
             headers={**spec["headers"], **dict(signed.headers)},
+            # A form endpoint's page and size live here and nowhere else - the
+            # platform package moved them out of `params`.
+            body=spec["body"] or None,
             endpoint=call.endpoint,
         ),
         timeout,

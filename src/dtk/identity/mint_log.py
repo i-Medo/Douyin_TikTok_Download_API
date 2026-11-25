@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any, Final
 
@@ -39,8 +40,17 @@ log = get_logger(__name__)
 CURRENT_KEY: Final = "worker:mint:current"
 #: The last few attempts, newest first.
 RECENT_KEY: Final = "worker:mint:recent"
-#: Set while the shared backoff is holding the sweep off.
-BACKOFF_KEY: Final = "worker:mint:backoff"
+#: Set while a backoff is holding the sweep off one platform; the platform
+#: follows the prefix. One per platform rather than one for the job: the
+#: worker rests each minting route on its own - the browser for Douyin and
+#: TikTok, plain HTTP for Bilibili - and a single shared key told the console
+#: that everything was resting when one route was, then cleared it when the
+#: other route minted.
+BACKOFF_PREFIX: Final = "worker:mint:backoff:"
+#: Set while the sweep keeps passing one platform over without trying, such as
+#: when every exit already carries one of its identities; the platform follows
+#: the prefix. Not an attempt, so not in :data:`RECENT_KEY` - see :func:`skipped`.
+SKIP_PREFIX: Final = "worker:mint:skip:"
 
 #: How many attempts to keep. Enough to show a pattern - a run of failures with
 #: one reason is a different story from an alternating one - and small enough
@@ -95,6 +105,9 @@ async def finished(
         redis = get_redis()
         pipe = redis.pipeline()
         pipe.delete(CURRENT_KEY)
+        # An attempt was made, so whatever was holding this platform back has
+        # let go of it.
+        pipe.delete(skip_key(platform))
         pipe.lpush(RECENT_KEY, json.dumps(entry))
         pipe.ltrim(RECENT_KEY, 0, KEEP - 1)
         pipe.expire(RECENT_KEY, RECENT_TTL)
@@ -103,34 +116,83 @@ async def finished(
         log.debug("mint_log.finished_unavailable", error=type(exc).__name__)
 
 
-async def backing_off(*, failures: int, seconds: float) -> None:
-    """Record that the sweep is holding off, and for how long.
+def backoff_key(platform: Platform) -> str:
+    return f"{BACKOFF_PREFIX}{platform.value}"
+
+
+def skip_key(platform: Platform) -> str:
+    return f"{SKIP_PREFIX}{platform.value}"
+
+
+async def skipped(platform: Platform, *, reason: str, ttl: int) -> None:
+    """Record that the sweep passed ``platform`` over, and why.
+
+    Kept apart from the attempts on purpose. A skip repeats every tick for as
+    long as its cause lasts, and written into the attempt list it was drawn as
+    a row of failures - "20 of the last 20 failed" for a pool that had simply
+    run out of exits (#807) - while pushing the real attempts out of the window
+    within twenty minutes.
+
+    ``ttl`` should cover a few sweeps: the key's presence is the state, so it
+    lapses on its own once the sweep stops skipping, and :func:`finished`
+    clears it as soon as an attempt is made. ``since`` carries over from the
+    entry it replaces while the reason stays the same, so the console can say
+    for how long.
+    """
+    key = skip_key(platform)
+    try:
+        redis = get_redis()
+        previous = _decode(await redis.get(key))
+        now = _now()
+        since = previous.get("since") if previous and previous.get("reason") == reason else None
+        entry = {"reason": reason, "since": since or now, "at": now}
+        await redis.set(key, json.dumps(entry), ex=max(1, ttl))
+    except Exception as exc:  # pragma: no cover - a breadcrumb, never a failure
+        log.debug("mint_log.skip_unavailable", error=type(exc).__name__)
+
+
+async def backing_off(
+    platforms: Iterable[Platform], *, route: str, failures: int, seconds: float
+) -> None:
+    """Record that the sweep is holding off these platforms, and for how long.
+
+    ``platforms`` are every platform minted by ``route``, because that is what
+    the worker rests: one failed browser mint holds off Douyin and TikTok
+    both, and Bilibili not at all.
 
     Given the same lifetime as the wait itself, so the key's presence IS the
     state: nothing has to compare a stored deadline against the clock, and a
     worker that restarts does not leave a backoff nobody is honouring.
     """
+    entry = json.dumps(
+        {
+            "route": route,
+            "failures": failures,
+            "until": datetime.fromtimestamp(
+                datetime.now(UTC).timestamp() + seconds, tz=UTC
+            ).isoformat(),
+        }
+    )
     try:
-        await get_redis().set(
-            BACKOFF_KEY,
-            json.dumps(
-                {
-                    "failures": failures,
-                    "until": datetime.fromtimestamp(
-                        datetime.now(UTC).timestamp() + seconds, tz=UTC
-                    ).isoformat(),
-                }
-            ),
-            ex=max(1, int(seconds)),
-        )
+        pipe = get_redis().pipeline()
+        for platform in platforms:
+            pipe.set(backoff_key(platform), entry, ex=max(1, int(seconds)))
+        await pipe.execute()
     except Exception as exc:  # pragma: no cover - a breadcrumb, never a failure
         log.debug("mint_log.backoff_unavailable", error=type(exc).__name__)
 
 
-async def recovered() -> None:
-    """A mint succeeded, so the backoff no longer applies."""
+async def recovered(platforms: Iterable[Platform]) -> None:
+    """A mint on these platforms' route succeeded, so their backoff is over.
+
+    Only theirs: a Bilibili guest minted over HTTP says nothing about a browser
+    container that is still down.
+    """
+    keys = [backoff_key(platform) for platform in platforms]
+    if not keys:
+        return
     try:
-        await get_redis().delete(BACKOFF_KEY)
+        await get_redis().delete(*keys)
     except Exception as exc:  # pragma: no cover - a breadcrumb, never a failure
         log.debug("mint_log.recover_unavailable", error=type(exc).__name__)
 
@@ -138,26 +200,53 @@ async def recovered() -> None:
 async def snapshot() -> dict[str, Any]:
     """Everything the console needs about minting, in one round trip.
 
+    ``backoffs`` is keyed by platform and holds only the platforms that are
+    resting. ``backoff`` is the longest of them, for a reader written when
+    there was one shared backoff and nothing else. ``skips`` is keyed the same
+    way and holds only the platforms the sweep is currently passing over.
+
     Returns empty structures rather than raising when Redis cannot answer: a
     status panel that disappears is better than a page that fails to load
     because the thing it reports on is down.
     """
-    empty: dict[str, Any] = {"current": None, "recent": [], "backoff": None}
+    empty: dict[str, Any] = {
+        "current": None,
+        "recent": [],
+        "backoff": None,
+        "backoffs": {},
+        "skips": {},
+    }
+    platforms = tuple(Platform)
     try:
         redis = get_redis()
         pipe = redis.pipeline()
         pipe.get(CURRENT_KEY)
         pipe.lrange(RECENT_KEY, 0, KEEP - 1)
-        pipe.get(BACKOFF_KEY)
-        current, recent, backoff = await pipe.execute()
+        for platform in platforms:
+            pipe.get(backoff_key(platform))
+        for platform in platforms:
+            pipe.get(skip_key(platform))
+        current, recent, *per_platform = await pipe.execute()
     except Exception as exc:
         log.debug("mint_log.snapshot_unavailable", error=type(exc).__name__)
         return empty
 
+    resting, skipping = per_platform[: len(platforms)], per_platform[len(platforms) :]
+    backoffs = _by_platform(platforms, resting)
     return {
         "current": _decode(current),
         "recent": [entry for entry in (_decode(raw) for raw in recent or []) if entry is not None],
-        "backoff": _decode(backoff),
+        "backoff": max(backoffs.values(), key=lambda entry: str(entry.get("until")), default=None),
+        "backoffs": backoffs,
+        "skips": _by_platform(platforms, skipping),
+    }
+
+
+def _by_platform(platforms: tuple[Platform, ...], raws: list[Any]) -> dict[str, dict[str, Any]]:
+    return {
+        platform.value: entry
+        for platform, entry in zip(platforms, (_decode(raw) for raw in raws), strict=True)
+        if entry is not None
     }
 
 
@@ -177,14 +266,18 @@ def _decode(raw: Any) -> dict[str, Any] | None:
 
 
 __all__ = [
-    "BACKOFF_KEY",
+    "BACKOFF_PREFIX",
     "CURRENT_KEY",
     "KEEP",
     "RECENT_KEY",
     "RECENT_TTL",
+    "SKIP_PREFIX",
     "backing_off",
+    "backoff_key",
     "finished",
     "recovered",
+    "skip_key",
+    "skipped",
     "snapshot",
     "started",
 ]

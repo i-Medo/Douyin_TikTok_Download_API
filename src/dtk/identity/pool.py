@@ -10,7 +10,7 @@ docs/design/02-identity-pool.md.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Final
@@ -31,6 +31,7 @@ from dtk.core.types import (
 from dtk.db.models import Identity as IdentityRow
 from dtk.db.models import IdentityEvent
 from dtk.identity.importing import to_cookie_header
+from dtk.identity.rotation import rotate
 from dtk.scheduler.health import HealthInput, cooldown_seconds
 from dtk.scheduler.leases import forget_identity
 from dtk.scheduler.scheduler import Candidate
@@ -138,6 +139,16 @@ class LiveIdentity:
         return to_cookie_header(self.cookies)
 
 
+def _jar_of(header: str) -> dict[str, str]:
+    """The stored ``name=value; ...`` header back as a mapping."""
+    cookies: dict[str, str] = {}
+    for chunk in header.split(";"):
+        name, sep, value = chunk.partition("=")
+        if sep:
+            cookies[name.strip()] = value.strip()
+    return cookies
+
+
 def _fingerprint_from_json(data: dict) -> Fingerprint:
     family_raw = data.get("browser_family")
     family: BrowserFamily | None = None
@@ -159,6 +170,7 @@ def _fingerprint_from_json(data: dict) -> Fingerprint:
         # rather than claiming a machine nobody measured.
         hardware_concurrency=data.get("hardware_concurrency"),
         device_memory=data.get("device_memory"),
+        device_id=data.get("device_id"),
     )
 
 
@@ -173,6 +185,7 @@ def _fingerprint_to_json(fp: Fingerprint) -> dict:
         "timezone": fp.timezone,
         "hardware_concurrency": fp.hardware_concurrency,
         "device_memory": fp.device_memory,
+        "device_id": fp.device_id,
     }
 
 
@@ -192,6 +205,7 @@ class IdentityPool:
         source: IdentitySource,
         proxy_id: uuid.UUID | None = None,
         authenticated: bool = False,
+        note: str | None = None,
     ) -> uuid.UUID:
         """Persist a new identity.
 
@@ -215,6 +229,7 @@ class IdentityPool:
             source=source.value,
             state=IdentityState.ACTIVE.value,
             minted_at=datetime.now(UTC),
+            note=note,
         )
         session.add(row)
         session.add(
@@ -247,12 +262,7 @@ class IdentityPool:
         row = await session.get(IdentityRow, uuid.UUID(identity_id))
         if row is None or row.state == IdentityState.RETIRED.value:
             return None
-        header = self._cipher.decrypt(row.cookies_encrypted, aad=str(row.id))
-        cookies = {}
-        for chunk in header.split(";"):
-            name, sep, value = chunk.partition("=")
-            if sep:
-                cookies[name.strip()] = value.strip()
+        cookies = _jar_of(self._cipher.decrypt(row.cookies_encrypted, aad=str(row.id)))
         return LiveIdentity(
             id=str(row.id),
             platform=Platform(row.platform),
@@ -311,6 +321,12 @@ class IdentityPool:
                         window_risk,
                         row.consecutive_fails,
                     ),
+                    rotation_endpoints=(
+                        tuple(row.rotation_endpoints)
+                        if row.rotation_endpoints is not None
+                        else None
+                    ),
+                    authenticated=row.authenticated,
                 )
             )
         return candidates
@@ -568,6 +584,74 @@ class IdentityPool:
         )
         return IdentityState(row.state)
 
+    async def remember_device_id(
+        self, session: AsyncSession, identity_id: str, device_id: str
+    ) -> None:
+        """Keep the device id the platform issued this identity's session.
+
+        Written into the fingerprint, which is where every request builder
+        already reads the identity's browser facts from, so no call path has to
+        be taught to look somewhere new.
+        """
+        row = await session.get(IdentityRow, uuid.UUID(identity_id))
+        if row is None:
+            return
+        row.fingerprint = {**(row.fingerprint or {}), "device_id": device_id}
+
+    async def absorb_cookies(
+        self, session: AsyncSession, identity_id: str, offered: Mapping[str, str]
+    ) -> tuple[str, ...]:
+        """Keep the cookies a response set, by the rules in `dtk.identity.rotation`.
+
+        In the caller's session, never one of its own: a transaction that has
+        already used this identity once - a retry, the next page, a follow-up -
+        holds its row from that request's bookkeeping until it commits, and a
+        second session would wait on that lock while its own caller waits for
+        it (the reason `RawResponse.set_cookies` exists).
+
+        The row is read again from the database, under a row lock, rather than
+        taken from the session. The copy a request loaded can be the whole
+        request old - on a TikTok identity's first call the device id makes it
+        dirty, which keeps it pinned in the session - and a retire committed
+        meanwhile has wiped the credential that copy still holds. Writing it
+        back gave a retired identity its cookies again; found in review, before
+        release. The lock is the one `record_outcome` takes a moment later in
+        the same transaction, and it also means two requests on one identity no
+        longer undo each other's rotation. Pending changes to the row are
+        flushed first, so the device id is not lost to the refresh.
+
+        Returns the names that changed.
+        """
+        if not offered:
+            return ()
+        row = await session.get(
+            IdentityRow, uuid.UUID(identity_id), with_for_update=True, populate_existing=True
+        )
+        if row is None or row.state == IdentityState.RETIRED.value or not row.cookies_encrypted:
+            return ()
+        platform = Platform(row.platform)
+        jar = _jar_of(self._cipher.decrypt(row.cookies_encrypted, aad=str(row.id)))
+        rotation = rotate(platform, jar, offered)
+        if rotation.refused:
+            log.info(
+                "identity.cookies.refused",
+                identity_id=identity_id,
+                platform=platform.value,
+                names=list(rotation.refused),
+            )
+        if not rotation.changed:
+            return ()
+        row.cookies_encrypted = self._cipher.encrypt(
+            to_cookie_header(rotation.jar), aad=str(row.id)
+        )
+        log.info(
+            "identity.cookies.rotated",
+            identity_id=identity_id,
+            platform=platform.value,
+            names=list(rotation.changed),
+        )
+        return rotation.changed
+
     async def retire(self, session: AsyncSession, identity_id: str, reason: str) -> None:
         """Retire an identity and wipe its credential immediately.
 
@@ -591,6 +675,71 @@ class IdentityPool:
         await session.flush()
         await forget_identity(identity_id)
         log.info("identity.retired", identity_id=identity_id, reason=reason)
+
+    async def retire_burned(
+        self,
+        session: AsyncSession,
+        platform: Platform,
+        *,
+        streak: int,
+        max_fail_streak: int,
+        limit: int = 200,
+    ) -> int:
+        """Retire minted guests that have failed ``streak`` times in a row.
+
+        Nothing retired an identity on its own. One the platform had flagged
+        cooled, waited, was promoted back, was handed a request and failed
+        again, for ever: measured on the demo on 2026-11-02, 1273 of its 1288
+        live Douyin identities had failed three or more times in a row, 476 of
+        them ten or more, and still about 600 were used in a day. Every one of
+        those requests was a risk-control answer, and the endpoint's circuit
+        breaker counts them - so they tripped it for the users the healthy
+        identities could have served.
+
+        Only minted guests. A guest costs a mint to replace; a login is somebody's
+        account, and whether it is finished is its owner's call.
+
+        Only while the platform still has a usable identity. If none is, the
+        platform is refusing everyone and the streaks say nothing about any one
+        identity - the filler holds off minting into that, and retiring the
+        pool from under it would leave nothing to recover with.
+        """
+        if streak <= 0:
+            return 0
+        if await self.usable_count(session, platform, max_fail_streak=max_fail_streak) == 0:
+            return 0
+        burned = (
+            await session.execute(
+                select(IdentityRow.id, IdentityRow.consecutive_fails)
+                .where(
+                    IdentityRow.platform == platform.value,
+                    IdentityRow.state.in_(
+                        (
+                            IdentityState.ACTIVE.value,
+                            IdentityState.COOLING.value,
+                            IdentityState.DEGRADED.value,
+                        )
+                    ),
+                    IdentityRow.source == IdentitySource.MINTED.value,
+                    IdentityRow.authenticated.is_(False),
+                    IdentityRow.consecutive_fails >= streak,
+                )
+                .order_by(IdentityRow.consecutive_fails.desc())
+                .limit(limit)
+            )
+        ).all()
+        for identity_id, fails in burned:
+            await self.retire(
+                session, str(identity_id), f"auto: {fails} consecutive failures with no success"
+            )
+        if burned:
+            log.info(
+                "identity.burned_retired",
+                platform=platform.value,
+                retired=len(burned),
+                streak=streak,
+            )
+        return len(burned)
 
     async def counts(self, session: AsyncSession, platform: Platform) -> dict[str, int]:
         rows = await session.execute(
@@ -623,6 +772,10 @@ class IdentityPool:
                 IdentityRow.platform == platform.value,
                 IdentityRow.state.in_((IdentityState.ACTIVE.value, cooling)),
                 IdentityRow.consecutive_fails < max_fail_streak,
+                # An identity kept out of rotation is not capacity the shared
+                # pool can spend. Counting it let one reserved account hold the
+                # level at its target while general traffic had nothing to use.
+                IdentityRow.rotation_endpoints.is_(None),
             )
         )
         return int(rows.scalar_one())

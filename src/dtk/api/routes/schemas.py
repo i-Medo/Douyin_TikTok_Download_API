@@ -15,10 +15,11 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from dtk.api.routes.passwords import MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH
 from dtk.core.types import Platform, Scope, UserRole
+from dtk.db.models import IDENTITY_NOTE_MAX
 from dtk.services import collections
 
 #: Usernames are local console accounts, not display names: keep them to what
@@ -38,6 +39,26 @@ class Body(BaseModel):
     """Base for every request body: unknown fields are an error, not noise."""
 
     model_config = ConfigDict(extra="forbid")
+
+
+def identity_note(value: str | None) -> str | None:
+    """An identity's note as stored: trimmed, one line, and absent when blank.
+
+    Blank is no note rather than an empty one, so clearing the box clears the
+    note. A line break is refused rather than folded: the note is shown on one
+    line in a table, and a multi-line paste in it is almost always the cookie
+    jar that was meant for the box above.
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        raise ValueError("a note is one line, without control characters")
+    if len(text) > IDENTITY_NOTE_MAX:
+        raise ValueError(f"a note is at most {IDENTITY_NOTE_MAX} characters")
+    return text
 
 
 # --------------------------------------------------------------------------
@@ -167,7 +188,9 @@ class MintRequest(Body):
         default=None,
         description=(
             "Mint behind this exit and bind the identities to it. An identity is minted "
-            "from one address and must keep using it; omitting this mints direct."
+            "from one address and must keep using it. Omitted, each one takes a healthy "
+            "proxy no identity is bound to yet, and mints direct only when no proxy is "
+            "configured at all."
         ),
     )
 
@@ -210,7 +233,11 @@ class IdentityImport(Body):
     )
     proxy_id: str | None = Field(
         default=None,
-        description="Send as this identity only through this exit.",
+        description=(
+            "Send as this identity only through this exit. Omitted, the identity goes "
+            "out directly from this server, for good: an identity's exit is fixed when "
+            "it is stored."
+        ),
     )
     dry_run: bool = Field(
         default=False,
@@ -219,6 +246,44 @@ class IdentityImport(Body):
             "is far easier to spot than to debug."
         ),
     )
+    reserved: bool = Field(
+        default=False,
+        description=(
+            "Store it out of rotation, for the requests that name it with `identity=` "
+            "and nothing else. The same as an empty list on its rotation, set before "
+            "rotation can hand it out once."
+        ),
+    )
+    note: str | None = Field(
+        default=None,
+        max_length=1024,
+        description=(
+            "A note to keep with it, such as the account it signs in as. One line, at "
+            f"most {IDENTITY_NOTE_MAX} characters once trimmed."
+        ),
+    )
+
+    _note = field_validator("note")(identity_note)
+
+
+class IdentityUpdate(Body):
+    """What an operator may change about an identity after storing it.
+
+    Only the note. The cookies, the proxy and the fingerprint are bound for
+    life (doc 02); rotation has its own route because it changes what the
+    scheduler does, and that is audited apart from a label.
+    """
+
+    note: str | None = Field(
+        description=(
+            "The note, or null to clear it. One line, at most "
+            f"{IDENTITY_NOTE_MAX} characters once trimmed; blank clears it too. "
+            "Required, so that an empty body cannot read as clearing it."
+        ),
+        max_length=1024,
+    )
+
+    _note = field_validator("note")(identity_note)
 
 
 class IdentityExport(Body):
@@ -375,6 +440,24 @@ class ApiKeyCreate(Body):
     )
 
 
+class ApiKeyUpdate(Body):
+    """A key's label and reach. Never its secret: whatever holds it keeps working."""
+
+    name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="Rename the key. Shown in the list and in the audit log.",
+    )
+    scopes: list[Scope] | None = Field(
+        default=None,
+        description=(
+            "Replace what the key may do with exactly this list. Bounded by your own "
+            "scopes, as when creating one."
+        ),
+    )
+
+
 class SettingUpdate(Body):
     value: object = Field(
         description=(
@@ -500,6 +583,40 @@ class DownloadRequest(Body):
             "posts and forty already on disk."
         ),
     )
+    part: int | None = Field(
+        default=None,
+        ge=1,
+        le=1000,
+        description=(
+            "Bilibili only: which part of a video uploaded in several, from 1. Omitted, "
+            "it is the part a link's `?p=` names, or the first. A later part is stored "
+            "beside the first, in a directory of its own."
+        ),
+    )
+
+
+class TranscriptionRequest(Body):
+    """Start or reuse a transcription for one stored video."""
+
+    download_id: uuid.UUID = Field(description="Download UUID containing the source video.")
+    normalize: bool = Field(
+        default=True,
+        description="Apply contextual Chinese inverse text normalization to the transcript.",
+    )
+    refresh: bool = Field(
+        default=False,
+        description="Create a new transcription instead of reusing a completed match.",
+    )
+
+
+class TranscriptionDeleteRequest(Body):
+    """Delete settled transcription records without touching their source media."""
+
+    ids: list[uuid.UUID] = Field(
+        min_length=1,
+        max_length=100,
+        description="Settled transcription ids to delete as one atomic operation.",
+    )
 
 
 class RetryRequest(Body):
@@ -527,6 +644,19 @@ class DedupeRequest(Body):
 
     dry_run: bool = Field(
         default=False, description="Report what would go without deleting anything."
+    )
+
+
+class RotationRequest(Body):
+    endpoints: list[str] | None = Field(
+        max_length=64,
+        description=(
+            "Which endpoints rotation may hand this identity to. null for all of them, "
+            "the default for every identity; an empty list for none, so only a request "
+            "that names the identity with `identity=` uses it; or endpoint names such "
+            "as `douyin.author_posts`. Required, so that leaving it out cannot read as "
+            "lifting a restriction."
+        ),
     )
 
 
@@ -728,6 +858,15 @@ class WatchUpdate(Body):
     interval_seconds: int | None = Field(
         default=None, ge=1, description="Change how often it runs. Same floor as on create."
     )
+    label: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Rename it in the console. Send null or an empty string to clear it, and "
+            "the next successful run fills it in from the platform again; leave it out "
+            "to keep the current one."
+        ),
+    )
     enabled: bool | None = Field(
         default=None,
         description="Pause it or start it again. A paused entry keeps its history.",
@@ -756,6 +895,14 @@ class DiagnoseRequest(Body):
             "spends an identity. Skipping it keeps the whole diagnosis local."
         ),
     )
+    platform: Platform | None = Field(
+        default=None,
+        description=(
+            "Which platform the end-to-end step fetches from. Omitted, the platform this "
+            "instance can serve is chosen: the one with the most active identities in "
+            "rotation, or Bilibili on an instance with no browser and no identities."
+        ),
+    )
 
 
 __all__ = [
@@ -763,6 +910,7 @@ __all__ = [
     "MAX_PASTE_CHARS",
     "USERNAME_PATTERN",
     "ApiKeyCreate",
+    "ApiKeyUpdate",
     "BackfillRequest",
     "BackupRequest",
     "BatchItem",

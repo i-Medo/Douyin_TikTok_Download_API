@@ -34,16 +34,26 @@ from dtk.api.deps import Principal, enforce_rate_limit
 from dtk.api.request_proxy import RequestProxyMode
 from dtk.api.request_proxy import vet as vet_proxy
 from dtk.api.routes.openapi import I18N_KEY
-from dtk.api.routes.support import ok
-from dtk.core.errors import InvalidParam, NotConfigured, UpstreamRiskControl
+from dtk.api.routes.support import manage_pool, ok
+from dtk.core.errors import InvalidParam, NotConfigured, SigningFailed, UpstreamRiskControl
 from dtk.core.logging import get_logger
-from dtk.core.types import Platform, Scope
+from dtk.core.types import PLATFORM_READ_SCOPES, Platform
 from dtk.identity.importing import parse_cookies
-from dtk.identity.minting import BrowserRpcClient, BrowserRpcUnavailable
+from dtk.identity.minting import (
+    BrowserRpcClient,
+    BrowserRpcUnavailable,
+    NativeMinter,
+    NativeMintFailed,
+)
+from dtk.identity.minting.native import NATIVE_MINT_PLATFORMS
+from dtk.platforms.bilibili.ids import BVID_PATTERN
 from dtk.signing import SigningSession, native_signers
 from dtk.signing.base import MS_TOKEN_PARAM, SignedParams, StaticFingerprint
 from dtk.signing.base import RequestSpec as SigningRequest
 from dtk.signing.native import decoding, tiktok_sign, websign
+from dtk.signing.native.wbi import WbiKeys
+from dtk.signing.native.wbi_keys import NavKeySource
+from dtk.transport.wreq_transport import WreqTransport
 from dtk.urls import extract_urls, first_url, identify, read_content_id
 
 log = get_logger(__name__)
@@ -327,9 +337,11 @@ async def sign(
 ) -> Any:
     """Compute the signature parameters a platform API URL needs.
 
-    Pure arithmetic: nothing is fetched, no identity is spent, and the result
-    depends only on what you send. Give it the full URL including its query and
-    it returns that query with the signature appended, ready to send.
+    Pure arithmetic: no identity is spent, and the result depends only on what
+    you send. Nothing is fetched either, except on Bilibili, whose two public
+    WBI keys come from the platform's own nav endpoint, at most hourly. Give it
+    the full URL including its query and it returns that query with the
+    signature appended, ready to send.
 
     Three things have to line up between signing and sending, or the platform
     refuses the request. Measured 2026-09-08 by sending this endpoint's own
@@ -348,7 +360,7 @@ async def sign(
 
     **Parameters**
 
-    - `platform` - `douyin` or `tiktok`.
+    - `platform` - `douyin`, `tiktok` or `bilibili`.
     - `url` - the API URL to sign, query included.
     - `user_agent` - what the request will be sent with; a Chrome default is
       used if you omit it.
@@ -390,7 +402,7 @@ async def sign(
     Send `query` byte for byte - re-encoding it changes the bytes the signature
     covers - and send every header in `headers` alongside it.
     """
-    principal.require(Scope.DOUYIN_READ, Scope.TIKTOK_READ)
+    principal.require(*PLATFORM_READ_SCOPES)
     platform = body.platform
     user_agent = (body.user_agent or DEFAULT_USER_AGENT).strip()
     if not user_agent:
@@ -418,7 +430,7 @@ async def sign(
     if body.ms_token:
         cookies["msToken"] = body.ms_token
 
-    signer = native_signers()[platform]
+    signer = native_signers(wbi_keys=_WBI_KEYS)[platform]
     signed = await signer.sign(
         SigningRequest(method="GET", url=base, params=params),
         StaticFingerprint(user_agent=user_agent, browser_platform="Win32"),
@@ -481,7 +493,25 @@ class DecodeRequest(BaseModel):
     )
 
 
-def _decode_target(body: DecodeRequest) -> tuple[str, list[decoding.Decoded]]:
+async def _wbi_keys_for(body: DecodeRequest) -> WbiKeys | None:
+    """Bilibili's published keys, only when a ``w_rid`` came with its query.
+
+    The one input a check here needs that is not in the request. Asked of the
+    same cached source the sign tool uses, so at most one ``nav`` request an
+    hour; when it fails, the check is reported as not run rather than as wrong.
+    """
+    if "w_rid=" not in body.value.lower():
+        return None
+    try:
+        return await _WBI_KEYS.keys()
+    except SigningFailed as exc:
+        log.warning("tools.decode.wbi_keys_unavailable", error=str(exc)[:200])
+        return None
+
+
+def _decode_target(
+    body: DecodeRequest, wbi_keys: WbiKeys | None = None
+) -> tuple[str, list[decoding.Decoded]]:
     """Work out what was pasted, then decode it. Order is cheapest-first.
 
     An explicit ``parameter`` wins over every guess: the caller knows, and a
@@ -493,7 +523,7 @@ def _decode_target(body: DecodeRequest) -> tuple[str, list[decoding.Decoded]]:
             decoding.decode_parameter(body.parameter, text, user_agent=body.user_agent)
         ]
     if "?" in text or "&" in text:
-        found = decoding.decode_url(text, user_agent=body.user_agent)
+        found = decoding.decode_url(text, user_agent=body.user_agent, wbi_keys=wbi_keys)
         if found:
             return SOURCE_URL, found
     name, separator, raw = text.partition("=")
@@ -525,8 +555,11 @@ async def decode(
     you own can be explained. Paste a whole signed URL and every parameter in it
     is decoded against the exact string that parameter seals.
 
-    Pure arithmetic. Nothing is fetched, no identity is spent, and the result
-    depends only on what you send.
+    Pure arithmetic. No identity is spent, and the result depends only on what
+    you send. Nothing is fetched either, except Bilibili's two public WBI keys
+    when a signed URL carries a `w_rid`: its md5 covers the query and a key mixed
+    from them, so they are the one input a check needs that is not in the
+    request. They are cached, so that is at most one `nav` request an hour.
 
     **What "decode" means here** - three different things, and every field says
     which one it is, because running them together is how a tool like this
@@ -569,8 +602,8 @@ async def decode(
     Fields are labelled, not translated: `name` is a stable slug, so a client
     may key off it.
     """
-    principal.require(Scope.DOUYIN_READ, Scope.TIKTOK_READ)
-    source, decoded = _decode_target(body)
+    principal.require(*PLATFORM_READ_SCOPES)
+    source, decoded = _decode_target(body, await _wbi_keys_for(body))
     platform = next((item.platform for item in decoded if item.platform), None)
     # Never the value, never a cookie: this endpoint is handed live signatures
     # and a log line is the easiest place to lose one.
@@ -628,7 +661,7 @@ async def parse_url(
     The platform, resource kind, id, handle, canonical URL, whether it needs
     expanding, and whether it is a supported target at all.
     """
-    principal.require(Scope.DOUYIN_READ, Scope.TIKTOK_READ)
+    principal.require(*PLATFORM_READ_SCOPES)
     # The same second pass /parse makes. Both apps put a caption, a numeric
     # code and the link on the clipboard together, and that whole string is
     # what a paste into the console sends - so an endpoint documented as
@@ -705,7 +738,7 @@ async def parse_batch(
     One entry per distinct line in the order given, each with what it was
     recognised as, and a summary count by outcome.
     """
-    principal.require(Scope.DOUYIN_READ, Scope.TIKTOK_READ)
+    principal.require(*PLATFORM_READ_SCOPES)
 
     seen: set[str] = set()
     items: list[dict[str, Any]] = []
@@ -801,6 +834,17 @@ def _identify_line(line: str) -> dict[str, Any]:
                 entry["minted_at"] = parsed.minted_at.isoformat()
         return entry
 
+    # A bvid names its platform, which a bare number never does: it is the
+    # one id that can be placed without a link around it.
+    if BVID_PATTERN.fullmatch(line.strip()):
+        entry.update(
+            kind="content_id",
+            platform=Platform.BILIBILI.value,
+            resource="video",
+            resource_id=line.strip(),
+        )
+        return entry
+
     parsed = read_content_id(line)
     if parsed is not None:
         entry.update(
@@ -815,6 +859,12 @@ def _identify_line(line: str) -> dict[str, Any]:
     if line.strip().isdigit():
         entry["kind"] = "bad_id"
     return entry
+
+
+#: Bilibili's two WBI keys, shared by every call here. They are public and the
+#: same for everyone, but they are fetched - from the platform's own ``nav`` -
+#: so a fresh source per request would ask for them on every signature.
+_WBI_KEYS: Final = NavKeySource()
 
 
 class IdentityRequest(BaseModel):
@@ -838,7 +888,7 @@ class IdentityRequest(BaseModel):
 async def mint_identity(
     request: Request,
     body: IdentityRequest,
-    principal: Principal = Depends(enforce_rate_limit),
+    principal: Principal = Depends(manage_pool),
 ) -> Any:
     """Drive a real browser to the platform and hand back the cookies it was given.
 
@@ -848,8 +898,8 @@ async def mint_identity(
     is not enough to make a request that works.
 
     Expect it to take tens of seconds: it launches a browser, loads the page and
-    waits for the scripts to finish setting cookies. It needs the
-    `identity:manage` scope, which ordinary read keys do not carry.
+    waits for the scripts to finish setting cookies. It needs `identity:manage`
+    and the operator role, as minting into the pool does.
 
     Nothing is stored. The jar is returned to you and forgotten - use
     `/api/v1/admin/identities/mint` instead if you want it added to this
@@ -857,7 +907,7 @@ async def mint_identity(
 
     **Parameters**
 
-    - `platform` - `douyin` or `tiktok`.
+    - `platform` - `douyin`, `tiktok` or `bilibili`.
     - `proxy` - mint behind this egress. Subject to the same
       `security.request_proxy` setting as every other proxy parameter, and worth
       setting: cookies minted at one address and used from another are the
@@ -870,14 +920,16 @@ async def mint_identity(
     from. Send all of it together; a jar used with a different User-Agent is a
     weaker identity than no identity.
     """
-    principal.require(Scope.IDENTITY_MANAGE)
-
+    # Gated by `manage_pool`, not by a scope check in the body. That check was
+    # here, and a scope check alone admits every console session: a viewer
+    # could drive the browser container and be handed a fresh jar.
     settings = request.app.state.settings
     base_url = getattr(settings, "browser_rpc_url", "")
-    if not base_url:
+    native = body.platform in NATIVE_MINT_PLATFORMS
+    if not native and not base_url:
         raise NotConfigured(
             "this instance has no browser-rpc service configured, so it cannot mint",
-            details={"setting": "DTK_BROWSER_RPC_URL"},
+            details={"setting": "DTK_BROWSER_RPC_URL", "platform": body.platform.value},
         )
 
     # The caller's egress goes through exactly the same gate as ?proxy= on the
@@ -890,16 +942,11 @@ async def mint_identity(
         mode = RequestProxyMode.DENY
     egress = await vet_proxy(body.proxy, mode=mode)
 
-    client = BrowserRpcClient(base_url)
-    try:
-        minted = await client.mint(body.platform, proxy_url=egress)
-    except BrowserRpcUnavailable as exc:
-        raise UpstreamRiskControl(
-            "the browser service could not mint an identity right now",
-            details={"platform": body.platform.value},
-        ) from exc
-    finally:
-        await client.aclose()
+    minted = (
+        await _mint_natively(body.platform, egress)
+        if native
+        else await _mint_in_browser(base_url, body.platform, egress)
+    )
 
     fingerprint = minted.fingerprint
     log.info(
@@ -927,6 +974,38 @@ async def mint_identity(
             "exit_ip": minted.exit_ip,
         },
     )
+
+
+async def _mint_in_browser(base_url: str, platform: Platform, egress: str | None) -> Any:
+    client = BrowserRpcClient(base_url)
+    try:
+        return await client.mint(platform, proxy_url=egress)
+    except BrowserRpcUnavailable as exc:
+        raise UpstreamRiskControl(
+            "the browser service could not mint an identity right now",
+            details={"platform": platform.value},
+        ) from exc
+    finally:
+        await client.aclose()
+
+
+async def _mint_natively(platform: Platform, egress: str | None) -> Any:
+    """A Bilibili guest, over plain HTTP: no browser involved.
+
+    Through a transport of its own, closed afterwards, so the TLS profile the
+    jar is handed back with is the one that obtained it - the same client the
+    worker's minter uses.
+    """
+    transport = WreqTransport()
+    try:
+        return await NativeMinter(transport).mint(platform, proxy_url=egress)
+    except NativeMintFailed as exc:
+        raise UpstreamRiskControl(
+            "Bilibili did not hand out a guest session right now",
+            details={"platform": platform.value},
+        ) from exc
+    finally:
+        await transport.close()
 
 
 __all__ = ["router"]

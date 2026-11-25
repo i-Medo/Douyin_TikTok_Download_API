@@ -81,6 +81,10 @@ SNAPSHOT_COMPRESSION_AFTER_DAYS: Final[int] = 7
 _UTC_NOW = func.now()
 _NEW_UUID = text("gen_random_uuid()")
 
+#: Longest note an identity may carry. Room for "signed in as X, cookie from
+#: the work laptop", and too short for a cookie jar pasted into the wrong box.
+IDENTITY_NOTE_MAX: Final[int] = 200
+
 
 def _repr(name: str, **fields: object) -> str:
     """Render a repr from an explicit allowlist of fields.
@@ -193,6 +197,11 @@ class Proxy(Base):
     timezone: Mapped[str | None] = mapped_column(Text, default=None)
     healthy: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    #: Why the last probe failed, credentials scrubbed; cleared by one that
+    #: passes. Before it, the reason reached a log line and nowhere else, so the
+    #: console said "unhealthy" and could not say that the proxy had answered
+    #: CONNECT with 400 - which is the whole diagnosis (#781).
+    last_error: Mapped[str | None] = mapped_column(Text, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=_UTC_NOW)
 
     def __repr__(self) -> str:
@@ -211,8 +220,14 @@ class Identity(Base):
 
     __tablename__ = "identities"
     __table_args__ = (
-        CheckConstraint("platform IN ('douyin','tiktok')", name="ck_identities_platform"),
+        CheckConstraint(
+            "platform IN ('douyin','tiktok','bilibili')", name="ck_identities_platform"
+        ),
         CheckConstraint("source IN ('minted','imported')", name="ck_identities_source"),
+        CheckConstraint(
+            f"note IS NULL OR char_length(note) BETWEEN 1 AND {IDENTITY_NOTE_MAX}",
+            name="ck_identities_note_length",
+        ),
         # The scheduler's candidate query: healthy identities of one platform,
         # least recently used first.
         Index("ix_identities_platform_state_last_used", "platform", "state", "last_used_at"),
@@ -241,6 +256,22 @@ class Identity(Base):
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     retire_reason: Mapped[str | None] = mapped_column(Text, default=None)
+    #: Which endpoints may draw this identity from rotation. NULL is all of
+    #: them, which is every identity until somebody says otherwise; an empty
+    #: list is none, so only a request that names it ever uses it; a list of
+    #: endpoint names is those and no others. A pinned request is never
+    #: filtered by this - reserving an account is how you keep it for the
+    #: requests that pin it (#789).
+    rotation_endpoints: Mapped[list[str] | None] = mapped_column(ARRAY(Text), default=None)
+    #: Whatever the operator wants to remember about it - whose account it is,
+    #: where the cookie came from. Theirs alone: nothing reads it but people.
+    note: Mapped[str | None] = mapped_column(Text, default=None)
+    #: The account the platform said these cookies belong to, the last time the
+    #: session was checked. The note says what somebody believes; this says
+    #: what the platform answered, so two logins with the same note - or one
+    #: login imported twice - can still be told apart.
+    account_id: Mapped[str | None] = mapped_column(Text, default=None)
+    account_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
     def __repr__(self) -> str:
         # Never widen this with cookies_encrypted or fingerprint: the first is a
@@ -284,8 +315,18 @@ class Task(Base):
     state: Mapped[str] = mapped_column(Text, server_default=text(f"'{TaskState.QUEUED.value}'"))
     #: Evicted after ``retention.task_result_hours``; the row itself lives on so
     #: statistics survive. A later lookup then answers TASK_NOT_FOUND.
-    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True, default=None)
-    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True, default=None)
+    #:
+    #: ``none_as_null`` for the reason given on ``ArchivedAuthor.raw``. These two
+    #: were missed: eviction wrote the JSON literal ``null``, the eviction filter
+    #: asks ``IS NOT NULL``, and so every maintenance pass rewrote the same rows
+    #: again - 813k updates on a 291-row table before anyone noticed (#822).
+    #: Rows already holding JSON ``null`` still match once and are corrected.
+    result: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True, default=None
+    )
+    error: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True, default=None
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=_UTC_NOW)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
@@ -392,6 +433,11 @@ class RequestLog(Base):
     __table_args__ = (
         Index("ix_request_log_endpoint_ts", "endpoint", text("ts DESC")),
         Index("ix_request_log_identity_ts", "identity_id", text("ts DESC")),
+        # The Logs page's proxy filter, and the proxy drawer's recent outcomes.
+        # Same shape as the two above, for the same reason the outcome index
+        # below exists: a filter that loses the ts ordering scans every chunk
+        # in its window with no early stop.
+        Index("ix_request_log_proxy_ts", "proxy_id", text("ts DESC")),
         # The Logs page's outcome filter, which is two clicks away and is how
         # anyone looks for what went wrong. Without this the filter falls off
         # the ts ordering and seq-scans every retained chunk with no early
@@ -621,13 +667,17 @@ class MediaDownload(Base):
         # of them writes - so the guarantee lives here, which is the only place
         # that sees them all. Partial, so a settled download never blocks a
         # retry.
+        # Per part as well since 0014: a part writes into its own directory.
+        # NULL and 1 are both the first part, so they collide as they must.
         Index(
             "ux_media_downloads_in_flight",
             "platform",
             "content_id",
+            text("COALESCE(part, 1)"),
             unique=True,
             postgresql_where=text("state IN ('queued', 'running')"),
         ),
+        CheckConstraint("part IS NULL OR part > 1", name="ck_media_downloads_part"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -635,10 +685,15 @@ class MediaDownload(Base):
     )
     platform: Mapped[str] = mapped_column(Text)
     content_id: Mapped[str] = mapped_column(Text)
+    #: Which part of a video uploaded in several, from 2. NULL is the first,
+    #: which is the post's own download and the one the library shows; a
+    #: later part is stored in a directory of its own beside it.
+    part: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     author_uid: Mapped[str] = mapped_column(Text)
     #: queued | running | done | partial | failed | cancelled
     state: Mapped[str] = mapped_column(Text, server_default=text("'queued'"))
-    #: Relative to the media root, as <platform>/<author_uid>/<content_id>.
+    #: Relative to the media root, as <platform>/<author_uid>/<content_id>,
+    #: with ``-p<part>`` on the last segment for a later part.
     #: Never absolute: the path inside the container is not the path on the
     #: host, and storing one would make the row wrong the moment the volume
     #: is mounted somewhere else.
@@ -672,6 +727,70 @@ class MediaDownload(Base):
         return _repr(
             "MediaDownload", id=self.id, platform=self.platform, content_id=self.content_id
         )
+
+
+class Transcription(Base):
+    """A durable whole-text transcription of one downloaded video."""
+
+    __tablename__ = "transcriptions"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('queued','running','done','failed','cancelled')",
+            name="ck_transcriptions_state",
+        ),
+        CheckConstraint(
+            "normalization_failure_policy IS NULL OR "
+            "normalization_failure_policy IN ('fallback','fail')",
+            name="ck_transcriptions_normalization_failure_policy",
+        ),
+        Index("ix_transcriptions_download", "download_id", text("created_at DESC")),
+        Index("ix_transcriptions_created", text("created_at DESC")),
+        Index("ix_transcriptions_platform_state", "platform", "state"),
+        Index("ix_transcriptions_task", "task_id"),
+        Index(
+            "ux_transcriptions_in_flight",
+            "download_id",
+            "source_sha256",
+            "model",
+            "normalization_requested",
+            text("COALESCE(normalizer, '')"),
+            text("COALESCE(normalization_failure_policy, '')"),
+            unique=True,
+            postgresql_where=text("state IN ('queued', 'running')"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, server_default=_NEW_UUID
+    )
+    download_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("media_downloads.id", ondelete="SET NULL"), nullable=True
+    )
+    platform: Mapped[str] = mapped_column(Text)
+    content_id: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(Text, server_default=text("'queued'"))
+    model: Mapped[str] = mapped_column(Text)
+    normalization_requested: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    normalization_applied: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    normalizer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    normalization_failure_policy: Mapped[str | None] = mapped_column(Text, nullable=True)
+    normalization_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    source_name: Mapped[str] = mapped_column(Text)
+    source_sha256: Mapped[str] = mapped_column(Text)
+    source_bytes: Mapped[int] = mapped_column(BigInteger)
+    task_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("api_keys.id", ondelete="SET NULL"), nullable=True
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=_UTC_NOW)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def __repr__(self) -> str:
+        return _repr("Transcription", id=self.id, state=self.state, download_id=self.download_id)
 
 
 class WatchlistEntry(Base):
@@ -869,6 +988,7 @@ TABLE_NAMES: Final[tuple[str, ...]] = (
     "archived_authors",
     "archived_contents",
     "media_downloads",
+    "transcriptions",
     "watchlist",
     "collections",
     "collection_items",
@@ -886,6 +1006,7 @@ __all__ = [
     "CONTINUOUS_AGGREGATES",
     "DERIVED_VIEWS",
     "HYPERTABLES",
+    "IDENTITY_NOTE_MAX",
     "IDENTITY_SOURCE_VALUES",
     "IDENTITY_STATE_VALUES",
     "PLATFORM_VALUES",

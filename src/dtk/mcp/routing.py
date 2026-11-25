@@ -26,7 +26,8 @@ from __future__ import annotations
 from typing import Any, Final
 
 from dtk.core.errors import InvalidParam, UnsupportedContent
-from dtk.core.types import Platform
+from dtk.core.types import CommentSort, Platform
+from dtk.platforms.paging import max_page_size
 from dtk.platforms.registry import available_platforms
 from dtk.urls import ResourceKind, UrlKind
 from dtk.worker.registry import (
@@ -34,10 +35,12 @@ from dtk.worker.registry import (
     CONTENT_ID,
     COUNT,
     CURSOR,
+    HANDLE_PLATFORMS,
     SEC_UID_PREFIX,
     UNIQUE_ID,
     Capability,
     EndpointDefinition,
+    comment_sort_params,
     definition_for,
     endpoint_name,
     endpoint_names,
@@ -54,19 +57,21 @@ PARSE_ENDPOINT: Final = "parse"
 
 
 #: Page size bounds. The platforms silently cap larger values, so accepting one
-#: would return fewer items than the agent asked for without saying so.
+#: would return fewer items than the agent asked for without saying so. A
+#: platform's own ceiling (dtk.platforms.paging) can be lower still, and is
+#: checked per platform in :func:`coerce_count`.
 MIN_COUNT: Final = 1
 MAX_COUNT: Final = 50
 
 #: Recognized resource kinds this tool set has no endpoint for. A short link is
 #: absent on purpose: what it points at is unknown until it has been followed.
+#: A sound, a hashtag and a live room left this set when /parse learned to
+#: answer them, and a Douyin reflow link - a live room by its broadcast -
+#: when /parse learned that too; the tool set did not grow for either,
+#: parse_url just goes further.
 _UNFETCHABLE: Final[frozenset[ResourceKind]] = frozenset(
     {
-        ResourceKind.LIVE,
-        ResourceKind.LIVE_ROOM,
         ResourceKind.MIX,
-        ResourceKind.MUSIC,
-        ResourceKind.CHALLENGE,
         ResourceKind.SEARCH,
     }
 )
@@ -97,18 +102,38 @@ def require_text(value: str | None, field: str) -> str:
     return text
 
 
-def coerce_count(value: int | None) -> int | None:
-    """Validate the page size. ``None`` leaves the platform default in place."""
+def coerce_count(value: int | None, platform: Platform) -> int | None:
+    """Validate the page size. ``None`` leaves the platform default in place.
+
+    The bound is the lower of this tool set's and the platform's own, which is
+    what REST checks too. Checking only the first let TikTok's 36 to 50 through,
+    which TikTok answers as an author with no posts, and Bilibili's 21 to 50,
+    which it refuses.
+    """
     if value is None:
         return None
     if not isinstance(value, int) or isinstance(value, bool):
         raise InvalidParam("count must be an integer", details={"field": "count"})
-    if value < MIN_COUNT or value > MAX_COUNT:
+    maximum = min(MAX_COUNT, max_page_size(platform))
+    if value < MIN_COUNT or value > maximum:
         raise InvalidParam(
-            f"count must be between {MIN_COUNT} and {MAX_COUNT}",
-            details={"field": "count", "min": MIN_COUNT, "max": MAX_COUNT},
+            f"count must be between {MIN_COUNT} and {maximum} on {platform.value}",
+            details={"field": "count", "min": MIN_COUNT, "max": maximum},
         )
     return value
+
+
+def coerce_sort(value: str | None) -> CommentSort | None:
+    """Validate a comment order. ``None`` leaves the platform's own in place."""
+    if value is None or not value.strip():
+        return None
+    try:
+        return CommentSort(value.strip().lower())
+    except ValueError:
+        raise InvalidParam(
+            f"sort must be one of {', '.join(CommentSort)}",
+            details={"field": "sort", "allowed": [s.value for s in CommentSort]},
+        ) from None
 
 
 def definition(platform: Platform, capability: Capability) -> EndpointDefinition:
@@ -149,7 +174,7 @@ def _author_identifier(spec: EndpointDefinition, value: str) -> dict[str, Any]:
     not. Where it cannot work, saying so - and naming a next step that exists -
     is worth more to an agent than an empty page.
     """
-    if looks_like_sec_uid(value):
+    if spec.platform not in HANDLE_PLATFORMS or looks_like_sec_uid(value):
         return {AUTHOR_ID: value}
     if UNIQUE_ID in spec.accepts:
         return {UNIQUE_ID: value.lstrip("@")}
@@ -167,6 +192,7 @@ def build_task(
     *,
     cursor: str | None = None,
     count: int | None = None,
+    sort: CommentSort | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Return ``(endpoint, params)`` ready to be queued as a task.
 
@@ -183,9 +209,11 @@ def build_task(
     )
     if cursor is not None and cursor.strip():
         params[CURSOR] = cursor.strip()
-    checked = coerce_count(count)
+    checked = coerce_count(count, platform)
     if checked is not None:
         params[COUNT] = checked
+    if capability is Capability.COMMENTS:
+        params.update(comment_sort_params(platform, sort))
 
     # Raises INVALID_PARAM for a missing or unsupported argument, which costs a
     # sentence rather than an identity's quota.
@@ -221,7 +249,8 @@ def route_url(kind: UrlKind) -> tuple[str, dict[str, Any]]:
     if kind.resource in _UNFETCHABLE:
         raise UnsupportedContent(
             f"that link points at a {kind.resource.value.replace('_', ' ')}, which this "
-            "tool set does not cover; it handles posts and user profiles",
+            "tool set does not cover; it handles posts, user profiles, sounds, hashtags "
+            "and live rooms",
             details={"resource": kind.resource.value, "url": kind.url},
         )
     return PARSE_ENDPOINT, {"url": kind.url}

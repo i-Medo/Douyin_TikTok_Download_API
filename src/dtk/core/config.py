@@ -41,6 +41,12 @@ class BootstrapSettings(BaseSettings):
 
     secret_key: str = Field(default="", description="Master key for credential encryption")
     database_url: str = Field(default="postgresql+asyncpg://dtk:dtk@postgres:5432/dtk")
+    #: Connections each process keeps open, and how many more it may open under
+    #: load before a request waits for one instead. The api and the worker each
+    #: get this many; the diagnosis warns when the two together, plus room for
+    #: the CLI and TimescaleDB, exceed Postgres' `max_connections`.
+    db_pool_size: int = Field(default=5, ge=1)
+    db_max_overflow: int = Field(default=5, ge=0)
     redis_url: str = Field(default="redis://redis:6379/0")
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000
@@ -61,6 +67,11 @@ class BootstrapSettings(BaseSettings):
     #: network no other container is on, so this is defence in depth rather
     #: than the boundary; empty means the sidecar checks nothing.
     downloader_token: str = ""
+    #: Internal transcription sidecar. Empty means transcription is not installed.
+    transcriber_url: str = ""
+    transcriber_token: str = ""
+    transcriber_timeout_seconds: int = 3600
+    transcriber_normalization_failure_policy: str = "fallback"
 
     @field_validator("secret_key")
     @classmethod
@@ -180,6 +191,20 @@ def _pool_override(value: Any) -> int:
     return number
 
 
+def _retire_streak(value: Any) -> int:
+    """0 (never) or a streak of at least two.
+
+    One would retire a guest for a single bad answer - a proxy that dropped
+    once, a request the platform happened to throttle - which is what the
+    cooldown is for. The maintenance job also never retires below
+    ``pool.max_fail_streak``, so a value under it acts as that.
+    """
+    number = int(value)
+    if number < 0 or number == 1:
+        raise ValueError("must be 0 (never) or a streak of 2 or more")
+    return number
+
+
 def _pool_platform_settings() -> list[SettingSpec]:
     """``pool.<platform>.min_size`` / ``target_size`` for every platform.
 
@@ -199,6 +224,58 @@ def _pool_platform_settings() -> list[SettingSpec]:
         )
         for platform in Platform
         for field in ("min_size", "target_size")
+    ]
+
+
+def _pool_login_settings() -> list[SettingSpec]:
+    """``pool.<platform>.guests_first`` for every platform.
+
+    On by default. An endpoint that gives a guest the same answer as a login is
+    answered by a guest first, and reaches a signed-in identity only when no
+    guest can serve it: guests are minted for nothing and replaced in a minute,
+    a login is somebody's account, and spending one on a request a guest would
+    have answered identically only wears it out for the endpoints that need it.
+    Off, logins and guests share those endpoints as they used to.
+    """
+    return [
+        SettingSpec(
+            f"pool.{platform.value}.guests_first",
+            True,
+            Scope.RUNTIME,
+            bool,
+            f"Serve {platform.value} endpoints that need no login from guest identities "
+            "first, and use a signed-in one there only when no guest can",
+        )
+        for platform in Platform
+    ]
+
+
+def _pool_egress_settings() -> list[SettingSpec]:
+    """``pool.<platform>.direct_egress`` for every platform.
+
+    Whether this machine's own address counts as one more exit once proxies
+    are configured. Until 5.1.8 it did not: adding one proxy took a pool that
+    had been minting on the direct egress down to one identity per platform,
+    and the filler then skipped every minute, which the console drew as a row
+    of failures (#807). On, the direct egress holds one identity of the
+    platform like any proxy does, used once every proxy is taken.
+
+    Per platform because reachability is: a server in mainland China with a
+    proxy only for TikTok reaches Douyin directly and TikTok not at all, and a
+    direct TikTok mint there would fail and rest the browser - Douyin's minting
+    with it - every time it was tried.
+    """
+    return [
+        SettingSpec(
+            f"pool.{platform.value}.direct_egress",
+            True,
+            Scope.RUNTIME,
+            bool,
+            f"With proxies configured, also mint one {platform.value} identity on this "
+            "machine's own IP once every proxy has one; without proxies that IP is the "
+            "only exit and is always used",
+        )
+        for platform in Platform
     ]
 
 
@@ -283,7 +360,18 @@ RUNTIME_SETTINGS: dict[str, SettingSpec] = {
             "Consecutive failures after which an identity stops counting towards "
             "the pool level, so the filler replaces it instead of counting it",
         ),
+        SettingSpec(
+            "pool.retire_fail_streak",
+            10,
+            Scope.RUNTIME,
+            int,
+            "Consecutive failures after which a minted guest identity is retired "
+            "automatically, while its platform still has a usable one; 0 never retires",
+            validate=_retire_streak,
+        ),
         *_pool_platform_settings(),
+        *_pool_login_settings(),
+        *_pool_egress_settings(),
         SettingSpec(
             "pool.health_prior",
             0.8,

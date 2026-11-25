@@ -28,6 +28,7 @@ from fastapi.responses import StreamingResponse
 
 from dtk.api.deps import Principal, enforce_rate_limit
 from dtk.api.routes import operations
+from dtk.api.routes import transcriptions as transcription_routes
 from dtk.api.routes.openapi import ACCEPTED_RESPONSES, CREATED_RESPONSES, I18N_KEY
 from dtk.api.routes.schemas import (
     ArchiveDelete,
@@ -41,9 +42,16 @@ from dtk.api.routes.support import ok
 from dtk.core.db import session_scope
 from dtk.core.errors import DownloaderDown, NotConfigured, NotFound
 from dtk.core.logging import get_logger
-from dtk.core.types import Availability, ContentKind, DurationBucket, Platform, Scope
+from dtk.core.types import (
+    PLATFORM_READ_SCOPES,
+    Availability,
+    ContentKind,
+    DurationBucket,
+    Platform,
+    Scope,
+)
 from dtk.db.models import ArchivedContent
-from dtk.services import archive, collections, downloads
+from dtk.services import archive, collections, downloads, transcriptions
 
 log = get_logger(__name__)
 
@@ -55,10 +63,7 @@ EXPORT_LIMIT = 50_000
 
 #: Which read scope a walk of one platform's history costs. Both of these
 #: endpoints look like archive reads and behave like platform reads.
-_READ_SCOPE: Final[dict[Platform, Scope]] = {
-    Platform.DOUYIN: Scope.DOUYIN_READ,
-    Platform.TIKTOK: Scope.TIKTOK_READ,
-}
+_READ_SCOPE: Final[dict[Platform, Scope]] = dict(zip(Platform, PLATFORM_READ_SCOPES, strict=True))
 
 PLATFORM_QUERY = Query(default=None, description="Only this platform.")
 AUTHOR_QUERY = Query(default=None, max_length=256, description="Only this author's posts.")
@@ -226,38 +231,61 @@ async def list_archive(
     rows, next_cursor = await archive.search(
         request.state.db, spec, limit=limit or archive.DEFAULT_PAGE, cursor=cursor
     )
+    return ok(
+        request,
+        {
+            "items": await _described(request, principal, rows),
+            "cursor": next_cursor,
+            "has_more": bool(next_cursor),
+        },
+    )
+
+
+async def _described(
+    request: Request, principal: Principal, rows: list[ArchivedContent]
+) -> list[dict[str, Any]]:
+    """Archived posts with what this instance kept of them beside each.
+
+    Shared by the page and the single read. The single read used to answer
+    with `stored` always null and no collections, so a post opened from a link
+    - `/library?platform=&content_id=` - said it had never been saved when its
+    video was on the disk.
+    """
+    keys = [(row.platform, row.content_id) for row in rows]
     # One query for the whole page rather than one per row: the console renders
     # this as a grid of covers and asks the same question of every card.
     #
     # Named `on_disk` rather than `stored`, which is now the query parameter
     # asking to be filtered by it.
     on_disk = (
-        await downloads.stored_for(
-            request.state.db, [(row.platform, row.content_id) for row in rows]
-        )
+        await downloads.stored_for(request.state.db, keys)
         if principal.permits(Scope.MEDIA_READ, Scope.ADMIN)
+        else {}
+    )
+    # Whether the stored video already has a transcript, so the library can
+    # open it rather than offer to start one the API would only hand back.
+    # Under `stored` because a transcript is of a download, not of a post.
+    transcribed = (
+        await transcriptions.latest_for_downloads(
+            request.state.db, [uuid.UUID(entry["download_id"]) for entry in on_disk.values()]
+        )
+        if on_disk and transcription_routes.may_read(principal)
         else {}
     )
     # Same shape of question, same treatment: one query for the page rather
     # than one per card.
-    member_of = await collections.memberships(
-        request.state.db, [(row.platform, row.content_id) for row in rows]
-    )
-    return ok(
-        request,
-        {
-            "items": [
-                _row(
-                    row,
-                    stored=on_disk.get((row.platform, row.content_id)),
-                    in_collections=member_of.get((row.platform, row.content_id), []),
-                )
-                for row in rows
-            ],
-            "cursor": next_cursor,
-            "has_more": bool(next_cursor),
-        },
-    )
+    member_of = await collections.memberships(request.state.db, keys)
+    described = []
+    for row in rows:
+        key = (row.platform, row.content_id)
+        stored = on_disk.get(key)
+        if stored is not None:
+            stored = {
+                **stored,
+                "transcription": transcribed.get(uuid.UUID(stored["download_id"])),
+            }
+        described.append(_row(row, stored=stored, in_collections=member_of.get(key, [])))
+    return described
 
 
 @router.get("/stats", summary="Archive totals", openapi_extra={I18N_KEY: "archive_stats"})
@@ -298,6 +326,8 @@ async def export_archive(
     duration_bucket: DurationBucket | None = DURATION_QUERY,
     availability: Availability | None = AVAILABILITY_QUERY,
     q: str | None = SEARCH_QUERY,
+    collection: uuid.UUID | None = COLLECTION_QUERY,
+    stored: bool | None = STORED_QUERY,
     principal: Principal = Depends(enforce_rate_limit),
 ) -> StreamingResponse:
     """Stream every matching post as newline-delimited JSON.
@@ -312,6 +342,8 @@ async def export_archive(
     **Parameters**
 
     The same filters as the list endpoint. Export what you can already see.
+    `collection` and `stored` were missing until 2026-10: the console sent
+    them, this ignored them, and exporting one collection exported the lot.
 
     **Returns**
 
@@ -320,8 +352,56 @@ async def export_archive(
     `/archive/{platform}/{content_id}` when you need the mirrors.
     """
     principal.require(Scope.ARCHIVE_EXPORT)
-    spec = _filter(platform, author_uid, tag, kind, duration_bucket, availability, q)
+    spec = _filter(
+        platform,
+        author_uid,
+        tag,
+        kind,
+        duration_bucket,
+        availability,
+        q,
+        collection_id=collection,
+        stored=stored,
+    )
+    return _export(spec)
 
+
+@router.post(
+    "/export",
+    summary="Export chosen posts",
+    openapi_extra={I18N_KEY: "archive_export_selected"},
+    response_class=StreamingResponse,
+    responses={200: {"content": {"application/x-ndjson": {}}, "description": "One post per line."}},
+)
+async def export_selected(
+    request: Request,
+    body: ContentSelection,
+    principal: Principal = Depends(enforce_rate_limit),
+) -> StreamingResponse:
+    """Stream the posts named in the body as newline-delimited JSON.
+
+    The filtered export answers "everything like this"; this one answers "these
+    ones", which is what a hand-made selection is - cards picked across pages
+    share no filter. A POST because the list is a body: five hundred keys do not
+    fit in a query string every proxy will pass.
+
+    The same scope and the same shape as `GET /archive/export`. A post that is
+    not in the archive is skipped rather than refusing the rest.
+
+    **Parameters**
+
+    - `items` - the posts, each as a platform and a content id.
+
+    **Returns**
+
+    `application/x-ndjson`: one line per post that was found.
+    """
+    principal.require(Scope.ARCHIVE_EXPORT)
+    keys = tuple(collections.clean_keys(body.items))
+    return _export(archive.ArchiveFilter(keys=keys))
+
+
+def _export(spec: archive.ArchiveFilter) -> StreamingResponse:
     async def lines() -> AsyncIterator[bytes]:
         # Its own session, not `request.state.db`. The body of a StreamingResponse
         # runs AFTER the route function returns, so the request-scoped session is
@@ -388,7 +468,7 @@ async def recheck(
     # imply - and the archive module's own docstring promises that reading it
     # spends no identity. A recheck is a platform read wearing an archive name,
     # so it asks for a platform read scope.
-    principal.require(Scope.DOUYIN_READ, Scope.TIKTOK_READ)
+    principal.require(*PLATFORM_READ_SCOPES)
     return await operations.submit_and_wait(
         request,
         principal,
@@ -716,7 +796,7 @@ async def delete_archived(
 )
 async def get_archived(
     request: Request,
-    platform: str = Path(description="douyin or tiktok."),
+    platform: str = Path(description="douyin, tiktok or bilibili."),
     content_id: str = Path(max_length=64, description="The post id."),
     principal: Principal = Depends(enforce_rate_limit),
 ) -> Any:
@@ -725,13 +805,15 @@ async def get_archived(
     **Returns**
 
     The stored record, media manifest included. The signed CDN links inside it
-    expire; `web_url` is the part that survives.
+    expire; `web_url` is the part that survives. `stored` and `collections`
+    as the list endpoint reports them.
     """
     principal.require(Scope.ARCHIVE_READ)
     row = await archive.get(request.state.db, platform, content_id)
     if row is None:
         raise NotFound("this instance has not archived that post")
-    return ok(request, _row(row))
+    [described] = await _described(request, principal, [row])
+    return ok(request, described)
 
 
 __all__ = ["router"]

@@ -50,9 +50,10 @@ from dtk.core.errors import (
     UnsupportedContent,
 )
 from dtk.core.logging import get_logger
-from dtk.core.types import Platform, Scope
+from dtk.core.types import PLATFORM_READ_SCOPES, CommentSort, Platform, PopularBoard, Scope
 from dtk.i18n.messages import render_error
 from dtk.platforms.paging import max_page_size
+from dtk.services.download_requests import resolve_part
 from dtk.urls import ResourceKind, UrlKind, first_url, identify, require_content_id
 from dtk.worker import registry
 
@@ -81,8 +82,8 @@ COUNT_QUERY = Query(
     # go upstream to be read back as "this author has nothing".
     description=(
         "Items per page. The ceiling depends on the platform: Douyin serves up to 50, "
-        "TikTok refuses more than 35. Above it this is a 400 naming the maximum, "
-        "rejected rather than shortened."
+        "TikTok refuses more than 35, Bilibili more than 20. Above it this is a 400 "
+        "naming the maximum, rejected rather than shortened."
     ),
 )
 CURSOR_QUERY = Query(
@@ -138,7 +139,12 @@ IDENTITY_QUERY = Query(
         "is never served from another identity and never from the response cache."
     ),
 )
-PLATFORM_PATH = Path(description="Platform the request is addressed to: douyin or tiktok.")
+PLATFORM_PATH = Path(
+    description=(
+        "Platform the request is addressed to: douyin, tiktok or bilibili. Not every "
+        "endpoint is served on every platform."
+    )
+)
 URL_QUERY = Query(
     default=None,
     max_length=4096,
@@ -155,17 +161,48 @@ AWEME_ID_QUERY = Query(
 SEC_USER_ID_QUERY = Query(
     default=None,
     max_length=256,
-    description=("The author's stable id, as an alternative to url. On TikTok this is secUid."),
+    description=(
+        "The author's stable id, as an alternative to url. On TikTok this is secUid; "
+        "on Bilibili, the numeric mid."
+    ),
 )
 MIX_ID_QUERY = Query(
     min_length=1,
     max_length=64,
-    description="The mix or playlist to read; Douyin calls it mix_info, TikTok playlistId.",
+    description=(
+        "The mix, playlist or season to read: the mix_id /user/mixes returns. A post "
+        "carries it too, as mix_info on Douyin and playlistId on TikTok."
+    ),
 )
 COLLECTION_ID_QUERY = Query(
     min_length=1,
     max_length=64,
     description="The saved folder to read; ids come from /user/collections.",
+)
+SORT_QUERY = Query(
+    default=None,
+    description=(
+        "hot or new. Only Bilibili offers a choice; Douyin and TikTok rank comments "
+        "their own way, accept hot, and refuse new. Send the same value again with "
+        "the cursor of a later page."
+    ),
+)
+PART_QUERY = Query(
+    default=None,
+    ge=1,
+    le=1000,
+    description=(
+        "Bilibili only: which part of a video uploaded in several, from 1. A link's ?p= "
+        "says the same. The stream returned is that part's."
+    ),
+)
+BOARD_QUERY = Query(
+    default=PopularBoard.HOT,
+    description=(
+        "hot: popular now, paged by number. weekly: the weekly selection, newest issue "
+        "first; the cursor is the next older issue. precious: the editors' all-time "
+        "selection, one page. rank: the site-wide top 100, one page."
+    ),
 )
 COMMENT_ID_QUERY = Query(
     min_length=1,
@@ -242,7 +279,7 @@ def vet_url(url: str, *, expected: Platform | None = None) -> UrlKind:
             kind = identify(candidate)
     if not kind.allowed:
         raise InvalidUrl(
-            "not a supported Douyin or TikTok URL",
+            "not a supported Douyin, TikTok or Bilibili URL",
             details={"reason": "host_not_allowed"},
         )
     if expected is not None and kind.platform is not None and kind.platform is not expected:
@@ -257,7 +294,7 @@ def vet_url(url: str, *, expected: Platform | None = None) -> UrlKind:
     return kind
 
 
-def _identifier(kind: UrlKind, wanted: ResourceKind) -> str | None:
+def identifier(kind: UrlKind, wanted: ResourceKind) -> str | None:
     """The resource id from a URL, when it is already the right kind.
 
     A short link yields nothing here on purpose: its target is unknowable
@@ -295,10 +332,10 @@ async def parse(
     Accepts either platform, so it requires read access to one of them; the
     worker decides which after expanding the URL.
     """
-    if not has_scope(principal, (Scope.DOUYIN_READ, Scope.TIKTOK_READ)):
+    if not has_scope(principal, PLATFORM_READ_SCOPES):
         raise ForbiddenScope(
             "this credential lacks read access to any platform",
-            details=principal.denial(scopes=(Scope.DOUYIN_READ, Scope.TIKTOK_READ)),
+            details=principal.denial(scopes=PLATFORM_READ_SCOPES),
         )
 
     kind = vet_url(body.url)
@@ -350,10 +387,10 @@ async def batch(
     its own fate, so one bad link cannot smear the whole request into a single
     error the way a synchronous bulk endpoint would (doc 07).
     """
-    if not has_scope(principal, (Scope.DOUYIN_READ, Scope.TIKTOK_READ)):
+    if not has_scope(principal, PLATFORM_READ_SCOPES):
         raise ForbiddenScope(
             "this credential lacks read access to any platform",
-            details=principal.denial(scopes=(Scope.DOUYIN_READ, Scope.TIKTOK_READ)),
+            details=principal.denial(scopes=PLATFORM_READ_SCOPES),
         )
     callback = validate_callback_url(request, body.callback_url)
     # Vetted once for the whole batch rather than per item: the answer cannot
@@ -426,6 +463,7 @@ async def video(
     platform: Platform = PLATFORM_PATH,
     url: str | None = URL_QUERY,
     aweme_id: str | None = AWEME_ID_QUERY,
+    part: int | None = PART_QUERY,
     include_raw: bool = RAW_QUERY,
     wait: float | None = WAIT_QUERY,
     proxy: str | None = PROXY_QUERY,
@@ -442,10 +480,12 @@ async def video(
 
     **Parameters**
 
-    - `platform` - `douyin` or `tiktok`. Must match the link you pass.
+    - `platform` - `douyin`, `tiktok` or `bilibili`. Must match the link you pass.
     - `url` - a link to the post. Text with a link inside it is accepted, so
       the clipboard content the apps produce can be sent unedited.
     - `aweme_id` - the post id, if you already have it.
+    - `part` - Bilibili only: which part of a video uploaded in several, from
+      1; a link's `?p=` says the same. The stream returned is that part's.
     - `include_raw` - also return the platform's own untouched payload.
     - `wait` - seconds to wait for the result. Omit it to get `202` and a task
       id to poll.
@@ -459,10 +499,14 @@ async def video(
     **Returns**
 
     The post's media URLs, cover, caption, statistics, author and timestamps,
-    normalized to the same shape for both platforms.
+    normalized to the same shape for every platform. A Bilibili video lists its
+    parts in `parts`.
     """
     authorize(principal, platform)
-    params = _content_params(platform, url=url, aweme_id=aweme_id)
+    params = content_params(platform, url=url, aweme_id=aweme_id)
+    later = resolve_part(platform, part, url)
+    if later is not None:
+        params["part"] = later
     params["include_raw"] = include_raw
     return await operations.submit_and_wait(
         request,
@@ -489,6 +533,7 @@ async def comments(
     aweme_id: str | None = AWEME_ID_QUERY,
     cursor: str | None = CURSOR_QUERY,
     count: int | None = COUNT_QUERY,
+    sort: CommentSort | None = SORT_QUERY,
     include_raw: bool = RAW_QUERY,
     wait: float | None = WAIT_QUERY,
     proxy: str | None = PROXY_QUERY,
@@ -504,12 +549,15 @@ async def comments(
 
     **Parameters**
 
-    - `platform` - `douyin` or `tiktok`. Must match the link you pass.
+    - `platform` - `douyin`, `tiktok` or `bilibili`. Must match the link you pass.
     - `url` - a link to the post.
     - `aweme_id` - the post id, if you already have it.
     - `cursor` - the cursor returned by the previous page. Omit it for the
       first page; a response with no cursor is the last page.
     - `count` - comments per page.
+    - `sort` - `hot` (the default) or `new`. Only Bilibili offers `new`;
+      Douyin and TikTok answer it with `400 INVALID_PARAM`. A cursor belongs
+      to the order it was read in, so send the same `sort` with it.
     - `include_raw` - include each item's untouched platform payload. A page
       carries one per item, so this multiplies the response and everything
       that stores it; it is off by default for that reason.
@@ -528,12 +576,13 @@ async def comments(
     cursor for the next page.
     """
     authorize(principal, platform)
-    params = _content_params(platform, url=url, aweme_id=aweme_id)
+    params = content_params(platform, url=url, aweme_id=aweme_id)
     params.update(
         {
             "cursor": cursor,
             "count": resolve_count(count, maximum=max_page_size(platform)),
             "include_raw": include_raw,
+            **registry.comment_sort_params(platform, sort),
         }
     )
     return await operations.submit_and_wait(
@@ -578,7 +627,7 @@ async def comment_replies(
 
     **Parameters**
 
-    - `platform` - `douyin` or `tiktok`. Must match the link you pass.
+    - `platform` - `douyin`, `tiktok` or `bilibili`. Must match the link you pass.
     - `comment_id` - the parent comment to read replies under.
     - `url` - a link to the post the comment is on.
     - `aweme_id` - that post's id, if you already have it.
@@ -603,7 +652,7 @@ async def comment_replies(
     page.
     """
     authorize(principal, platform)
-    params = _content_params(platform, url=url, aweme_id=aweme_id)
+    params = content_params(platform, url=url, aweme_id=aweme_id)
     params.update(
         {
             "comment_id": comment_id,
@@ -616,6 +665,134 @@ async def comment_replies(
         request,
         principal,
         endpoint=endpoint_name(platform, Operation.COMMENT_REPLIES),
+        params=params,
+        wait=resolve_wait(request, wait),
+        proxy=await resolve_request_proxy(request, proxy),
+        refresh=refresh,
+        explain=await resolve_explain(request, principal, explain),
+        identity=await resolve_request_identity(request, principal, identity, platform=platform),
+    )
+
+
+@router.get(
+    "/{platform}/video/parts",
+    summary="The parts of a video",
+    openapi_extra={I18N_KEY: "content_parts", **ASYNC_RESPONSES},
+)
+async def video_parts(
+    request: Request,
+    platform: Platform = PLATFORM_PATH,
+    url: str | None = URL_QUERY,
+    aweme_id: str | None = AWEME_ID_QUERY,
+    include_raw: bool = RAW_QUERY,
+    wait: float | None = WAIT_QUERY,
+    proxy: str | None = PROXY_QUERY,
+    identity: str | None = IDENTITY_QUERY,
+    refresh: bool = REFRESH_QUERY,
+    explain: bool = EXPLAIN_QUERY,
+    principal: Principal = Depends(enforce_rate_limit),
+) -> Any:
+    """Every part of a video uploaded in several, in order. Bilibili only.
+
+    Identify the video by **either** `url` **or** `aweme_id`. A single-part
+    video lists its one part. The same list arrives with `/video` as `parts`;
+    this is the cheaper call when the list is all you need.
+
+    **Parameters**
+
+    - `platform` - `bilibili`. Douyin and TikTok answer `UNSUPPORTED_CONTENT`.
+    - `url` - a link to the video.
+    - `aweme_id` - the bvid (an `av` number is accepted too).
+    - `include_raw`, `wait`, `proxy`, `identity`, `refresh`, `explain` - as on
+      `/video`.
+
+    **Returns**
+
+    Each part's 1-based `part` number, `cid`, `title`, `duration_ms`, `width`
+    and `height`. Pass the number as `part` to `/video` for that part's stream,
+    or to `POST /api/v1/downloads` to store it.
+    """
+    authorize(principal, platform)
+    endpoint = supported(platform, Operation.CONTENT_PARTS)
+    params = content_params(platform, url=url, aweme_id=aweme_id)
+    params["include_raw"] = include_raw
+    return await operations.submit_and_wait(
+        request,
+        principal,
+        endpoint=endpoint,
+        params=params,
+        wait=resolve_wait(request, wait),
+        proxy=await resolve_request_proxy(request, proxy),
+        refresh=refresh,
+        explain=await resolve_explain(request, principal, explain),
+        identity=await resolve_request_identity(request, principal, identity, platform=platform),
+    )
+
+
+#: Which operation reads each board.
+_BOARDS: dict[PopularBoard, Operation] = {
+    PopularBoard.HOT: Operation.POPULAR,
+    PopularBoard.WEEKLY: Operation.POPULAR_WEEKLY,
+    PopularBoard.PRECIOUS: Operation.POPULAR_PRECIOUS,
+    PopularBoard.RANK: Operation.RANKING,
+}
+
+
+@router.get(
+    "/{platform}/popular",
+    summary="A site-curated list of posts",
+    openapi_extra={I18N_KEY: "popular", **ASYNC_RESPONSES},
+)
+async def popular(
+    request: Request,
+    platform: Platform = PLATFORM_PATH,
+    board: PopularBoard = BOARD_QUERY,
+    cursor: str | None = CURSOR_QUERY,
+    count: int | None = COUNT_QUERY,
+    include_raw: bool = RAW_QUERY,
+    wait: float | None = WAIT_QUERY,
+    proxy: str | None = PROXY_QUERY,
+    identity: str | None = IDENTITY_QUERY,
+    refresh: bool = REFRESH_QUERY,
+    explain: bool = EXPLAIN_QUERY,
+    principal: Principal = Depends(enforce_rate_limit),
+) -> Any:
+    """One page of a list the site itself curates. Bilibili only.
+
+    **Parameters**
+
+    - `platform` - `bilibili`. Douyin and TikTok answer `UNSUPPORTED_CONTENT`.
+    - `board` - which list:
+      - `hot` (the default): what is popular now, paged by number.
+      - `weekly`: the weekly selection, 50 videos an issue, newest issue
+        first. The cursor is the next older issue's number; pass an issue
+        number to start there.
+      - `precious`: the editors' all-time selection, one page.
+      - `rank`: the site-wide top 100, one page.
+    - `cursor` - the cursor returned by the previous page. Omit it for the
+      first page; a response with no cursor is the last page.
+    - `count` - items per page, for `hot` only; the others are the size the
+      site makes them.
+    - `include_raw`, `wait`, `proxy`, `identity`, `refresh`, `explain` - as on
+      the other list endpoints. The lists are the same for everyone, so a
+      repeat inside `cache.list_ttl` (5 minutes by default) is free.
+
+    **Returns**
+
+    A page of posts in the same shape as `/user/posts`, plus the cursor for
+    the next page.
+    """
+    authorize(principal, platform)
+    endpoint = supported(platform, _BOARDS[board])
+    params: dict[str, Any] = {
+        "cursor": cursor,
+        "count": resolve_count(count, maximum=max_page_size(platform)),
+        "include_raw": include_raw,
+    }
+    return await operations.submit_and_wait(
+        request,
+        principal,
+        endpoint=endpoint,
         params=params,
         wait=resolve_wait(request, wait),
         proxy=await resolve_request_proxy(request, proxy),
@@ -650,7 +827,7 @@ async def user(
 
     **Parameters**
 
-    - `platform` - `douyin` or `tiktok`. Must match the link you pass.
+    - `platform` - `douyin`, `tiktok` or `bilibili`. Must match the link you pass.
     - `url` - a link to the author's profile page.
     - `sec_user_id` - the author's stable id, if you already have it. On
       TikTok this is `secUid`.
@@ -670,7 +847,7 @@ async def user(
     like and post counts.
     """
     authorize(principal, platform)
-    params = _author_params(platform, url=url, sec_user_id=sec_user_id)
+    params = author_params(platform, url=url, sec_user_id=sec_user_id)
     params["include_raw"] = include_raw
     return await operations.submit_and_wait(
         request,
@@ -712,7 +889,7 @@ async def user_posts(
 
     **Parameters**
 
-    - `platform` - `douyin` or `tiktok`. Must match the link you pass.
+    - `platform` - `douyin`, `tiktok` or `bilibili`. Must match the link you pass.
     - `url` - a link to the author's profile page.
     - `sec_user_id` - the author's stable id, if you already have it. On
       TikTok this is `secUid`.
@@ -737,7 +914,7 @@ async def user_posts(
     the next page.
     """
     authorize(principal, platform)
-    params = _author_params(platform, url=url, sec_user_id=sec_user_id)
+    params = author_params(platform, url=url, sec_user_id=sec_user_id)
     params.update(
         {
             "cursor": cursor,
@@ -814,7 +991,7 @@ async def user_likes(
     The same post shape as `/video`, plus the cursor for the next page.
     """
     authorize(principal, platform)
-    params = _author_params(platform, url=url, sec_user_id=sec_user_id)
+    params = author_params(platform, url=url, sec_user_id=sec_user_id)
     params.update(
         {
             "cursor": cursor,
@@ -889,7 +1066,7 @@ async def user_reposts(
     the next page.
     """
     authorize(principal, platform)
-    params = _author_params(platform, url=url, sec_user_id=sec_user_id)
+    params = author_params(platform, url=url, sec_user_id=sec_user_id)
     params.update(
         {
             "cursor": cursor,
@@ -1012,19 +1189,22 @@ async def user_collections(
       public folders" rather than "no folders".
     - **Douyin** takes no author at all - its endpoint carries no user id and
       answers only about the session sending it. Pass `identity` pointed at an
-      imported identity; passing `url` or `sec_user_id` is an error rather
-      than being quietly ignored.
+      imported identity - required, since an unpinned answer would be some
+      account's private folders - and passing `url` or `sec_user_id` is an
+      error rather than being quietly ignored.
+    - **Bilibili** takes an author, by `mid` or space link, and answers with
+      every public folder at once: there is one page.
 
     Either way each folder says whether it is public, and to read what is
     inside one, pass its id to `/collection/posts`.
 
     **Parameters**
 
-    - `platform` - `douyin` or `tiktok`.
-    - `url` - a link to the author's profile page. **TikTok only**; Douyin
-      rejects it, because its endpoint cannot be pointed at anyone.
-    - `sec_user_id` - the author's stable id, if you already have it. **TikTok
-      only**, for the same reason.
+    - `platform` - `douyin`, `tiktok` or `bilibili`.
+    - `url` - a link to the author's profile page. **TikTok and Bilibili**;
+      Douyin rejects it, because its endpoint cannot be pointed at anyone.
+    - `sec_user_id` - the author's stable id, if you already have it - a
+      Bilibili `mid`. **TikTok and Bilibili**, for the same reason.
     - `cursor` - the cursor returned by the previous page. Omit it for the
       first page; a response with no cursor is the last page.
     - `count` - folders per page.
@@ -1032,7 +1212,7 @@ async def user_collections(
     - `wait` - seconds to wait for the result. Omit it to get `202` and a task
       id to poll.
     - `identity` - send the request as this identity and no other. Requires
-      `identity:manage`.
+      `identity:manage`. **Required on Douyin**, and then never cached.
     - `refresh` - ignore any cached or in-flight answer and ask upstream
       again. Without it a repeat inside `cache.list_ttl` (5 minutes by default)
       is answered from the cache and costs nothing; a refresh costs an
@@ -1048,10 +1228,12 @@ async def user_collections(
     # Douyin's folder list has no subject but the identity sending it, so an
     # author is neither required nor accepted there; TikTok's needs one.
     params: dict[str, Any] = (
-        _author_params(platform, url=url, sec_user_id=sec_user_id)
+        author_params(platform, url=url, sec_user_id=sec_user_id)
         if _accepts_author(endpoint)
         else _refuse_author(endpoint, url=url, sec_user_id=sec_user_id)
     )
+    pinned = await resolve_request_identity(request, principal, identity, platform=platform)
+    _require_pin(endpoint, pinned)
     params.update({"cursor": cursor, "count": resolve_count(count), "include_raw": include_raw})
     return await operations.submit_and_wait(
         request,
@@ -1062,13 +1244,13 @@ async def user_collections(
         proxy=await resolve_request_proxy(request, proxy),
         refresh=refresh,
         explain=await resolve_explain(request, principal, explain),
-        identity=await resolve_request_identity(request, principal, identity, platform=platform),
+        identity=pinned,
     )
 
 
 @router.get(
     "/{platform}/user/bookmarks",
-    summary="Posts an author has saved",
+    summary="Posts an account has saved",
     openapi_extra={I18N_KEY: "author_bookmarks", **ASYNC_RESPONSES},
 )
 async def user_bookmarks(
@@ -1086,33 +1268,39 @@ async def user_bookmarks(
     explain: bool = EXPLAIN_QUERY,
     principal: Principal = Depends(enforce_rate_limit),
 ) -> Any:
-    """One page of the posts an author has saved, across every folder.
+    """One page of the posts an account has saved, across every folder.
 
-    **TikTok only**, and **only ever the account's own list**. This is the other
-    half of the Saved tab: `/user/collections` lists the folders, this lists
-    what is in the tab regardless of folder.
+    **Only ever the account's own list**, on both platforms, so `identity` is
+    required: point it at an identity imported from that account's own
+    browser session. This is the other half of the saved tab -
+    `/user/collections` lists the folders, this lists what is in the tab
+    regardless of folder, and an account can have saved posts and no folders.
 
-    Unlike `/user/collections`, there is no public half to this one: the
-    request names an account rather than a folder. Measured with a guest
-    identity against an account that has saved a post, TikTok refuses outright
-    rather than returning an empty page, so point `identity` at an identity
-    imported from that account's own browser session. For someone else's
-    public folder, use `/collection/posts` instead.
+    - **TikTok** takes the account as well, and answers only that account's own
+      session: measured with a guest identity against an account that has
+      saved a post, it refuses outright rather than returning an empty page.
+    - **Douyin** takes no account at all - its endpoint carries no user id and
+      answers about the session sending it. Passing `url` or `sec_user_id` is an
+      error rather than being quietly ignored.
+
+    For someone else's public folder, use `/collection/posts` instead.
 
     **Parameters**
 
-    - `platform` - must be `tiktok`.
-    - `url` - a link to the author's profile page.
-    - `sec_user_id` - the author's stable id, if you already have it.
+    - `platform` - `douyin` or `tiktok`.
+    - `url` - a link to the account's profile page. **TikTok only**.
+    - `sec_user_id` - the account's stable id, if you already have it.
+      **TikTok only**.
     - `cursor` - the cursor returned by the previous page. Omit it for the
       first page; a response with no cursor is the last page.
     - `count` - posts per page. TikTok refuses more than 35.
     - `include_raw` - include each post's untouched platform payload.
     - `wait` - seconds to wait for the result. Omit it to get `202` and a task
       id to poll.
-    - `identity` - send the request as this identity and no other. Requires
-      `identity:manage`, and is the whole point of this endpoint.
-    - `refresh` - ignore any cached or in-flight answer and ask upstream again.
+    - `identity` - **required**. Send the request as this identity and no
+      other. Requires `identity:manage`. The answer is never cached, because
+      it belongs to that identity alone.
+    - `refresh` - ignore any in-flight answer and ask upstream again.
 
     **Returns**
 
@@ -1120,7 +1308,14 @@ async def user_bookmarks(
     for the next page.
     """
     authorize(principal, platform)
-    params = _author_params(platform, url=url, sec_user_id=sec_user_id)
+    endpoint = supported(platform, Operation.AUTHOR_BOOKMARKS)
+    params: dict[str, Any] = (
+        author_params(platform, url=url, sec_user_id=sec_user_id)
+        if _accepts_author(endpoint)
+        else _refuse_author(endpoint, url=url, sec_user_id=sec_user_id)
+    )
+    pinned = await resolve_request_identity(request, principal, identity, platform=platform)
+    _require_pin(endpoint, pinned)
     params.update(
         {
             "cursor": cursor,
@@ -1131,13 +1326,13 @@ async def user_bookmarks(
     return await operations.submit_and_wait(
         request,
         principal,
-        endpoint=supported(platform, Operation.AUTHOR_BOOKMARKS),
+        endpoint=endpoint,
         params=params,
         wait=resolve_wait(request, wait),
         proxy=await resolve_request_proxy(request, proxy),
         refresh=refresh,
         explain=await resolve_explain(request, principal, explain),
-        identity=await resolve_request_identity(request, principal, identity, platform=platform),
+        identity=pinned,
     )
 
 
@@ -1235,7 +1430,7 @@ async def collection_posts(
 
     **Parameters**
 
-    - `platform` - `douyin` or `tiktok`.
+    - `platform` - `douyin`, `tiktok` or `bilibili`.
     - `collection_id` - the folder to read, as returned by `/user/collections`.
     - `cursor` - the cursor returned by the previous page. Omit it for the
       first page; a response with no cursor is the last page.
@@ -1297,14 +1492,16 @@ async def mix_posts(
 ) -> Any:
     """One page of the posts collected in a mix.
 
-    A mix is Douyin's series and TikTok's playlist - an ordered set an author
-    groups their own posts into. The id comes from any post that belongs to
-    one: Douyin returns it as `mix_info`, TikTok as `playlistId`.
+    A mix is Douyin's series, TikTok's playlist and Bilibili's season - an
+    ordered set an author groups their own posts into. `/user/mixes` lists an
+    author's, and any post that belongs to one carries its id: Douyin returns
+    it as `mix_info`, TikTok as `playlistId`.
 
     **Parameters**
 
-    - `platform` - `douyin` or `tiktok`.
-    - `mix_id` - the mix or playlist to read.
+    - `platform` - `douyin`, `tiktok` or `bilibili`. A Bilibili season comes
+      back whole, in one page, whatever `cursor` and `count` say.
+    - `mix_id` - the mix, playlist or season to read.
     - `cursor` - the cursor returned by the previous page. Omit it for the
       first page; a response with no cursor is the last page.
     - `count` - posts per page.
@@ -1396,7 +1593,7 @@ async def user_followers(
     """
     authorize(principal, platform)
     endpoint = supported(platform, Operation.AUTHOR_FOLLOWERS)
-    params = _author_params(platform, url=url, sec_user_id=sec_user_id)
+    params = author_params(platform, url=url, sec_user_id=sec_user_id)
     params.update(
         {
             "cursor": cursor,
@@ -1469,7 +1666,7 @@ async def user_following(
     """
     authorize(principal, platform)
     endpoint = supported(platform, Operation.AUTHOR_FOLLOWING)
-    params = _author_params(platform, url=url, sec_user_id=sec_user_id)
+    params = author_params(platform, url=url, sec_user_id=sec_user_id)
     params.update(
         {
             "cursor": cursor,
@@ -1495,7 +1692,7 @@ async def user_following(
 # --------------------------------------------------------------------------
 
 
-def _content_params(platform: Platform, *, url: str | None, aweme_id: str | None) -> dict[str, Any]:
+def content_params(platform: Platform, *, url: str | None, aweme_id: str | None) -> dict[str, Any]:
     """Accept either a link or an id, and normalize to what the worker needs.
 
     When the URL already carries the id, it is extracted here so two callers
@@ -1508,7 +1705,7 @@ def _content_params(platform: Platform, *, url: str | None, aweme_id: str | None
         )
     if url:
         kind = vet_url(url, expected=platform)
-        extracted = _identifier(kind, ResourceKind.VIDEO)
+        extracted = identifier(kind, ResourceKind.VIDEO)
         chosen = aweme_id or extracted
         # Only what the caller typed is checked. An id this system pulled out of
         # a URL it already recognised has been through the pattern that
@@ -1547,7 +1744,22 @@ def _refuse_author(endpoint: str, *, url: str | None, sec_user_id: str | None) -
     return {}
 
 
-def _author_params(
+def _require_pin(endpoint: str, identity: str | None) -> None:
+    """Refuse a session-bound endpoint that names no identity, before it queues.
+
+    The fetch layer refuses it too, and has to - it is where the cache is
+    decided. This copy exists so the caller hears it as a 400 now rather than
+    as a task that queues, runs and fails.
+    """
+    if identity is None and registry.ENDPOINTS[endpoint].session_bound:
+        raise InvalidParam(
+            f"{endpoint} answers only about the identity sending it, so it needs "
+            "one pinned with `identity`",
+            details={"endpoint": endpoint, "field": "identity"},
+        )
+
+
+def author_params(
     platform: Platform, *, url: str | None, sec_user_id: str | None
 ) -> dict[str, Any]:
     if not url and not sec_user_id:
@@ -1557,7 +1769,7 @@ def _author_params(
         )
     if url:
         kind = vet_url(url, expected=platform)
-        extracted = _identifier(kind, ResourceKind.USER)
+        extracted = identifier(kind, ResourceKind.USER)
         return {
             "sec_user_id": sec_user_id or extracted,
             "url": None if extracted else kind.url,
@@ -1565,4 +1777,13 @@ def _author_params(
     return {"sec_user_id": sec_user_id, "url": None}
 
 
-__all__ = ["authorize", "read_scope", "router", "vet_url"]
+__all__ = [
+    "author_params",
+    "authorize",
+    "content_params",
+    "identifier",
+    "read_scope",
+    "router",
+    "supported",
+    "vet_url",
+]

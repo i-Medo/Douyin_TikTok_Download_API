@@ -36,6 +36,9 @@ class TaskOutcome:
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     endpoint: str | None = None
+    #: Sent as one named identity: its result is that session's private view,
+    #: and collecting it costs what naming the identity costs.
+    pinned: bool = False
 
     @property
     def settled(self) -> bool:
@@ -56,8 +59,12 @@ class TaskOutcome:
 class TaskGateway(Protocol):
     """Submit work and wait for it, over the same asynchronous path as REST."""
 
-    async def submit(self, endpoint: str, params: dict[str, Any]) -> str:
-        """Queue one unit of work and return its task id."""
+    async def submit(self, endpoint: str, params: dict[str, Any], *, is_demo: bool = False) -> str:
+        """Queue one unit of work and return its task id.
+
+        ``is_demo`` marks a task the public demo account queued, so it is not
+        archived and is swept on the demo's own retention window.
+        """
         ...
 
     async def wait(self, task_id: str, seconds: float) -> TaskOutcome | None:
@@ -67,6 +74,38 @@ class TaskGateway(Protocol):
     async def result(self, task_id: str) -> TaskOutcome:
         """Look up a task without waiting. Raises ``TaskNotFound``."""
         ...
+
+
+class TranscriptionGateway(Protocol):
+    async def start(
+        self,
+        download_id: str,
+        *,
+        normalize: bool,
+        refresh: bool,
+        requested_by: Any | None,
+        is_demo: bool = False,
+    ) -> tuple[dict[str, Any], str | None]: ...
+
+    async def get(self, transcription_id: str) -> dict[str, Any]: ...
+
+    async def progress(self, transcription_id: str) -> dict[str, Any] | None: ...
+
+
+class DownloadGateway(Protocol):
+    async def start(
+        self,
+        *,
+        url: str | None,
+        platform: Platform | None,
+        content_id: str | None,
+        skip_existing: bool,
+        requested_by: Any | None,
+        is_demo: bool,
+        part: int | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def get(self, download_id: str) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +238,8 @@ class McpContext:
     history: HistoryReader
     config: Callable[[], Config] = _default_config
     authorize: PlatformAuthorizer = _allow_any_platform
+    downloads: DownloadGateway | None = None
+    transcriptions: TranscriptionGateway | None = None
 
     @property
     def tool_timeout(self) -> float:
@@ -212,6 +253,7 @@ class McpContext:
 
 
 __all__ = [
+    "DownloadGateway",
     "EndpointHealth",
     "HistoryPoint",
     "HistoryReader",
@@ -221,4 +263,5 @@ __all__ = [
     "PoolSnapshot",
     "TaskGateway",
     "TaskOutcome",
+    "TranscriptionGateway",
 ]

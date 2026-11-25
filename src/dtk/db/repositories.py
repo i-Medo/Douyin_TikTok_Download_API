@@ -31,7 +31,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from dtk.core.logging import get_logger
@@ -256,17 +256,41 @@ class ProxyRepository(Repository):
         )
         return (await self.session.scalars(stmt)).all()
 
+    async def direct_unbound(self, platform: Platform) -> bool:
+        """Whether the direct egress carries no live identity of ``platform``.
+
+        The same rule as :meth:`list_unbound`, for the exit that has no row.
+        An imported identity with no proxy sits on this exit too, so it counts.
+        """
+        stmt = (
+            select(Identity.id)
+            .where(
+                Identity.platform == platform.value,
+                Identity.proxy_id.is_(None),
+                Identity.state.not_in([IdentityState.RETIRED.value]),
+            )
+            .limit(1)
+        )
+        return not (await self.session.scalars(stmt)).all()
+
     async def set_health(
         self,
         proxy_id: uuid.UUID,
         *,
         healthy: bool,
         checked_at: datetime | None = None,
+        error: str | None = None,
     ) -> bool:
+        """Record one probe's verdict. ``error`` is ignored on a healthy one,
+        which clears whatever the last failure said."""
         stmt = (
             update(Proxy)
             .where(Proxy.id == proxy_id)
-            .values(healthy=healthy, last_check_at=checked_at or utcnow())
+            .values(
+                healthy=healthy,
+                last_check_at=checked_at or utcnow(),
+                last_error=None if healthy else (error or "probe failed")[:300],
+            )
             .execution_options(**_NO_SYNC)
         )
         return affected(await self.session.execute(stmt)) == 1
@@ -328,15 +352,20 @@ class IdentityRepository(Repository):
         platform: Platform | None = None,
         states: IdentityState | Iterable[IdentityState] = SCHEDULABLE_STATES,
         limit: int | None = None,
+        in_rotation: bool = False,
     ) -> Sequence[Identity]:
         """Candidates for the scheduler: least recently used first.
 
         NULLS FIRST is deliberate: an identity that has never been used is the
-        least recently used one there is.
+        least recently used one there is. ``in_rotation`` leaves out identities
+        restricted to some endpoints or kept for pinned requests only, for a
+        caller that would otherwise pick one for traffic it was kept from.
         """
         stmt = select(Identity).where(Identity.state.in_(_states(states)))
         if platform is not None:
             stmt = stmt.where(Identity.platform == platform.value)
+        if in_rotation:
+            stmt = stmt.where(Identity.rotation_endpoints.is_(None))
         stmt = stmt.order_by(Identity.last_used_at.asc().nulls_first())
         if limit is not None:
             stmt = stmt.limit(limit)
@@ -723,11 +752,28 @@ class AuditRepository(Repository):
         *,
         limit: int = 100,
         before: datetime | None = None,
+        before_id: uuid.UUID | None = None,
         action: str | None = None,
         user_id: uuid.UUID | None = None,
     ) -> Sequence[AuditLog]:
-        stmt = select(AuditLog).order_by(AuditLog.ts.desc()).limit(limit)
-        if before is not None:
+        """Newest first, paged by ``(ts, id)``.
+
+        ``ts`` alone is not a cursor. It is the transaction's start time, so
+        every row one request writes shares it, and paging on ``ts < before``
+        silently dropped whichever of them fell past the page boundary. With
+        ``before_id`` the cursor is the last row actually shown, and the ``id``
+        tie-break makes the order total so the next page starts exactly after
+        it.
+        """
+        stmt = select(AuditLog).order_by(AuditLog.ts.desc(), AuditLog.id.desc()).limit(limit)
+        if before is not None and before_id is not None:
+            stmt = stmt.where(
+                or_(
+                    AuditLog.ts < before,
+                    and_(AuditLog.ts == before, AuditLog.id < before_id),
+                )
+            )
+        elif before is not None:
             stmt = stmt.where(AuditLog.ts < before)
         if action is not None:
             stmt = stmt.where(AuditLog.action == action)

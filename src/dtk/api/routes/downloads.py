@@ -25,16 +25,15 @@ download spends an identity and consumes disk, which no read scope should imply.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path as FsPath
 from typing import Any, Final
 
 from fastapi import APIRouter, Depends, Path, Query, Request
 from fastapi.responses import FileResponse
-from sqlalchemy.exc import IntegrityError
 
 from dtk.api.deps import Principal, enforce_rate_limit
-from dtk.api.routes import operations
+from dtk.api.routes import transcriptions as transcription_routes
 from dtk.api.routes.openapi import ACCEPTED_RESPONSES, I18N_KEY
 from dtk.api.routes.schemas import DedupeRequest, DownloadRequest, PinRequest, RetryRequest
 from dtk.api.routes.support import (
@@ -43,22 +42,16 @@ from dtk.api.routes.support import (
     ok,
 )
 from dtk.core.config import BootstrapSettings
-from dtk.core.errors import DownloaderDown, InvalidParam, NotConfigured, NotFound, QueueFull
+from dtk.core.errors import DownloaderDown, InvalidParam, NotConfigured, NotFound
 from dtk.core.logging import get_logger
-from dtk.core.types import DownloadState, Platform, Scope
+from dtk.core.types import DownloadState, Platform, Scope, UserRole
 from dtk.media import plan
 from dtk.ops import capacity
-from dtk.services import archive, downloads, tasks
-from dtk.urls import ResourceKind, first_url, identify, require_content_id
+from dtk.services import download_requests, downloads, transcriptions
 
 log = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/downloads", tags=["downloads"])
-
-#: How long a caller should wait when the disk guard has stopped new jobs. Long
-#: enough that retrying is not a spin, short enough that freeing space is
-#: noticed within a maintenance tick.
-CAPACITY_RETRY_AFTER = 300
 
 PLATFORM_QUERY = Query(default=None, description="Only this platform.")
 STATE_QUERY = Query(default=None, description="Only downloads in this state.")
@@ -66,24 +59,23 @@ PINNED_QUERY = Query(default=None, description="Only pinned downloads, or only u
 ON_DISK_QUERY = Query(default=None, description="True for downloads whose files are still stored.")
 LIMIT_QUERY = Query(default=None, ge=1, le=MAX_ADMIN_PAGE_SIZE, description="Rows per page.")
 OFFSET_QUERY = Query(default=0, ge=0, description="Rows to skip.")
+SEARCH_QUERY = Query(
+    default=None,
+    max_length=200,
+    description=(
+        "Substring of the post's title or author, as the archive holds them, or of its content id."
+    ),
+)
 DOWNLOAD_ID = Path(description="The download id returned when it was started.")
 
 
-def _configured(request: Request) -> None:
-    """Refuse early when no downloader is running.
-
-    A 501 rather than a 500: the sidecar is an opt-in compose profile, and an
-    instance without it is correctly configured for someone who never wanted
-    it. The message says how to turn it on rather than implying a fault.
-    """
-    settings: BootstrapSettings = request.app.state.settings
-    if not settings.downloader_url:
-        raise NotConfigured(
-            "this instance has no media downloader; start the downloader compose "
-            "profile and set DTK_DOWNLOADER_URL"
-        )
-    if not bool(request.app.state.config.get("media.enabled")):
-        raise NotConfigured("media downloads are disabled in the settings")
+async def _transcriptions_for(
+    request: Request, principal: Principal, rows: Sequence[Any]
+) -> dict[uuid.UUID, dict[str, Any]]:
+    """Which of these downloads already have a transcript, for a caller who may open one."""
+    if not rows or not transcription_routes.may_read(principal):
+        return {}
+    return await transcriptions.latest_for_downloads(request.state.db, [row.id for row in rows])
 
 
 @router.post(
@@ -124,6 +116,10 @@ async def start_download(
     - `skip_existing` - hand back the download this instance already has rather
       than fetching the post again. What re-running a feed wants: the author
       added three posts and the other forty are on the disk already.
+    - `part` - Bilibili only: which part of a video uploaded in several, from
+      1. A link's `?p=` says the same thing; omitted, it is the first part.
+      Each part is its own download, stored in its own directory, and is
+      transcribed as one.
 
     A download already in flight for the same post is joined whatever
     `skip_existing` says, and that is not a preference. Two downloads of one
@@ -138,215 +134,19 @@ async def start_download(
     served back through this API.
     """
     principal.require(Scope.MEDIA_WRITE)
-    _configured(request)
-
-    platform, content_id = _resolve_target(body)
-    config = request.app.state.config
-    verdict = capacity.evaluate(
-        warn_percent=float(config.get("capacity.warn_percent")),
-        hard_stop_percent=float(config.get("capacity.hard_stop_percent")),
+    result = await download_requests.start(
+        request.state.db,
+        config=request.app.state.config,
+        downloader_configured=bool(request.app.state.settings.downloader_url),
+        url=body.url,
+        platform=body.platform,
+        content_id=body.content_id,
+        skip_existing=body.skip_existing,
+        requested_by=principal.api_key_id,
+        is_demo=principal.role is UserRole.DEMO,
+        part=body.part,
     )
-    if verdict.paused:
-        raise QueueFull(
-            f"new downloads are paused: {verdict.detail}",
-            retry_after=CAPACITY_RETRY_AFTER,
-        )
-
-    session = request.state.db
-
-    # Two reasons not to start a second one, and only one of them is optional.
-    live, stored = await downloads.existing_for(session, platform.value, content_id)
-    if live is not None:
-        # Never optional. Two downloads of a post write to one directory - it is
-        # keyed by platform, author and post - and the sidecar renames
-        # `name.part` to `name` on the way out, so the loser renames a file the
-        # winner has already moved and comes back `partial`. Measured here:
-        # three requests for one post finished within 10ms and one lost a cover
-        # that way. Joining is also what the caller wanted; they are waiting for
-        # this post's media, and it is already on its way.
-        return _existing(request, live, reason="in_flight")
-    if body.skip_existing and stored is not None:
-        return _existing(request, stored, reason="already_stored")
-
-    row = await archive.get(session, platform.value, content_id)
-    planned: list[dict[str, str]] = []
-    skipped: list[str] = []
-    if row is None:
-        # Never seen. The worker fetches it before downloading, so there is
-        # nothing to plan from yet and nothing to refuse on.
-        try:
-            download = await downloads.create_pending(
-                session,
-                platform=platform.value,
-                content_id=content_id,
-                requested_by=principal.api_key_id,
-            )
-        except IntegrityError:
-            return await _joined(request, session, platform.value, content_id)
-    else:
-        # Planned here as well as in the worker, so a post that IS archived and
-        # has nothing fetchable is a 400 the caller reads now rather than a task
-        # that fails in a minute.
-        plan = downloads.plan_for(row, max_file_bytes=int(config.get("media.max_file_bytes")))
-        if plan.empty:
-            raise InvalidParam(
-                "; ".join(plan.skipped) or "this post has no downloadable media",
-                details={"skipped": list(plan.skipped)},
-            )
-        planned = [{"name": item.name, "kind": item.kind} for item in plan.items]
-        skipped = list(plan.skipped)
-        try:
-            download = await downloads.create(session, row, requested_by=principal.api_key_id)
-        except IntegrityError:
-            return await _joined(request, session, platform.value, content_id)
-    task_id, state = await operations.submit(
-        request,
-        principal,
-        endpoint=operations.Maintenance.MEDIA_DOWNLOAD.value,
-        params={"download_id": str(download.id)},
-        # Never coalesced. Two requests for the same post are two deliberate
-        # acts, and the second one is usually "the first did not work" - joining
-        # them onto one task would answer it with the failure it was retrying.
-        coalesce=False,
-        # Held back until the download row carries the task id. Otherwise a
-        # worker can start before that link is written, and a request that dies
-        # in the gap leaves a download nothing points at.
-        publish=False,
-    )
-    download.task_id = task_id
-    try:
-        await session.commit()
-    except IntegrityError:
-        return await _joined(request, session, platform.value, content_id)
-    await tasks.enqueue(task_id, endpoint=operations.Maintenance.MEDIA_DOWNLOAD.value)
-
-    log.info(
-        "media.download.requested",
-        download_id=str(download.id),
-        platform=platform.value,
-        items=len(planned),
-        archived=row is not None,
-    )
-    return ok(
-        request,
-        {
-            "download_id": str(download.id),
-            "task_id": str(task_id),
-            "state": state.value,
-            "directory": download.directory,
-            "planned": planned,
-            "skipped": skipped,
-            "reused": None,
-            # False means the worker has to fetch the post before it can
-            # download anything, which is a slower first response.
-            "archived": row is not None,
-        },
-        status_code=202,
-    )
-
-
-async def _joined(request: Request, session: Any, platform: str, content_id: str) -> Any:
-    """Answer a request the in-flight index refused.
-
-    `ux_media_downloads_in_flight` fires when another request for this post got
-    there first, in the window between our check and our insert. A check cannot
-    close that window - simultaneous requests all read "none in flight" before
-    any of them writes - so the index is the guarantee and this is how it reads
-    to a caller: the same answer the check would have given.
-
-    The insert raises at the flush inside `create`, not at the commit, so this
-    is called from three places rather than wrapped once around the end.
-    """
-    await session.rollback()
-    live, _ = await downloads.existing_for(session, platform, content_id)
-    if live is None:
-        # The other request settled and cleared the way between the refusal and
-        # this lookup. Nothing to join, and pretending otherwise would hand back
-        # a download that is already over.
-        raise QueueFull(
-            "another download of this post was in flight; try again",
-            retry_after=1,
-        )
-    return _existing(request, live, reason="in_flight")
-
-
-def _existing(request: Request, download: Any, *, reason: str) -> Any:
-    """Answer with a download that already exists, saying which one and why."""
-    log.info(
-        "media.download.reused",
-        download_id=str(download.id),
-        platform=download.platform,
-        reason=reason,
-    )
-    return ok(
-        request,
-        {
-            "download_id": str(download.id),
-            "task_id": str(download.task_id) if download.task_id else None,
-            "state": download.state,
-            "directory": download.directory,
-            "planned": [],
-            "skipped": [],
-            "archived": True,
-            # 200 rather than 202: nothing was accepted for processing, and the
-            # caller is being handed something that already exists.
-            "reused": reason,
-        },
-    )
-
-
-def _resolve_target(body: DownloadRequest) -> tuple[Platform, str]:
-    """Work out which post is meant, from a link or a key.
-
-    `identify` is the allowlist: an unrecognised host yields nothing and is
-    refused here, so no URL a caller sends ever becomes a request.
-    """
-    if body.url:
-        kind = identify(body.url)
-        if not kind.allowed:
-            # Both apps put a caption and a numeric code on the clipboard
-            # beside the link, and that whole string is what gets pasted.
-            candidate = first_url(body.url)
-            if candidate is not None:
-                kind = identify(candidate)
-        if not kind.allowed or kind.platform is None:
-            raise InvalidParam(
-                "that link is not a supported Douyin or TikTok post",
-                details={"field": "url"},
-            )
-        if kind.needs_expansion:
-            raise InvalidParam(
-                "a short link has to be expanded before it names a post; send it "
-                "to /api/v1/parse, which follows it in the background",
-                details={"field": "url", "needs_expansion": True},
-            )
-        if kind.resource is not ResourceKind.VIDEO or not kind.resource_id:
-            raise InvalidParam(
-                "that link names a profile rather than a post",
-                details={"field": "url", "resource": kind.resource.value},
-            )
-        if body.platform is not None and body.platform is not kind.platform:
-            # Guessing which one was meant is how you download the wrong post
-            # from the wrong platform and call it a feature.
-            raise InvalidParam(
-                "the link and the platform disagree",
-                details={"url_platform": kind.platform.value, "platform": body.platform.value},
-            )
-        if body.content_id and body.content_id != kind.resource_id:
-            raise InvalidParam(
-                "the link and the content_id name different posts",
-                details={"url_content_id": kind.resource_id, "content_id": body.content_id},
-            )
-        return kind.platform, kind.resource_id
-
-    if body.platform is None or not body.content_id:
-        raise InvalidParam(
-            "provide either url, or platform and content_id",
-            details={"fields": ["url", "platform", "content_id"]},
-        )
-    # Only a typed id is checked: one extracted from a link came out of the
-    # pattern that recognised the link.
-    return body.platform, require_content_id(body.content_id, platform=body.platform)
+    return ok(request, result.as_dict(), status_code=200 if result.reused else 202)
 
 
 #: How many live downloads to ask the sidecar about on one listing. The number
@@ -385,28 +185,65 @@ async def _live_progress(request: Request, rows: Sequence[Any]) -> dict[str, dic
                 break
             if not job:
                 continue
-            items = [item for item in (job.get("items") or []) if isinstance(item, dict)]
-            done = sum(1 for item in items if item.get("state") == "done")
-            found[str(row.id)] = {
-                "bytes": int(job.get("bytes_total") or 0),
-                "files_done": done,
-                "files_total": len(items),
-                "state": str(job.get("state") or ""),
-                # Per file, so a stalled cover next to a finished video is
-                # visible as that rather than as one number not moving.
-                "items": [
-                    {
-                        "name": str(item.get("name") or ""),
-                        "kind": str(item.get("kind") or ""),
-                        "state": str(item.get("state") or ""),
-                        "bytes": int(item.get("bytes") or 0),
-                    }
-                    for item in items
-                ],
-            }
+            found[str(row.id)] = progress_of(job)
     finally:
         await client.aclose()
     return found
+
+
+def progress_of(job: Mapping[str, Any]) -> dict[str, Any]:
+    """One in-flight job, as the listing reports it.
+
+    ``bytes`` is summed over the files rather than read from the job's
+    ``bytes_total``, which the sidecar writes only when the job settles. Read
+    from there it stayed at zero for the whole of a 100 MB Bilibili video and
+    then jumped, so the one number meant to keep moving never did.
+    """
+    items = [item for item in (job.get("items") or []) if isinstance(item, dict)]
+    files = [
+        {
+            "name": str(item.get("name") or ""),
+            "kind": str(item.get("kind") or ""),
+            "state": str(item.get("state") or ""),
+            "bytes": int(item.get("bytes") or 0),
+            "bytes_expected": int(item.get("bytes_expected") or 0) or None,
+            "bytes_per_second": int(item.get("bytes_per_second") or 0),
+        }
+        for item in items
+    ]
+    return {
+        "bytes": sum(file["bytes"] for file in files),
+        "bytes_expected": _expected_total(files),
+        "bytes_per_second": sum(file["bytes_per_second"] for file in files),
+        "files_done": sum(1 for file in files if file["state"] == "done"),
+        "files_total": len(files),
+        "state": str(job.get("state") or ""),
+        # Per file, so a stalled cover next to a finished video is visible as
+        # that rather than as one number not moving.
+        "items": files,
+    }
+
+
+def _expected_total(files: Sequence[Mapping[str, Any]]) -> int | None:
+    """What the whole download will weigh, or None while any part is unknown.
+
+    A finished file counts what landed and a failed one nothing. A running one
+    counts the size its server declared - for display only; the ceiling is
+    enforced on bytes written, in the sidecar. A file not started yet, or one
+    whose server declared nothing, makes the total unknown, and the page falls
+    back to counting files rather than drawing a bar against a guess.
+    """
+    total = 0
+    for file in files:
+        if file["state"] == "done":
+            total += file["bytes"]
+        elif file["state"] == "failed":
+            continue
+        elif file["bytes_expected"]:
+            total += max(file["bytes_expected"], file["bytes"])
+        else:
+            return None
+    return total
 
 
 @router.post(
@@ -442,7 +279,13 @@ async def retry_download(
     `202` with the new `download_id` and the task running it.
     """
     principal.require(Scope.MEDIA_WRITE)
-    _configured(request)
+    # Before the lookup, as it always was: on an instance with no downloader
+    # the answer to every retry is "not configured", not a 404 or a 400 about
+    # a row that could not be retried anyway.
+    download_requests.ensure_configured(
+        downloader_configured=bool(request.app.state.settings.downloader_url),
+        config=request.app.state.config,
+    )
 
     session = request.state.db
     row = await downloads.get(session, body.download_id)
@@ -570,6 +413,7 @@ async def list_downloads(
     state: DownloadState | None = STATE_QUERY,
     pinned: bool | None = PINNED_QUERY,
     on_disk: bool | None = ON_DISK_QUERY,
+    q: str | None = SEARCH_QUERY,
     limit: int | None = LIMIT_QUERY,
     offset: int = OFFSET_QUERY,
     principal: Principal = Depends(enforce_rate_limit),
@@ -581,18 +425,56 @@ async def list_downloads(
     from never having been fetched - and unlike that one, it can be undone by
     asking again.
 
+    **Parameters**
+
+    - `platform`, `state`, `pinned`, `on_disk` - narrow the result.
+    - `q` - substring of the post's title or author as the archive holds them,
+      or of its content id. Substring rather than word matching, so it behaves
+      the same in Chinese as in English.
+    - `limit`, `offset` - paging. `total` counts every match, not the page.
+
     **Returns**
 
-    The downloads with their per-file digests and sizes, plus the total.
+    The downloads with their per-file digests and sizes, plus the total. A
+    download still in flight also carries `progress`, read live from the
+    downloader: `bytes` written so far, `bytes_expected` once every file's size
+    is known (null until then), `bytes_per_second` over the last few seconds,
+    and the same per file. It is null once the download settles.
+
+    `transcription` is the newest queued, running or finished transcription of
+    the download - its id and state - or null. Null as well for a caller who
+    may not read transcriptions.
     """
     principal.require(Scope.MEDIA_READ)
-    spec = downloads.DownloadFilter(platform=platform, state=state, pinned=pinned, on_disk=on_disk)
+    spec = downloads.DownloadFilter(
+        platform=platform, state=state, pinned=pinned, on_disk=on_disk, query=q
+    )
     rows, total = await downloads.search(
         request.state.db,
         spec,
         limit=limit or DEFAULT_ADMIN_PAGE_SIZE,
         offset=offset,
     )
+    return ok(
+        request,
+        {
+            "items": await _described(request, principal, rows),
+            "total": total,
+            "limit": limit or DEFAULT_ADMIN_PAGE_SIZE,
+            "offset": offset,
+        },
+    )
+
+
+async def _described(
+    request: Request, principal: Principal, rows: Sequence[Any]
+) -> list[dict[str, Any]]:
+    """Download rows with what the console shows beside them.
+
+    Shared by the listing and the single read, so a drawer opened from a link -
+    `/downloads?id=` - shows the same title, progress and transcript link as
+    one opened from the table.
+    """
     # One statement for the page. A table of content ids and byte counts is a
     # table of receipts; the archive already knows what was kept.
     titles = await downloads.titles_for(
@@ -600,22 +482,16 @@ async def list_downloads(
     )
     # Only the in-flight rows cost anything here, and only while there are any.
     progress = await _live_progress(request, rows)
-    return ok(
-        request,
+    transcribed = await _transcriptions_for(request, principal, rows)
+    return [
         {
-            "items": [
-                {
-                    **downloads.as_dict(row),
-                    "post": titles.get((row.platform, row.content_id)),
-                    "progress": progress.get(str(row.id)),
-                }
-                for row in rows
-            ],
-            "total": total,
-            "limit": limit or DEFAULT_ADMIN_PAGE_SIZE,
-            "offset": offset,
-        },
-    )
+            **downloads.as_dict(row),
+            "post": titles.get((row.platform, row.content_id)),
+            "progress": progress.get(str(row.id)),
+            "transcription": transcribed.get(row.id),
+        }
+        for row in rows
+    ]
 
 
 @router.get(
@@ -682,13 +558,15 @@ async def get_download(
     **Returns**
 
     The stored record: per-file name, size, sha256 and content type, plus
-    whether the files are still on the disk.
+    whether the files are still on the disk - and, as in the listing, the
+    post's title, live `progress` while it runs, and its `transcription`.
     """
     principal.require(Scope.MEDIA_READ)
     row = await downloads.get(request.state.db, download_id)
     if row is None:
         raise NotFound("no such download", details={"download_id": str(download_id)})
-    return ok(request, downloads.as_dict(row))
+    [described] = await _described(request, principal, [row])
+    return ok(request, described)
 
 
 @router.get(
@@ -805,6 +683,95 @@ async def pin_download(
 
 
 @router.delete(
+    "/{download_id}/files",
+    summary="Delete a download's files",
+    openapi_extra={I18N_KEY: "downloads_delete_files"},
+)
+async def delete_download_files(
+    request: Request,
+    download_id: uuid.UUID = DOWNLOAD_ID,
+    principal: Principal = Depends(enforce_rate_limit),
+) -> Any:
+    """Remove what a download stored, and keep the record that it was stored.
+
+    The record reads as cleaned up afterwards, exactly as when the size ceiling
+    removes it: the downloads page can still tell "had this and removed it" from
+    "never fetched it", and asking for the download again brings the files back.
+    The console's Delete on the downloads page always promised this and was
+    wired to the cancel below instead, which leaves a finished download as it
+    is - so it reported success and removed nothing.
+
+    The downloads of one post share a directory, so this removes that directory
+    and marks every record in it. It is refused, and nothing is removed, while
+    any of them is still running - that one is writing into the directory - or
+    pinned, because a pin is the promise that these files stay. Removing the
+    post and its records altogether is `POST /api/v1/archive/delete`.
+
+    **Returns**
+
+    How many records were marked and how many bytes the sidecar freed. Files
+    already gone answer the same, with nothing marked and nothing freed.
+    """
+    principal.require(Scope.MEDIA_WRITE)
+    session = request.state.db
+    row = await downloads.get(session, download_id)
+    if row is None:
+        raise NotFound("no such download", details={"download_id": str(download_id)})
+    if row.files_removed_at is not None or not row.directory:
+        return ok(request, {"download_id": str(download_id), "downloads": 0, "freed_bytes": 0})
+
+    sharing = await downloads.sharing_directory(session, row.directory)
+    running = [str(other.id) for other in sharing if other.state in downloads.LIVE_STATES]
+    if running:
+        raise InvalidParam(
+            "a download of this post is still running; cancel it first, or wait for it to settle",
+            details={"download_id": str(download_id), "running": running},
+        )
+    pinned = [str(other.id) for other in sharing if other.pinned]
+    if pinned:
+        raise InvalidParam(
+            "this post is pinned, which is the promise that its files stay; unpin it first",
+            details={"download_id": str(download_id), "pinned": pinned},
+        )
+
+    settings: BootstrapSettings = request.app.state.settings
+    if not settings.downloader_url:
+        # The bytes are on the volume and only the sidecar can reach them.
+        # Marking the rows anyway would leave files nothing accounts for.
+        raise NotConfigured(
+            "this instance has no media downloader to remove the files; "
+            "start the downloader compose profile"
+        )
+    from dtk.media import DownloaderClient, DownloaderUnavailable
+
+    client = DownloaderClient(settings.downloader_url, token=settings.downloader_token)
+    try:
+        removed = await client.delete([row.directory])
+    except DownloaderUnavailable as exc:
+        log.warning("media.download.delete_failed", download_id=str(download_id), error=str(exc))
+        raise DownloaderDown("the media downloader did not answer, so nothing was deleted") from exc
+    finally:
+        await client.aclose()
+    # Only what the sidecar confirmed is marked, as the eviction sweep does: a
+    # row that says its files are gone while they are on the disk is a row no
+    # sweep would ever reclaim.
+    if row.directory not in {str(path) for path in removed.get("removed") or []}:
+        raise DownloaderDown("the media downloader did not confirm removing the files")
+
+    marked = await downloads.mark_evicted(session, [other.id for other in sharing])
+    await session.commit()
+    freed = int(removed.get("freed_bytes") or 0)
+    log.info(
+        "media.download.files_deleted",
+        download_id=str(download_id),
+        downloads=marked,
+        freed_bytes=freed,
+        actor=str(principal.user_id) if principal.user_id else None,
+    )
+    return ok(request, {"download_id": str(download_id), "downloads": marked, "freed_bytes": freed})
+
+
+@router.delete(
     "/{download_id}", summary="Cancel a download", openapi_extra={I18N_KEY: "downloads_cancel"}
 )
 async def cancel_download(
@@ -815,8 +782,9 @@ async def cancel_download(
     """Stop a download that has not finished.
 
     Cancels the transfer; it does not delete anything. Files already complete
-    stay where they are, and the record stays either way - removing files is
-    the cleanup sweep's job and follows the operator's ceiling, not a DELETE.
+    stay where they are, and the record stays either way. Removing files is
+    `DELETE /api/v1/downloads/{download_id}/files`, or the cleanup sweep once
+    the operator's ceiling is reached.
 
     **Returns**
 

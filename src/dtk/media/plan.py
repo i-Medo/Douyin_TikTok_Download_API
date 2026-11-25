@@ -17,6 +17,7 @@ object key, not a title, and half of them have no extension at all.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final
 from urllib.parse import urlsplit
@@ -25,13 +26,20 @@ from dtk.core.types import Platform
 from dtk.media.domains import allowed_mirrors
 
 #: Covers and album images never approach the video ceiling, and a 500 MB
-#: "image" is a sign something is wrong rather than a large photograph.
+#: "image" is a sign something is wrong rather than a large photograph. A live
+#: photo's clip is held to it too: a few seconds, measured at about 0.6 MB in
+#: 720p, and one the size of a film would be as wrong as such an image.
 IMAGE_MAX_BYTES: Final = 32 * 1024 * 1024
 
 #: How many files one post may produce. A Douyin image album tops out around
-#: 35 slides; the cap is a guard against a malformed payload turning into a
-#: thousand-item job, not a limit anyone should meet.
-MAX_ITEMS: Final = 64
+#: 35 slides, and every one of them may be a live photo with a clip beside it:
+#: 71 files with the cover. The cap is a guard against a malformed payload
+#: turning into a thousand-item job, not a limit anyone should meet - it was 64
+#: until live photos were stored, which a full album of them would have met.
+MAX_ITEMS: Final = 128
+
+#: The kind of the clip a live photo slide carries, stored beside its still.
+LIVE_VIDEO_KIND: Final = "live_video"
 
 #: Content types each kind will accept.
 #:
@@ -53,7 +61,50 @@ IMAGE_EXTENSIONS: Final[frozenset[str]] = frozenset({"jpg", "jpeg", "png", "webp
 REFERER: Final[dict[Platform, str]] = {
     Platform.DOUYIN: "https://www.douyin.com/",
     Platform.TIKTOK: "https://www.tiktok.com/",
+    Platform.BILIBILI: "https://www.bilibili.com/",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class BoundCookie:
+    """A cookie a platform's CDN binds its media links to, and where it goes."""
+
+    name: str
+    #: The cookie's own domain. The downloader sends it to hosts inside this
+    #: one only, the way a browser would.
+    domain: str
+
+
+#: The only cookies a download job may carry, per platform.
+#:
+#: TikTok's video links say ``tk=tt_chain_token``: its CDN serves them only to
+#: a request carrying the tt_chain_token of the session that asked for them,
+#: and answers 403 to everyone else (#831). That holds only for links asked for
+#: with the session's own device id - see ``dtk.platforms.tiktok.params`` - and
+#: with that pair the first mirror lands; without the cookie the download falls
+#: back to a www.tiktok.com mirror whose redirect depends on the exit. The
+#: token is anonymous - any visitor is given one - and it is the whole of what
+#: is sent: never the jar, never a login. The Go side keeps the same list
+#: (``boundCookies`` in docker/downloader/cookies.go) and refuses any other
+#: name, so a mistake here fails the job rather than shipping a credential.
+BOUND_COOKIES: Final[dict[Platform, tuple[BoundCookie, ...]]] = {
+    Platform.TIKTOK: (BoundCookie("tt_chain_token", "tiktok.com"),),
+}
+
+
+def bound_cookies(platform: Platform, jar: Mapping[str, str]) -> list[dict[str, str]]:
+    """The cookies a job for ``platform`` carries, taken from one identity's jar.
+
+    Empty for a platform whose links are not bound to a session, and for a jar
+    that lacks the token - the job then goes out without it and fails as it
+    always did, with the CDN's 403 in the reason.
+    """
+    return [
+        {"name": cookie.name, "value": jar[cookie.name], "domain": cookie.domain}
+        for cookie in BOUND_COOKIES.get(platform, ())
+        if jar.get(cookie.name)
+    ]
+
 
 #: A desktop Chrome string. The CDNs are not signing on it, but an obviously
 #: automated agent is answered differently by some edges, and this costs
@@ -234,25 +285,39 @@ def build(
             skipped.append("no video mirror survived the media allowlist")
 
     # --- album images ---------------------------------------------------
+    # A live photo's clip goes right after its still and under the same stem,
+    # `image-01.webp` beside `image-01.mp4` - the pairing a phone's own live
+    # photos use on disk, and the one that keeps "which clip is which slide"
+    # answerable without meta.json. Its own kind, not "video": the post's video
+    # is what the library plays and the transcriber reads, and the first
+    # five-second clip of an album is neither.
     images = media.get("images")
     if isinstance(images, list):
         for index, image in enumerate(images, start=1):
-            if not isinstance(image, dict) or len(items) >= MAX_ITEMS:
+            if not isinstance(image, dict):
                 continue
-            mirrors, refused = _mirrors(image, platform)
-            note(refused)
-            if not mirrors:
-                continue
-            extension = _extension(mirrors[0], IMAGE_EXTENSIONS, "jpg")
-            items.append(
-                PlannedItem(
-                    name=f"image-{index:02d}.{extension}",
-                    kind="image",
-                    mirrors=tuple(mirrors),
-                    accept=IMAGE_ACCEPT,
-                    max_bytes=min(max_file_bytes, IMAGE_MAX_BYTES),
+            for source, kind in ((image, "image"), (image.get("video"), LIVE_VIDEO_KIND)):
+                if not isinstance(source, dict) or len(items) >= MAX_ITEMS:
+                    continue
+                mirrors, refused = _mirrors(source, platform)
+                note(refused)
+                if not mirrors:
+                    continue
+                if kind == "image":
+                    extension = _extension(mirrors[0], IMAGE_EXTENSIONS, "jpg")
+                    accept = IMAGE_ACCEPT
+                else:
+                    extension = _extension(mirrors[0], VIDEO_EXTENSIONS, "mp4")
+                    accept = VIDEO_ACCEPT
+                items.append(
+                    PlannedItem(
+                        name=f"image-{index:02d}.{extension}",
+                        kind=kind,
+                        mirrors=tuple(mirrors),
+                        accept=accept,
+                        max_bytes=min(max_file_bytes, IMAGE_MAX_BYTES),
+                    )
                 )
-            )
 
     # --- the cover ------------------------------------------------------
     # Last, and only one of them. The covers list holds an animated version and
@@ -315,15 +380,19 @@ def sidecar(row: Any, plan: Plan) -> dict[str, Any]:
 
 
 __all__ = [
+    "BOUND_COOKIES",
     "EXPORT_PREFIX",
     "IMAGE_ACCEPT",
     "IMAGE_MAX_BYTES",
+    "LIVE_VIDEO_KIND",
     "MAX_ITEMS",
     "REFERER",
     "USER_AGENT",
     "VIDEO_ACCEPT",
+    "BoundCookie",
     "Plan",
     "PlannedItem",
+    "bound_cookies",
     "build",
     "export_name",
     "sidecar",

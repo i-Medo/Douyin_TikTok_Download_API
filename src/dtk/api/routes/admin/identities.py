@@ -14,14 +14,15 @@ the response (doc 06, doc 08).
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Final
 
 from fastapi import APIRouter, Depends, Path, Query, Request
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dtk.api.deps import Principal
@@ -32,8 +33,11 @@ from dtk.api.routes.schemas import (
     IdentityBundle,
     IdentityExport,
     IdentityImport,
+    IdentityUpdate,
     MintRequest,
     RetireRequest,
+    RotationRequest,
+    identity_note,
 )
 from dtk.api.routes.support import (
     DEFAULT_ADMIN_PAGE_SIZE,
@@ -62,6 +66,7 @@ from dtk.identity.importing import (
     to_cookie_header,
 )
 from dtk.identity.marks import pool_marks
+from dtk.identity.minting.native import NATIVE_MINT_PLATFORMS
 from dtk.identity.pool import IdentityPool
 from dtk.scheduler.health import score
 from dtk.signing.native.websign import UIFID_COOKIE_NAMES, VERIFY_FP_COOKIE
@@ -89,7 +94,21 @@ _SESSION_COOKIE: Final[Mapping[str, tuple[str, int]]] = MappingProxyType(
     {
         Platform.TIKTOK.value: ("msToken", 144),
         Platform.DOUYIN.value: ("UIFID_TEMP", 32),
+        # The visitor id finger/spi hands out. No bootstrap value of it has
+        # been measured, so present is enough. Without an entry every Bilibili
+        # row read "Unknown", which on this column means "this build cannot
+        # tell" - not true of a cookie it refuses to import without.
+        Platform.BILIBILI.value: ("buvid3", 1),
     }
+)
+
+#: Every name the session value goes by where a platform has more than one,
+#: in the order the signer reads them. The name above is the one a mint yields,
+#: and a browser's jar spells Douyin's `UIFID`: judged on `UIFID_TEMP` alone,
+#: every login imported from a browser read "missing" and the Identities page
+#: hid it as a spent session, while the signer was signing with it.
+_SESSION_SPELLINGS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
+    {Platform.DOUYIN.value: UIFID_COOKIE_NAMES}
 )
 
 
@@ -115,6 +134,12 @@ def _session_health(platform: str, cookies: Mapping[str, str]) -> dict[str, Any]
     if expected is None:
         return {"cookie": None, "verdict": "unknown"}
     name, minimum = expected
+    # The spelling the signer would read first, so the verdict is on the value
+    # it signs with; none held, and the cell names the one a mint yields.
+    name = next(
+        (spelling for spelling in _SESSION_SPELLINGS.get(platform, ()) if cookies.get(spelling)),
+        name,
+    )
     value = cookies.get(name) or ""
     if not value:
         verdict = "missing"
@@ -132,6 +157,15 @@ def _session_health(platform: str, cookies: Mapping[str, str]) -> dict[str, Any]
 #: sign without.
 _SIGNING_COOKIES: Final[frozenset[str]] = frozenset({*UIFID_COOKIE_NAMES, VERIFY_FP_COOKIE})
 
+#: Cookies that belong to a login without being the one that proves it, so
+#: they are shown as part of it. Not session markers: `bili_jct` without
+#: `SESSDATA` is a CSRF token for a session the jar does not hold, and counting
+#: it would mark a guest as logged in. Shown as "other" they read as noise in
+#: the very paste whose login an operator is checking.
+_LOGIN_COMPANIONS: Final[frozenset[str]] = frozenset(
+    {"bili_jct", "DedeUserID", "DedeUserID__ckMd5"}
+)
+
 
 #: The export document's shape. Bumped when an entry gains or loses a field,
 #: so an importer can refuse a file it would silently read wrong rather than
@@ -143,6 +177,20 @@ EXPORT_VERSION: Final = 1
 def _text(value: Any) -> str | None:
     """A field from an imported document, when it is a string worth passing on."""
     return value if isinstance(value, str) and value else None
+
+
+def _bundle_note(value: Any) -> str | None:
+    """An exported note, if it is still one this build would store.
+
+    Dropped rather than refused when it is not: a note is a label, and an
+    identity that would otherwise restore is worth more than the label on it.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        return identity_note(value)
+    except ValueError:
+        return None
 
 
 def _decrypt(request: Request, identity: Identity) -> dict[str, str] | None:
@@ -162,7 +210,7 @@ def _decrypt(request: Request, identity: Identity) -> dict[str, str] | None:
     return _parse_cookies(header)
 
 
-def _cookie_role(name: str) -> str:
+def _cookie_role(name: str, platform: Platform | None = None) -> str:
     """Why this cookie matters, using the sets the rest of the build judges by.
 
     Four buckets rather than a description per cookie: the platforms add and
@@ -170,10 +218,15 @@ def _cookie_role(name: str) -> str:
     keep current in a file nobody opens. What the server knows for certain is
     which names this build treats as load bearing; the console renders the
     prose, and an unknown name still gets an honest "other".
+
+    Required is judged against ``platform`` when there is one. Against every
+    platform at once, a `ttwid` pasted into a Bilibili import read as required
+    by the one platform that never asks for it.
     """
-    if name in SESSION_MARKERS:
+    if name in SESSION_MARKERS or name in _LOGIN_COMPANIONS:
         return "session"
-    if any(name in required for required in REQUIRED.values()):
+    required_sets = [REQUIRED.get(platform, ())] if platform is not None else REQUIRED.values()
+    if any(name in required for required in required_sets):
         return "required"
     if name in USEFUL or name in _SIGNING_COOKIES:
         return "useful"
@@ -206,11 +259,16 @@ def _row(
     session: dict[str, Any] | None = None,
     health: float | None = None,
     proxy_label: str | None = None,
+    expires_at: datetime | None = None,
 ) -> dict[str, Any]:
     """The console view of one identity. Never widens to the cookie column."""
     fingerprint = identity.fingerprint or {}
     return {
         "session": session or {"cookie": None, "verdict": "unknown"},
+        # When the login lapses, read out of the session cookie: None for a
+        # guest, and for a login whose cookie does not say. A date rather than
+        # anything from the value, which is the credential.
+        "expires_at": iso(expires_at),
         # None where the aggregate has no traffic for this identity. The
         # console falls back to the failure streak there rather than drawing a
         # number that would read as measured.
@@ -232,6 +290,13 @@ def _row(
         "last_used_at": iso(identity.last_used_at),
         "retired_at": iso(identity.retired_at),
         "retire_reason": identity.retire_reason,
+        # None for an identity in ordinary rotation; see Identity.rotation_endpoints.
+        "rotation_endpoints": identity.rotation_endpoints,
+        "note": identity.note,
+        # What the platform named the last time the session was checked, and
+        # when. None until a check has named an account.
+        "account_id": identity.account_id,
+        "account_seen_at": iso(identity.account_seen_at),
         "fingerprint": {
             "browser_family": fingerprint.get("browser_family"),
             "browser_major": fingerprint.get("browser_major"),
@@ -239,6 +304,31 @@ def _row(
             "language": fingerprint.get("language"),
             "timezone": fingerprint.get("timezone"),
         },
+    }
+
+
+def _summary(report: ImportReport, warnings: list[str]) -> dict[str, Any]:
+    """What the import preview shows: names, roles, masks - never a value."""
+    return {
+        "detected_format": report.detected_format.value,
+        "detected_platform": (
+            report.detected_platform.value if report.detected_platform is not None else None
+        ),
+        "cookie_names": sorted(report.cookies),
+        "cookies_masked": report.masked(),
+        "cookie_roles": {
+            name: _cookie_role(name, report.platform) for name in sorted(report.cookies)
+        },
+        "authenticated": report.authenticated,
+        "expires_at": iso(report.expires_at),
+        "missing_required": list(report.missing_required),
+        "warnings": warnings,
+        "warning_codes": [warning.code.value for warning in report.warnings],
+        "usable": report.usable,
+        "browser_family": (
+            report.fingerprint.browser_family.value if report.fingerprint.browser_family else None
+        ),
+        "browser_major": report.fingerprint.browser_major,
     }
 
 
@@ -253,6 +343,91 @@ def _warnings(report: ImportReport, lang: Language) -> list[str]:
     return [t(warning.key, lang, **warning.args) for warning in report.warnings]
 
 
+class RotationFilter(StrEnum):
+    """Which rotation an identity is in, as the list filters on it."""
+
+    #: Handed out for every endpoint: `rotation_endpoints` is null.
+    ROTATING = "rotating"
+    #: Only for requests that name it: an empty list.
+    RESERVED = "reserved"
+    #: Handed out for the endpoints its list names and nothing else.
+    LIMITED = "limited"
+
+
+#: The states the scheduler hands out: active, and degraded as a fallback.
+#: One tuple for the coverage card's count and the list it links to, which
+#: used to answer two different questions under one number.
+_SERVING_STATES: Final = (IdentityState.ACTIVE.value, IdentityState.DEGRADED.value)
+
+
+def _logins_only(endpoint: str) -> bool:
+    """Whether rotation sends this endpoint nothing but logins, first page included.
+
+    The scheduler's pass for such an endpoint draws signed-in identities alone,
+    so a guest in rotation for it is never sent there. Counting the guests
+    anyway put "8" under Can serve beside Douyin's author likes, an endpoint
+    those eight could not serve once, and the list it opened was eight guests.
+    """
+    from dtk.platforms.base import LoginNeed
+    from dtk.platforms.registry import get_adapter
+
+    try:
+        table = get_adapter(Platform(endpoint.partition(".")[0])).endpoints
+    except ValueError:
+        return False
+    return endpoint in table and table[endpoint].login is LoginNeed.REQUIRED
+
+
+def _list_conditions(
+    *,
+    platform: Platform | None,
+    state: IdentityState | None,
+    authenticated: bool | None,
+    source: IdentitySource | None,
+    rotation: RotationFilter | None,
+    identity_id: uuid.UUID | None,
+    serves: str | None = None,
+    ready: bool = False,
+) -> list[ColumnElement[bool]]:
+    """The filters the listing and its total share, retired rows aside."""
+    conditions: list[ColumnElement[bool]] = []
+    if platform is not None:
+        conditions.append(Identity.platform == platform.value)
+    if state is not None:
+        conditions.append(Identity.state == state.value)
+    if authenticated is not None:
+        conditions.append(Identity.authenticated.is_(authenticated))
+    if source is not None:
+        conditions.append(Identity.source == source.value)
+    if rotation is RotationFilter.ROTATING:
+        conditions.append(Identity.rotation_endpoints.is_(None))
+    elif rotation is RotationFilter.RESERVED:
+        conditions.append(func.cardinality(Identity.rotation_endpoints) == 0)
+    elif rotation is RotationFilter.LIMITED:
+        conditions.append(func.cardinality(Identity.rotation_endpoints) > 0)
+    if identity_id is not None:
+        conditions.append(Identity.id == identity_id)
+    if serves is not None:
+        # The scheduler's own test, Candidate.rotates_for, as SQL: no list is
+        # every endpoint, and a list is the endpoints it names.
+        conditions.append(
+            or_(
+                Identity.rotation_endpoints.is_(None),
+                Identity.rotation_endpoints.contains([serves]),
+            )
+        )
+        if _logins_only(serves):
+            conditions.append(Identity.authenticated.is_(True))
+    if ready:
+        conditions.append(Identity.state.in_(_SERVING_STATES))
+    return conditions
+
+
+async def _count(session: AsyncSession, conditions: Sequence[ColumnElement[bool]]) -> int:
+    result = await session.execute(select(func.count()).select_from(Identity).where(*conditions))
+    return int(result.scalar_one())
+
+
 @router.get(
     "", summary="List identities with state and health", openapi_extra={I18N_KEY: "identities_list"}
 )
@@ -262,70 +437,224 @@ async def list_identities(
         default=None, description="Only identities for this platform."
     ),
     state: IdentityState | None = Query(default=None, description="Only identities in this state."),
+    authenticated: bool | None = Query(
+        default=None, description="Only logged-in identities (true), or only guests (false)."
+    ),
+    source: IdentitySource | None = Query(
+        default=None, description="Only minted, or only imported, identities."
+    ),
+    rotation: RotationFilter | None = Query(
+        default=None,
+        description=(
+            "Only identities rotation hands out for every endpoint (`rotating`), only "
+            "for requests that name them (`reserved`), or for a list of endpoints "
+            "(`limited`)."
+        ),
+    ),
+    include_retired: bool = Query(
+        default=False,
+        description=(
+            "Also list retired identities. They are kept for 90 days for their "
+            "statistics and hold no cookies."
+        ),
+    ),
+    identity_id: uuid.UUID | None = Query(
+        default=None, description="Only this identity, retired or not."
+    ),
+    serves: str | None = Query(
+        default=None,
+        max_length=128,
+        description=(
+            "Only identities rotation may hand out for this endpoint, such as "
+            "`douyin.author_posts`: those in ordinary rotation and those limited to a "
+            "list that names it. Reserved identities never match, and guests do not "
+            "where the endpoint needs a login from its first page."
+        ),
+    ),
+    ready: bool = Query(
+        default=False,
+        description=(
+            "Only identities the scheduler would hand out now: active, or degraded "
+            "as a fallback. With `serves`, the identities the coverage card counts "
+            "as able to serve that endpoint."
+        ),
+    ),
     limit: int = Query(
         default=DEFAULT_ADMIN_PAGE_SIZE,
         ge=1,
         le=MAX_ADMIN_PAGE_SIZE,
         description="Maximum identities to return.",
     ),
+    offset: int = Query(default=0, ge=0, description="Rows to skip."),
     principal: Principal = Depends(read_admin),
 ) -> Any:
     """The identity pool, newest first.
 
     Cookies are never returned; this is the health view, not the credential.
 
+    Retired identities are left out unless `include_retired` is set, `state`
+    asks for them, or `identity_id` names one. They used to be listed and
+    hidden by the console instead, and since they are kept for 90 days they
+    took up the page: a pool that retired two hundred identities in a bad
+    week showed none of its older logins at all, and said nothing about it.
+
     **Parameters**
 
     - `platform` - restrict to one platform.
     - `state` - restrict to one state, such as `active` or `cooling`.
-    - `limit` - how many to return.
+    - `authenticated` - only logins, or only guests.
+    - `source` - only `minted` or only `imported` identities.
+    - `rotation` - `rotating`, `reserved` or `limited`.
+    - `include_retired` - list retired identities as well.
+    - `identity_id` - just this one identity.
+    - `serves` - only identities rotation may hand out for this endpoint.
+    - `ready` - only those it would hand out now: active or degraded.
+    - `limit`, `offset` - the page.
 
     **Returns**
 
     Each identity's id, platform, state, the proxy it is bound to - its
     `proxy_id` and `proxy_label`, the name someone gave that proxy, `null` when
     there is no proxy or no name, and never its URL - when it was minted and
-    last used, and its health score over the last 15 and 60 minutes: `null` for
-    an identity the aggregate has no traffic for, which is not the same as zero.
+    last used, when its login expires (`expires_at`, read from the session
+    cookie; `null` for a guest), and its health score over the last 15 and 60
+    minutes: `null` for an identity the aggregate has no traffic for, which is
+    not the same as zero. `meta.total` is how many identities match, and
+    `meta.retired` how many retired ones the same filters left out.
     """
-    stmt = select(Identity)
-    if platform is not None:
-        stmt = stmt.where(Identity.platform == platform.value)
-    if state is not None:
-        stmt = stmt.where(Identity.state == state.value)
-    stmt = stmt.order_by(Identity.minted_at.desc()).limit(limit)
-    rows = (await request.state.db.scalars(stmt)).all()
+    db = request.state.db
+    conditions = _list_conditions(
+        platform=platform,
+        state=state,
+        authenticated=authenticated,
+        source=source,
+        rotation=rotation,
+        identity_id=identity_id,
+        serves=serves,
+        ready=ready,
+    )
+    excluding = not include_retired and state is None and identity_id is None
+    retired_left_out = 0
+    if excluding:
+        retired_left_out = await _count(
+            db, [*conditions, Identity.state == IdentityState.RETIRED.value]
+        )
+        conditions.append(Identity.state != IdentityState.RETIRED.value)
+    total = await _count(db, conditions)
+    stmt = (
+        select(Identity)
+        .where(*conditions)
+        # The id breaks ties so that two identities minted in the same instant
+        # cannot swap places between one page and the next.
+        .order_by(Identity.minted_at.desc(), Identity.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    rows = (await db.scalars(stmt)).all()
     # Decrypting each jar costs, and the list is bounded by `limit`. It buys the
     # one thing the board could not say before: whether an identity still holds
     # the session value its platform issued, which is the difference between
-    # "retire this identity" and "the signer is broken".
+    # "retire this identity" and "the signer is broken" - and, for a login,
+    # when it runs out.
     cipher = request.app.state.cipher
     sessions: list[dict[str, Any]] = []
+    expiries: list[datetime | None] = []
     for row in rows:
         try:
             header = cipher.decrypt(row.cookies_encrypted, aad=str(row.id))
         except Exception:
             sessions.append({"cookie": None, "verdict": "unknown"})
+            expiries.append(None)
             continue
-        sessions.append(_session_health(row.platform, _parse_cookies(header)))
+        cookies = _parse_cookies(header)
+        sessions.append(_session_health(row.platform, cookies))
+        expiries.append(session_expiry(cookies) if row.authenticated else None)
     # The same score the scheduler ranks on, over the same two windows, so the
     # column an operator reads and the ordering the pool actually uses cannot
     # disagree. The streak comes from the row rather than the aggregate: it is
     # written on every outcome, while the aggregate lags by up to one bucket.
-    windows = await pool.health_inputs(request.state.db, [row.id for row in rows])
+    windows = await pool.health_inputs(db, [row.id for row in rows])
     health = {
         row.id: score(replace(windows[row.id], consecutive_fails=row.consecutive_fails))
         for row in rows
         if row.id in windows
     }
-    labels = await _proxy_labels(request.state.db, rows)
+    labels = await _proxy_labels(db, rows)
     return ok(
         request,
         [
-            _row(row, session, health.get(row.id), labels.get(row.proxy_id))
-            for row, session in zip(rows, sessions, strict=True)
+            _row(row, session, health.get(row.id), labels.get(row.proxy_id), expires_at)
+            for row, session, expires_at in zip(rows, sessions, expiries, strict=True)
         ],
+        extra={"total": total, "retired": retired_left_out},
     )
+
+
+def _login_required_endpoints(platform: Platform) -> frozenset[str]:
+    """The endpoints a guest cannot serve at all, on some page or every page."""
+    from dtk.platforms.base import LoginNeed
+    from dtk.platforms.registry import get_adapter
+
+    table = get_adapter(platform).endpoints
+    return frozenset(
+        name
+        for name in table.names()
+        if LoginNeed.REQUIRED in (table[name].login, table[name].paging_login)
+    )
+
+
+#: The states rotation leases from; a cooling identity waits out its timer.
+_LEASABLE: Final = frozenset({IdentityState.ACTIVE.value, IdentityState.DEGRADED.value})
+
+
+def _count_logins(
+    rows: Iterable[tuple[str, str, Sequence[str] | None]],
+    needs_login: Mapping[str, frozenset[str]],
+) -> dict[str, dict[str, int]]:
+    """Each platform's logged-in identities, by what rotation can do with them.
+
+    Mirrors `Scheduler._rotation_pool`: an endpoint that requires a login
+    leases from active and degraded identities that rotate for it, and skips a
+    reserved one even then. So "reserved" is checked first - a reserved
+    identity that is also cooling is still one rotation will never reach - and
+    a limited one counts as rotating only where its list names an endpoint that
+    needs it.
+    """
+    coverage = {
+        platform.value: {"rotating": 0, "limited": 0, "reserved": 0, "cooling": 0}
+        for platform in Platform
+    }
+    for platform, state, endpoints in rows:
+        counts = coverage.get(platform)
+        if counts is None:
+            continue
+        if endpoints is not None and len(endpoints) == 0:
+            counts["reserved"] += 1
+        elif state == IdentityState.COOLING.value:
+            counts["cooling"] += 1
+        elif state in _LEASABLE:
+            required = needs_login.get(platform, frozenset())
+            serves = endpoints is None or not required or bool(required & set(endpoints))
+            counts["rotating" if serves else "limited"] += 1
+    return coverage
+
+
+async def _login_coverage(
+    session: AsyncSession, needs_login: Mapping[str, frozenset[str]]
+) -> dict[str, dict[str, int]]:
+    """:func:`_count_logins` over every live login, in one statement.
+
+    Three columns of the few authenticated rows rather than a count per
+    platform and bucket: the pool card polls this every five seconds, and a
+    pool holds a handful of logins beside its guests.
+    """
+    rows = await session.execute(
+        select(Identity.platform, Identity.state, Identity.rotation_endpoints).where(
+            Identity.authenticated.is_(True),
+            Identity.state != IdentityState.RETIRED.value,
+        )
+    )
+    return _count_logins(rows.tuples().all(), needs_login)
 
 
 @router.get(
@@ -358,7 +687,17 @@ async def pool_level(request: Request, principal: Principal = Depends(read_admin
     repeated failures have put the sweep to sleep. It comes from the worker via
     Redis rather than from this database, because a failed mint writes no row -
     which is exactly why a pool that stubbornly will not refill used to look
-    identical to one nobody asked to refill.
+    identical to one nobody asked to refill. `activity.backoffs` is keyed by
+    platform: the browser and plain HTTP back off separately, so Douyin can be
+    resting while Bilibili mints.
+
+    `logins` counts each platform's logged-in identities by what rotation can
+    do with them: `rotating` ones it hands out to the endpoints that need a
+    login, `reserved` ones only a request naming them reaches, `cooling` ones
+    it will hand out again, and `limited` ones it hands out only for endpoints
+    that need no login. `login_required_for` names the endpoints that refuse a
+    guest outright - on every page after the first - and answer
+    IDENTITY_LOGIN_REQUIRED when `rotating` is zero.
     """
     config = request.app.state.config
     # The global pair, which is what a platform with no override of its own
@@ -367,9 +706,11 @@ async def pool_level(request: Request, principal: Principal = Depends(read_admin
     min_size = int(config.get("pool.min_size"))
     target_size = max(min_size, int(config.get("pool.target_size")))
     max_fail_streak = max(1, int(config.get("pool.max_fail_streak")))
-    can_mint = bool(getattr(request.app.state.settings, "browser_rpc_url", "") or "")
+    browser = bool(getattr(request.app.state.settings, "browser_rpc_url", "") or "")
 
     identities = IdentityPool(request.app.state.cipher)
+    needs_login = {platform.value: _login_required_endpoints(platform) for platform in Platform}
+    logins = await _login_coverage(request.state.db, needs_login)
     platforms: list[dict[str, Any]] = []
     for platform in Platform:
         marks = pool_marks(config, platform)
@@ -395,11 +736,20 @@ async def pool_level(request: Request, principal: Principal = Depends(read_admin
                 "below_minimum": marks.auto and usable < marks.min_size,
                 "min_size": marks.min_size,
                 "target_size": marks.target_size,
+                # Per platform: Bilibili guests are minted over plain HTTP, so
+                # they can be minted where the others need a browser.
+                "can_mint": browser or platform in NATIVE_MINT_PLATFORMS,
                 # Whether each number is this platform's own or the global one,
                 # so the console can offer "back to the default" honestly.
                 "min_inherited": marks.min_inherited,
                 "target_inherited": marks.target_inherited,
                 "auto": marks.auto,
+                # The logins rotation can reach, and the endpoints that answer
+                # IDENTITY_LOGIN_REQUIRED without one. Nothing on the board
+                # said either, so the first sign that the only imported login
+                # had been reserved, had cooled or had lapsed was that error.
+                "logins": logins[platform.value],
+                "login_required_for": sorted(needs_login[platform.value]),
             }
         )
 
@@ -409,7 +759,9 @@ async def pool_level(request: Request, principal: Principal = Depends(read_admin
             "min_size": min_size,
             "target_size": target_size,
             "max_fail_streak": max_fail_streak,
-            "can_mint": can_mint,
+            # Whether any platform can be minted here. Kept for clients written
+            # before the per-platform flag; read that one to decide a button.
+            "can_mint": browser or bool(NATIVE_MINT_PLATFORMS),
             "platforms": platforms,
             "activity": await mint_log.snapshot(),
         },
@@ -428,8 +780,9 @@ async def mint(
 ) -> Any:
     """Queue a minting job per identity requested.
 
-    Minting drives a real browser through the proxy, which takes seconds and is
-    not on the request path; it is queued like any other job (doc 02).
+    Minting takes seconds and is not on the request path - Douyin and TikTok
+    drive a real browser through the proxy, Bilibili makes one plain HTTP
+    request through it - so it is queued like any other job (doc 02).
     """
     task_ids: list[str] = []
     for _ in range(body.count):
@@ -469,6 +822,20 @@ async def import_identity(
     ``dry_run`` returns the report without writing anything, which is what the
     console shows before the user commits: a mistyped jar is far easier to spot
     here than in a week of failing requests.
+
+    The report says which role each cookie plays for the chosen platform and
+    which platform the cookie names point at. The console kept its own copy of
+    the first, which knew only ByteDance cookies and labelled a whole Bilibili
+    jar "other"; the second is how it offers to switch a paste it was given
+    under the wrong platform.
+
+    ``reserved`` stores the identity already out of rotation, so a login that
+    was imported to serve the requests that name it is never handed to anything
+    else - not even in the moment between storing it and reserving it.
+
+    A logged-in jar is the account itself. Platforms rarely ban an account for
+    reading data with it, but a ban cannot be ruled out, and importing one is
+    at the importer's own risk; the console says so before it stores one.
     """
     report = build_report(
         body.cookies,
@@ -478,21 +845,7 @@ async def import_identity(
         timezone=body.timezone,
     )
     warnings = _warnings(report, language(request))
-    summary: dict[str, Any] = {
-        "detected_format": report.detected_format.value,
-        "cookie_names": sorted(report.cookies),
-        "cookies_masked": report.masked(),
-        "authenticated": report.authenticated,
-        "expires_at": iso(report.expires_at),
-        "missing_required": list(report.missing_required),
-        "warnings": warnings,
-        "warning_codes": [warning.code.value for warning in report.warnings],
-        "usable": report.usable,
-        "browser_family": (
-            report.fingerprint.browser_family.value if report.fingerprint.browser_family else None
-        ),
-        "browser_major": report.fingerprint.browser_major,
-    }
+    summary = _summary(report, warnings)
 
     if body.dry_run:
         return ok(request, {"stored": False, "report": summary})
@@ -515,7 +868,12 @@ async def import_identity(
         source=IdentitySource.IMPORTED,
         proxy_id=proxy_id,
         authenticated=report.authenticated,
+        note=body.note,
     )
+    if body.reserved:
+        stored = await request.state.db.get(Identity, identity_id)
+        if stored is not None:
+            stored.rotation_endpoints = []
     await audit(
         request,
         principal,
@@ -527,6 +885,8 @@ async def import_identity(
             "authenticated": report.authenticated,
             "cookie_names": sorted(report.cookies),
             "format": report.detected_format.value,
+            "reserved": body.reserved,
+            "noted": body.note is not None,
         },
     )
     log.info(
@@ -606,7 +966,7 @@ async def identity_cookies(
             "cookies": [
                 {
                     "name": name,
-                    "role": _cookie_role(name),
+                    "role": _cookie_role(name, Platform(identity.platform)),
                     "masked": mask_value(value),
                     "length": len(value),
                 }
@@ -654,7 +1014,8 @@ async def import_bundle(
     **Returns**
 
     `stored`, and one result per entry: its platform, whether it was usable,
-    and the id it was given.
+    why it was skipped (`reason`: `no_cookies`, `unknown_platform` or
+    `unusable`), when its login expires, and the id it was given.
     """
     if body.version > EXPORT_VERSION:
         raise InvalidParam(
@@ -692,10 +1053,17 @@ async def import_bundle(
         outcome |= {
             "platform": platform.value,
             "authenticated": report.authenticated,
+            # Restored all the same: a lapsed login still signs as a guest.
+            # Said here so the preview can show which logins will come back
+            # as guests in all but name.
+            "expires_at": iso(report.expires_at),
             "usable": report.usable,
             "missing_required": list(report.missing_required),
             "warnings": _warnings(report, lang),
         }
+        note = _bundle_note(entry.get("note"))
+        if note is not None:
+            outcome["note"] = note
         if not report.usable:
             results.append({**outcome, "reason": "unusable"})
             continue
@@ -711,6 +1079,7 @@ async def import_bundle(
             source=IdentitySource.IMPORTED,
             proxy_id=proxy_id,
             authenticated=report.authenticated,
+            note=note,
         )
         stored += 1
         results.append({**outcome, "identity_id": str(identity_id)})
@@ -852,6 +1221,9 @@ async def export_identities(
                 "minted_at": iso(identity.minted_at),
                 "retired_at": iso(identity.retired_at),
                 "cookies": cookies,
+                # A label, not a credential, and the one thing that says whose
+                # account a login in the file is. Read back by the bundle import.
+                "note": identity.note,
                 "user_agent": fingerprint.get("user_agent"),
                 "language": fingerprint.get("language"),
                 "timezone": fingerprint.get("timezone"),
@@ -1011,6 +1383,227 @@ async def reset_identity(
             "cleared_streak": streak,
         },
     )
+
+
+@router.post(
+    "/{identity_id}/rotation",
+    summary="Choose what rotation uses an identity for",
+    openapi_extra={I18N_KEY: "identities_rotation"},
+)
+async def set_rotation(
+    request: Request,
+    body: RotationRequest,
+    identity_id: uuid.UUID = Path(description="The identity to act on."),
+    principal: Principal = Depends(manage_pool),
+) -> Any:
+    """Keep an identity out of rotation, wholly or for all but some endpoints.
+
+    An account somebody imported to read one thing with is put at risk by
+    every other request rotation hands it, and until this there was no way to
+    stop that: naming it with `identity=` served the one request, while the
+    scheduler went on spending it on everything else (#789). An empty list
+    keeps it for the requests that name it and nothing else; a list of
+    endpoints adds those back to rotation.
+
+    A request that names the identity is never refused by this. It is also
+    left out of the pool level, so the filler does not count an account it
+    may not spend as one it can. It does not travel with an export: it is a
+    decision about this pool, not part of the identity.
+
+    **Parameters**
+
+    - `endpoints` - null for every endpoint, the default; `[]` for none; or
+      names such as `douyin.author_posts`, which must belong to the identity's
+      own platform.
+
+    **Returns**
+
+    The identity's id and the endpoints rotation may now use it for.
+    """
+    session = request.state.db
+    identity = await session.get(Identity, identity_id)
+    if identity is None:
+        raise NotFound("no such identity")
+    if identity.state == IdentityState.RETIRED.value:
+        raise InvalidParam(
+            "a retired identity is in no rotation and cannot be put back in one",
+            details={"id": str(identity_id), "state": identity.state},
+        )
+
+    chosen: list[str] | None = None
+    if body.endpoints is not None:
+        from dtk.platforms.registry import get_adapter
+
+        known = set(get_adapter(identity.platform).endpoints)
+        unknown = sorted(set(body.endpoints) - known)
+        if unknown:
+            # Refused rather than stored: a typo here reads as "reserved for
+            # nothing", which keeps the account out of the very endpoint it
+            # was meant for and says nothing about why.
+            raise InvalidParam(
+                f"not {identity.platform} endpoints: {', '.join(unknown)}",
+                details={"unknown": unknown, "platform": identity.platform},
+            )
+        chosen = sorted(set(body.endpoints))
+
+    before = identity.rotation_endpoints
+    identity.rotation_endpoints = chosen
+    await audit(
+        request,
+        principal,
+        "identity.rotation_changed",
+        target_type="identity",
+        target_id=str(identity_id),
+        detail={"from": before, "to": chosen, "platform": identity.platform},
+    )
+    # One commit for the change and its audit row, so neither lands alone.
+    await session.commit()
+    log.info(
+        "identity.rotation_changed",
+        identity_id=str(identity_id),
+        endpoints=chosen,
+        restricted=chosen is not None,
+    )
+    return ok(request, {"id": str(identity_id), "rotation_endpoints": chosen})
+
+
+@router.patch(
+    "/{identity_id}",
+    summary="Change an identity's note",
+    openapi_extra={I18N_KEY: "identities_update"},
+)
+async def update_identity(
+    request: Request,
+    body: IdentityUpdate,
+    identity_id: uuid.UUID = Path(description="The identity to act on."),
+    principal: Principal = Depends(manage_pool),
+) -> Any:
+    """Write the note an operator keeps with an identity, or clear it.
+
+    Three imported logins were three UUIDs, and the only way to know which
+    account was which was to remember the order they went in. The note is the
+    operator's - the account a login signs in as, where its cookie came from -
+    and nothing in the request path reads it.
+
+    A retired identity keeps its note and may still have it changed: retired
+    rows stay for their statistics, and "which account was this" is exactly the
+    question somebody asks of one afterwards.
+
+    **Parameters**
+
+    - `note` - one line, at most 200 characters once trimmed; null or blank
+      clears it.
+
+    **Returns**
+
+    The identity as the list shows it.
+    """
+    session = request.state.db
+    identity = await session.get(Identity, identity_id)
+    if identity is None:
+        raise NotFound("no such identity", details={"identity_id": str(identity_id)})
+    before = identity.note
+    identity.note = body.note
+    if before != body.note:
+        await audit(
+            request,
+            principal,
+            "identity.note_changed",
+            target_type="identity",
+            target_id=str(identity_id),
+            # Whether, not what: a note is free text, and somebody writes the
+            # phone number a login belongs to into it. The audit trail is read
+            # more widely than the pool is managed.
+            detail={
+                "platform": identity.platform,
+                "had_note": before is not None,
+                "has_note": body.note is not None,
+            },
+        )
+    await session.commit()
+    return ok(request, _row(identity))
+
+
+@router.get(
+    "/coverage",
+    summary="Which identities rotation sends to each endpoint",
+    openapi_extra={I18N_KEY: "identities_coverage"},
+)
+async def rotation_coverage(request: Request, principal: Principal = Depends(read_admin)) -> Any:
+    """Per platform and per endpoint, how many identities rotation may send.
+
+    The pool page counted identities, and the scheduler hands them out per
+    endpoint: an identity limited to `douyin.author_posts` is in the pool and
+    absent from every other endpoint, a reserved one is in the pool and absent
+    from all of them, and a login is what decides whether an endpoint that needs
+    one can be served at all. None of that was visible without reading each
+    identity's rotation one at a time.
+
+    Counted the way the scheduler counts: an identity serves an endpoint when it
+    has no rotation list or its list names the endpoint - and is a login, where
+    the endpoint needs one from its first page - and it is `ready` when it is
+    active or degraded. A request that names an identity with `identity=` is
+    never limited by any of this.
+
+    **Returns**
+
+    One entry per platform: `guests_first`, the platform's
+    `pool.<platform>.guests_first`; `reserved`, how many of its identities serve
+    only the requests that name them; and one entry per endpoint it serves,
+    with the capability table's fields (`login`, `paging_login`,
+    `session_bound`) and `ready`, `signed_in` (of those ready, how many are
+    logins), `cooling` (resting, back in rotation when they recover) and
+    `dedicated` (ready ones limited to a list that names this endpoint).
+    """
+    from dtk.api.routes.capabilities import capability_table
+
+    config = request.app.state.config
+    serving = _SERVING_STATES
+    rows = (
+        await request.state.db.execute(
+            select(
+                Identity.platform,
+                Identity.state,
+                Identity.authenticated,
+                Identity.rotation_endpoints,
+            ).where(Identity.state.in_((*serving, IdentityState.COOLING.value)))
+        )
+    ).all()
+    table = capability_table()
+    platforms: list[dict[str, Any]] = []
+    for platform in Platform:
+        mine = [row for row in rows if row.platform == platform.value]
+        endpoints: list[dict[str, Any]] = []
+        for entry in table.get(platform.value, []):
+            name = entry["endpoint"]
+            logins_only = _logins_only(name)
+            rotating = [
+                row
+                for row in mine
+                if (row.rotation_endpoints is None or name in row.rotation_endpoints)
+                and (row.authenticated or not logins_only)
+            ]
+            ready = [row for row in rotating if row.state in serving]
+            endpoints.append(
+                {
+                    **entry,
+                    "ready": len(ready),
+                    "signed_in": sum(1 for row in ready if row.authenticated),
+                    "cooling": sum(
+                        1 for row in rotating if row.state == IdentityState.COOLING.value
+                    ),
+                    "dedicated": sum(1 for row in ready if row.rotation_endpoints is not None),
+                }
+            )
+        platforms.append(
+            {
+                "platform": platform.value,
+                "guests_first": bool(config.get(f"pool.{platform.value}.guests_first")),
+                "reserved": sum(1 for row in mine if row.rotation_endpoints == []),
+                "endpoints": endpoints,
+            }
+        )
+    return ok(request, {"platforms": platforms})
 
 
 @router.delete(

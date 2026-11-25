@@ -27,6 +27,7 @@ doing it here would put platform knowledge into ``api/``, which doc 01 forbids.
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from enum import StrEnum
 from typing import Any, Final
@@ -38,10 +39,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from dtk.api import envelope
 from dtk.api.deps import Principal
 from dtk.api.routes.support import language, ok, request_id
-from dtk.core.errors import ErrorCode, Internal, QueueFull, TaskNotFound
+from dtk.core.errors import ErrorCode, Internal, TaskNotFound
 from dtk.core.logging import get_logger
 from dtk.core.redis import get_redis
-from dtk.core.types import Platform, RejectReason, Scope, TaskState, UserRole
+from dtk.core.types import PLATFORM_READ_SCOPES, Platform, Scope, TaskState, UserRole
 from dtk.services import cache, tasks
 
 # The worker package's declared surface, not its internals: this route and
@@ -79,6 +80,24 @@ class Operation(StrEnum):
     MIX_POSTS = "mix_posts"
     AUTHOR_FOLLOWERS = "author_followers"
     AUTHOR_FOLLOWING = "author_following"
+    CONTENT_PARTS = "content_parts"
+    POPULAR = "popular"
+    POPULAR_WEEKLY = "popular_weekly"
+    POPULAR_PRECIOUS = "popular_precious"
+    RANKING = "ranking"
+    RELATED_POSTS = "related_posts"
+    MUSIC_DETAIL = "music_detail"
+    MUSIC_POSTS = "music_posts"
+    HASHTAG_DETAIL = "hashtag_detail"
+    HASHTAG_POSTS = "hashtag_posts"
+    SEARCH_POSTS = "search_posts"
+    SEARCH_AUTHORS = "search_authors"
+    AUTHOR_MIXES = "author_mixes"
+    LIVE_ROOM = "live_room"
+    LIVE_ROOM_BY_ID = "live_room_by_id"
+    LIVE_STATUS = "live_status"
+    LIVE_RANKING = "live_ranking"
+    TRENDING = "trending"
 
 
 class Maintenance(StrEnum):
@@ -99,6 +118,7 @@ class Maintenance(StrEnum):
     #: because it is dispatched by the same runner, but deliberately NOT exempt
     #: from the queue ceiling below.
     MEDIA_DOWNLOAD = "media.download"
+    MEDIA_TRANSCRIBE = "media.transcribe"
     #: Re-check whether archived posts still exist. Raised by the maintenance
     #: sweep on a timer, and by hand from the Library page.
     ARCHIVE_AVAILABILITY = "archive.availability"
@@ -173,10 +193,14 @@ async def _attach(session: AsyncSession, digest: str) -> tuple[uuid.UUID, TaskSt
 #: payload back out of any task id it was given.
 #:
 #: Ownership is deliberately NOT checked: a console session and the key that
-#: submitted a job are routinely different credentials for the same operator,
-#: and task ids are random UUIDv4 with no enumeration path.
+#: submitted a job are routinely different credentials for the same operator.
+#: Task ids are random UUIDv4, but they are not secret - the request log shows
+#: one on every row to anyone who may read the log, viewers included. So a task
+#: id is not a capability, and what reading costs has to be stated in full:
+#: these scopes for a key, and :func:`role_for_task` for a session, which
+#: passes every scope check.
 _MAINTENANCE_SCOPES: Final[tuple[Scope, ...]] = (Scope.ADMIN, Scope.IDENTITY_MANAGE)
-_READ_ANY_PLATFORM: Final[tuple[Scope, ...]] = (Scope.DOUYIN_READ, Scope.TIKTOK_READ)
+_READ_ANY_PLATFORM: Final[tuple[Scope, ...]] = PLATFORM_READ_SCOPES
 
 
 def scopes_for_task(endpoint: str) -> tuple[Scope, ...]:
@@ -191,6 +215,8 @@ def scopes_for_task(endpoint: str) -> tuple[Scope, ...]:
         return _READ_ANY_PLATFORM
     if endpoint in (Maintenance.MEDIA_DOWNLOAD.value,):
         return (Scope.MEDIA_READ, Scope.MEDIA_WRITE, *_MAINTENANCE_SCOPES)
+    if endpoint == Maintenance.MEDIA_TRANSCRIBE.value:
+        return (Scope.TRANSCRIPTION_READ, Scope.TRANSCRIPTION_WRITE)
     if endpoint in (
         Maintenance.ARCHIVE_AVAILABILITY.value,
         Maintenance.ARCHIVE_BACKFILL.value,
@@ -204,6 +230,50 @@ def scopes_for_task(endpoint: str) -> tuple[Scope, ...]:
         return (registry.definition_for(endpoint).scope,)
     except Exception:
         return (Scope.ADMIN,)
+
+
+#: Maintenance whose results only the roles that may start it should read: a
+#: proxy probe's exit address, a logged-in identity's account id, the self
+#: check. Gated by scope alone, a viewer's session read them, and could cancel
+#: a queued restore through the same check.
+_OPERATOR_TASKS: Final[frozenset[str]] = frozenset(
+    {
+        Maintenance.IDENTITY_MINT.value,
+        Maintenance.IDENTITY_TEST.value,
+        Maintenance.IDENTITY_SESSION.value,
+        Maintenance.PROXY_TEST.value,
+        Maintenance.DIAGNOSE.value,
+        Maintenance.NOTIFY_TEST.value,
+    }
+)
+_ADMIN_TASKS: Final[frozenset[str]] = frozenset(
+    {Maintenance.BACKUP.value, Maintenance.BACKUP_RESTORE.value}
+)
+
+
+def role_for_task(endpoint: str) -> UserRole:
+    """The lowest role that may read, or cancel, a task on ``endpoint``.
+
+    The other half of :func:`scopes_for_task`. Those scopes bound a key; a
+    console session passes all of them, so for a session this is the check.
+    Each answer is the floor of the route that starts such a task, and an
+    endpoint this build does not recognise needs an admin, as its scope does.
+    The demo role is held to its own tasks elsewhere, so DEMO here means no
+    floor beyond the route's.
+    """
+    if endpoint in _ADMIN_TASKS:
+        return UserRole.ADMIN
+    if endpoint in _OPERATOR_TASKS:
+        return UserRole.OPERATOR
+    if endpoint == Operation.PARSE.value or endpoint in {member.value for member in Maintenance}:
+        return UserRole.DEMO
+    try:
+        from dtk.worker import registry
+
+        registry.definition_for(endpoint)
+    except Exception:
+        return UserRole.ADMIN
+    return UserRole.DEMO
 
 
 async def submit(
@@ -270,6 +340,10 @@ async def submit(
             error=serialize_error(Internal("the task could not be queued for a worker")),
         )
         await session.commit()
+        # Redis is the thing that just failed, so this probably will too; the
+        # caller is told by the exception below either way.
+        with contextlib.suppress(Exception):
+            await tasks.wake_waiters(task_id)
         raise
     return task_id, TaskState.QUEUED
 
@@ -279,40 +353,34 @@ async def submit(
 #: self check because the queue is deep would withhold the tool at the moment it
 #: is wanted.
 #:
-#: Media downloads are the exception, and the exception is the point of the
+#: Media downloads and transcriptions are the exceptions, and the exception is the point of the
 #: rule: they are dispatched by the same runner but they are not rare, a caller
 #: can start as many as they have archived posts, and each one holds a worker
 #: slot for as long as a video takes. Exempting them would let one operator's
 #: bulk download starve every read on the instance.
+#:
+#: The archive recheck and backfill are out for a second reason: they were in
+#: this set while their routes ask for a platform read scope only, so any read
+#: key or viewer could queue them past the ceiling - each a run of real
+#: requests, up to 200 posts or 20 pages. Rare by intent is not rare by gate.
+_QUEUED_LIKE_READS: Final[frozenset[Maintenance]] = frozenset(
+    {
+        Maintenance.MEDIA_DOWNLOAD,
+        Maintenance.MEDIA_TRANSCRIBE,
+        Maintenance.ARCHIVE_AVAILABILITY,
+        Maintenance.ARCHIVE_BACKFILL,
+    }
+)
 _OPERATOR_TRIGGERED: Final[frozenset[str]] = frozenset(
-    member.value for member in Maintenance if member is not Maintenance.MEDIA_DOWNLOAD
+    member.value for member in Maintenance if member not in _QUEUED_LIKE_READS
 )
 
 
 async def _refuse_when_the_queue_is_full(request: Request, endpoint: str) -> None:
-    """Shed load rather than accept work nobody will get to.
-
-    ``sched.queue_max`` was a setting the console exposed and nothing read, and
-    RejectReason.QUEUE_FULL was defined and never raised - so the queue grew
-    without bound and every caller waited instead of being told to come back.
-    Doc 03 is explicit that rejecting early beats queueing: a caller left
-    hanging is worse off than one that gets a Retry-After immediately.
-    """
+    """Apply the queue ceiling to everything but the operator-triggered jobs."""
     if endpoint in _OPERATOR_TRIGGERED:
         return
-    ceiling = int(request.app.state.config.get("sched.queue_max"))
-    if ceiling <= 0:
-        return
-    depth = int(await get_redis().llen(tasks.QUEUE_KEY))
-    if depth < ceiling:
-        return
-    retry_after = max(1, int(request.app.state.config.get("sched.max_wait_seconds")))
-    log.warning("task.queue_full", endpoint=endpoint, depth=depth, ceiling=ceiling)
-    raise QueueFull(
-        f"{depth} tasks are already queued, at the configured ceiling of {ceiling}",
-        retry_after=retry_after,
-        details={"reject_reason": RejectReason.QUEUE_FULL.value, "queued": depth},
-    )
+    await tasks.refuse_when_queue_full(request.app.state.config, endpoint=endpoint)
 
 
 def accepted(request: Request, task_id: uuid.UUID, state: TaskState) -> JSONResponse:
@@ -441,6 +509,8 @@ __all__ = [
     "accepted",
     "endpoint_name",
     "finished",
+    "role_for_task",
+    "scopes_for_task",
     "submit",
     "submit_and_wait",
     "unwrap",

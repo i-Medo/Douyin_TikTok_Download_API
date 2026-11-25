@@ -17,7 +17,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, Path, Query, Request
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from dtk.api.deps import Principal
 from dtk.api.routes import operations
@@ -70,6 +70,8 @@ def _row(request: Request, proxy: Proxy, *, identity_count: int | None = None) -
         "timezone": proxy.timezone,
         "healthy": proxy.healthy,
         "last_check_at": iso(proxy.last_check_at),
+        # Scrubbed of credentials before it was stored; None after a pass.
+        "last_error": proxy.last_error,
         "created_at": iso(proxy.created_at),
     }
     if identity_count is not None:
@@ -102,7 +104,80 @@ async def list_proxies(
     if healthy_only:
         stmt = stmt.where(Proxy.healthy.is_(True))
     rows = (await request.state.db.scalars(stmt)).all()
-    return ok(request, [_row(request, row) for row in rows])
+    # The docstring always promised this and the route never counted it, so the
+    # console's Identities column read "-" on every row - including on a proxy
+    # nothing was bound to, which is the first thing to check when an identity
+    # turns out to be going direct (#781). One grouped query, not one per row.
+    bound = await request.state.db.execute(
+        select(Identity.proxy_id, func.count())
+        .where(
+            Identity.proxy_id.is_not(None),
+            Identity.state != IdentityState.RETIRED.value,
+        )
+        .group_by(Identity.proxy_id)
+    )
+    counts = {proxy_id: int(count) for proxy_id, count in bound.tuples().all()}
+    return ok(
+        request,
+        [_row(request, row, identity_count=counts.get(row.id, 0)) for row in rows],
+    )
+
+
+@router.get(
+    "/{proxy_id}", summary="One proxy and what uses it", openapi_extra={I18N_KEY: "proxies_get"}
+)
+async def get_proxy(
+    request: Request,
+    proxy_id: uuid.UUID = Path(description="The proxy to read."),
+    principal: Principal = Depends(read_admin),
+) -> Any:
+    """One egress, with the identities bound to it.
+
+    The list says how many identities each proxy carries; this says which. It
+    is what an operator needs before deleting one - every identity listed here
+    is retired with it - and when one egress starts drawing risk control, since
+    every identity behind it shares its address.
+
+    **Parameters**
+
+    - `proxy_id` - the proxy to read.
+
+    **Returns**
+
+    The proxy as the list shows it, plus `identities`: each bound identity's
+    id, platform, state and when it was last used. Never a cookie.
+    """
+    session = request.state.db
+    proxy = await session.get(Proxy, proxy_id)
+    if proxy is None:
+        raise NotFound("no such proxy")
+    # Retired ones are left out, as they are from the count: retirement wipes
+    # the jar, so they are history rather than something this proxy carries.
+    bound = (
+        await session.scalars(
+            select(Identity)
+            .where(
+                Identity.proxy_id == proxy_id,
+                Identity.state != IdentityState.RETIRED.value,
+            )
+            .order_by(Identity.platform, Identity.minted_at.desc())
+        )
+    ).all()
+    payload = _row(request, proxy, identity_count=len(bound))
+    payload["identities"] = [
+        {
+            "id": str(identity.id),
+            "platform": identity.platform,
+            "state": identity.state,
+            "authenticated": identity.authenticated,
+            "consecutive_fails": identity.consecutive_fails,
+            "last_used_at": iso(identity.last_used_at),
+            # None in ordinary rotation; see Identity.rotation_endpoints.
+            "rotation_endpoints": identity.rotation_endpoints,
+        }
+        for identity in bound
+    ]
+    return ok(request, payload)
 
 
 @router.post(

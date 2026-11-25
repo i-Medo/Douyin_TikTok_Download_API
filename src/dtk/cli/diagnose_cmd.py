@@ -17,6 +17,7 @@ from typing import Annotated, Any
 import typer
 
 from dtk.cli import output, runtime
+from dtk.core.db import connection_budget
 from dtk.core.types import Platform
 from dtk.identity import BrowserRpcClient
 from dtk.identity.marks import strictest_min_size
@@ -26,6 +27,7 @@ from dtk.ops.diagnose import (
     DiagnosticReport,
     SmokeRunner,
     StepStatus,
+    choose_smoke_platform,
     run_diagnostics,
 )
 
@@ -48,8 +50,12 @@ def diagnose(
         bool, typer.Option("--skip-smoke", help="Do not make the end-to-end request")
     ] = False,
     platform: Annotated[
-        Platform, typer.Option("--platform", help="Platform for the smoke test")
-    ] = Platform.DOUYIN,
+        Platform | None,
+        typer.Option(
+            "--platform",
+            help="Platform for the smoke test. Default: the one this instance serves most",
+        ),
+    ] = None,
     smoke_url: Annotated[
         str | None, typer.Option("--smoke-url", help="Link to use for the smoke test")
     ] = None,
@@ -64,8 +70,25 @@ def diagnose(
 
         from dtk.core.db import get_engine
         from dtk.core.redis import get_redis
+        from dtk.media.client import DownloaderClient
+        from dtk.transcriber import TranscriberClient
 
         rpc = BrowserRpcClient(ctx.settings.browser_rpc_url)
+        # Built from the same settings the api and the worker read, so the
+        # components step reports the sidecars this deployment configured
+        # rather than calling every one of them "not configured".
+        downloader = DownloaderClient(
+            ctx.settings.downloader_url, token=ctx.settings.downloader_token
+        )
+        transcriber = TranscriberClient(
+            ctx.settings.transcriber_url, token=ctx.settings.transcriber_token
+        )
+        # Chosen as the console chooses it. Always Douyin, an instance that only
+        # keeps Bilibili identities - any instance without the browser - failed
+        # the smoke step about a platform it was never meant to serve.
+        smoke_platform = platform or await choose_smoke_platform(
+            ctx.session, browser=rpc.configured
+        )
         async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as http:
             diagnose_ctx = DiagnoseContext(
                 session=ctx.session,
@@ -76,8 +99,15 @@ def diagnose(
                 cipher=ctx.cipher,
                 http=http,
                 smoke=None if skip_smoke else _smoke_runner(ctx),
-                smoke_url=None if skip_smoke else (smoke_url or probes.SMOKE_URLS[platform]),
+                smoke_url=None if skip_smoke else (smoke_url or probes.SMOKE_URLS[smoke_platform]),
                 min_active=strictest_min_size(ctx.config),
+                downloader=downloader,
+                transcriber=transcriber,
+                # This command's own engine is a small one; the budget is what
+                # the api and the worker open, from the settings they share.
+                connection_budget=connection_budget(
+                    ctx.settings.db_pool_size, ctx.settings.db_max_overflow
+                ),
             )
             if proxy_probe_url:
                 diagnose_ctx.proxy_probe_url = proxy_probe_url
@@ -85,6 +115,8 @@ def diagnose(
                 return await run_diagnostics(diagnose_ctx)
             finally:
                 await rpc.aclose()
+                await downloader.aclose()
+                await transcriber.aclose()
 
     report = runtime.with_context(operation, redis=True, config=True)
 

@@ -60,7 +60,7 @@ log = get_logger(__name__)
 #: asynchronous, `?wait=` is how to make one synchronous, and neither fact was
 #: written down anywhere a caller reads - so a 202 after a wait looked like a
 #: failure and the parameter's one-line summary did not say otherwise.
-DESCRIPTION = """Self-hosted data API for Douyin and TikTok. Submit a link, get normalized content back.
+DESCRIPTION = """Self-hosted data API for Douyin, TikTok and Bilibili. Submit a link, get normalized content back.
 
 Every response has the same envelope, errors included: `success`, `data`, `error`, `meta`. Error codes are stable and never translated; the message beside them is rendered in the language you asked for. Append `?lang=zh` to any endpoint, including this document, for Chinese.
 
@@ -98,7 +98,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: BootstrapSettings = app.state.settings
     configure(level=settings.log_level, json_output=settings.log_json)
 
-    init_engine(settings.database_url)
+    init_engine(
+        settings.database_url,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+    )
     init_redis(settings.redis_url)
     app.state.cipher = Cipher(settings.secret_key)
 
