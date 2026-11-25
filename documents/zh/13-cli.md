@@ -1,7 +1,7 @@
 # 命令行参考
 
 > **[Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)** ——
-> 自部署的抖音 / TikTok 数据接口服务：REST、MCP 和 Web 控制台，身份池自维护。
+> 自部署的抖音 / TikTok / B 站数据接口服务：REST、MCP 和 Web 控制台，身份池自维护。
 > [文档首页](../README.zh-CN.md) · [English](../en/13-cli.md)
 
 `dtk` 是随应用镜像一起发布的运维与救援命令行工具。读完本文你会知道如何在运行中的部署里调用它、每条命令和每个选项的作用，以及哪些命令可以随手对线上实例执行、哪些只有在出事时才该动。
@@ -105,7 +105,9 @@ hint: export DTK_SECRET_KEY, or run the CLI inside the container that has it
 | `DTK_SECRET_KEY` | 无，必填，至少 32 个字符 | 除 `dtk --version`、`dtk migrate --show`、`dtk backup list` 之外的全部命令 |
 | `DTK_DATABASE_URL` | `postgresql+asyncpg://dtk:dtk@postgres:5432/dtk` | 所有访问状态的命令 |
 | `DTK_REDIS_URL` | `redis://redis:6379/0` | `dtk config set`、`dtk identity retire`、`dtk diagnose`、`dtk worker` |
-| `DTK_BROWSER_RPC_URL` | 空（禁用） | `dtk identity mint` 必需；设置后，`dtk fetch`、`dtk identity test` 以及 `dtk diagnose` 的第 5 步会把它当作签名兜底 |
+| `DTK_BROWSER_RPC_URL` | 空（禁用） | `dtk identity mint` 铸造抖音和 TikTok 时必需；设置后，`dtk fetch`、`dtk identity test` 以及 `dtk diagnose` 的第 5 步会把它当作签名兜底 |
+| `DTK_DOWNLOADER_URL`、`DTK_DOWNLOADER_TOKEN` | 空（不下载媒体） | `dtk worker`，它通过这个 sidecar 存媒体；`dtk serve` 启动的应用，下载相关的路由要用；`dtk diagnose` 的第 1 步，只有设置了它才会检查下载器。令牌是和 sidecar 共享的密钥，两边必须一致 |
+| `DTK_TRANSCRIBER_URL`、`DTK_TRANSCRIBER_TOKEN` | 空（不转写） | 同样这三处，用于转写 sidecar |
 | `DTK_BIND_HOST` | `127.0.0.1` | `dtk serve` 未指定 `--host` 时 |
 | `DTK_BIND_PORT` | `8000` | `dtk serve` 未指定 `--port` 时 |
 | `DTK_LOG_LEVEL` | `info` | `dtk serve`（传给 uvicorn，它启动的 API 应用也会再读一次）和 `dtk worker`——worker 会用它配置日志栈。它**不会**改变其他命令的日志输出——`fetch`、`diagnose`、`config`、`identity`、`proxy`、`user`、`backup`、`migrate` |
@@ -155,7 +157,7 @@ docker compose -p dtk -f docker/compose.yml exec -T -e COLUMNS=10000 api \
 | 命令 | 作用 | 涉及 |
 |---|---|---|
 | `dtk fetch` | 解析一个链接并打印归一化后的结果 | 数据库、平台 |
-| `dtk diagnose` | 六步自检，输出一份报告 | 数据库、Redis、代理、browser-rpc、平台 |
+| `dtk diagnose` | 六步自检，输出一份报告 | 数据库、Redis、代理、browser-rpc、下载器、转写服务、平台 |
 | `dtk worker` | 前台运行任务 worker | 数据库、Redis |
 | `dtk migrate` | 执行数据库迁移 | 数据库 |
 | `dtk serve` | 运行 API 服务 | — |
@@ -177,7 +179,7 @@ dtk fetch [OPTIONS] {url}
 
 | 参数 / 选项 | 类型 | 默认值 | 含义 |
 |---|---|---|---|
-| `url` | 字符串，必填 | — | 抖音或 TikTok 链接，或者粘贴过来的分享文案 |
+| `url` | 字符串，必填 | — | 抖音、TikTok 或 B 站链接，或者粘贴过来的分享文案 |
 | `--raw` | 开关 | 关 | 输出中一并带上平台自己的原始 payload |
 | `--json` | 开关 | 关 | 只打印 JSON 结果，便于管道处理 |
 | `--identity` | 字符串 | 下一个身份 | 指定使用某个身份。**必须是完整 UUID**，不能用表格里那 8 位前缀 |
@@ -238,7 +240,7 @@ dtk diagnose [OPTIONS]
 | `--json` | 开关 | 关 | 以 JSON 而非表格输出报告 |
 | `--output`、`-o` | 路径 | 无 | 同时把文本报告写入文件 |
 | `--skip-smoke` | 开关 | 关 | 不做端到端请求 |
-| `--platform` | `douyin` \| `tiktok` | `douyin` | 冒烟测试用哪个平台 |
+| `--platform` | `douyin` \| `tiktok` \| `bilibili` | 自动 | 冒烟测试用哪个平台。自动时选轮换中身份最多的平台；一个身份都没有时，配置了浏览器选抖音，否则选 B 站 |
 | `--smoke-url` | 字符串 | 该平台内置链接 | 冒烟测试使用的链接 |
 | `--probe-url` | 字符串 | `https://api.ipify.org?format=json` | 报告代理出口地址的服务。注意这**不是** `dtk proxy test` 用的默认值，后者是 `https://ipinfo.io/json` |
 
@@ -246,11 +248,11 @@ dtk diagnose [OPTIONS]
 
 | # | 步骤 | 检查什么 |
 |---|---|---|
-| 1 | `components` | Postgres、Redis、browser-rpc 是否可达 |
-| 2 | `egress` | 本机能否直连平台域名 |
+| 1 | `components` | Postgres、Redis、browser-rpc 是否可达；本部署配置了下载器和转写服务的话，它们也要可达 |
+| 2 | `egress` | 本机能否直连抖音、TikTok 和 B 站的域名 |
 | 3 | `proxies` | 逐个代理：连通性和出口 IP。它显示的国家是代理行上已经存好的那个，不是新做一次 GeoIP 查询 |
 | 4 | `pool` | 有多少可用身份，最老的一个有多陈旧 |
-| 5 | `signing` | 纯 Python 签名与 browser-rpc 的签名逐平台比对——就是生产环境里 registry 跑的那套影子对比 |
+| 5 | `signing` | 纯 Python 签名与 browser-rpc 的签名比对，抖音和 TikTok 各一次——就是生产环境里 registry 跑的那套影子对比。B 站不参与比对，因为 browser-rpc 从不为它签名 |
 | 6 | `smoke` | 一条固定的公开链接走完整条流水线 |
 
 ```bash
@@ -573,7 +575,7 @@ hint: restore with the original key; without it the cookies and proxy URLs in th
 
 存在数据库里的运行时配置。
 
-实例初始化之后，`settings` 表就是权威来源，所以一个配错的值**不能**靠改 `.env` 加重启来修——这一点每个人都会被坑一次。这组命令就是在没有控制台的情况下修它的办法。运行时配置共有 54 项，完整目录及其含义和默认值在[配置参考](./03-configuration.md)。
+实例初始化之后，`settings` 表就是权威来源，所以一个配错的值**不能**靠改 `.env` 加重启来修——这一点每个人都会被坑一次。这组命令就是在没有控制台的情况下修它的办法。配置表共有 65 项，完整目录及其含义和默认值在[配置参考](./03-configuration.md)。
 
 ### `dtk config list`
 
@@ -597,7 +599,7 @@ no settings match that filter
 settings version 112
 ```
 
-关于作用域有两点。54 项配置里有 47 项是 `runtime`、7 项是 `sensitive`；`--scope bootstrap` 和 `--scope env_only` 能传，但永远匹配不到任何东西，因为那些配置只存在于环境变量里，从不进这张表。
+关于作用域有两点。65 项配置里有 57 项是 `runtime`、8 项是 `sensitive`；`--scope bootstrap` 和 `--scope env_only` 能传，但永远匹配不到任何东西，因为那些配置只存在于环境变量里，从不进这张表。
 
 另外，**取值是普通字符串的 `sensitive` 配置会被掩码。** 这是按声明而不是按形状决定的：注册表说了哪些配置敏感，然后每个展示面——这张表、admin API、写操作留下的审计记录——都用同一套规则掩码。掩码会保留前四个字符、其余替换成 `***`；长度不超过四个字符的值则整体变成 `***`，因为四个字符里露出三个算不上掩码。所以 `security.webhook_secret` 设成 `s3cr3t-value-abcdef` 时显示为 `s3cr***`，而 `security.request_proxy` 在默认值 `deny` 下显示为 `***`、改成其他可选值后则显示为 `allo***` 或 `publ***`。它既适用于真正的机密，也适用于 `security.request_proxy` 这种本身并不是机密的敏感配置。列表、布尔值和数字照原样显示，空字符串也照原样显示为空，因为“没设置”这件事值得看得见。
 
@@ -623,13 +625,14 @@ docker compose -p dtk -f docker/compose.yml exec api dtk config get cache.conten
 ### `dtk config set`
 
 ```text
-dtk config set [OPTIONS] {key} {value}
+dtk config set [OPTIONS] {key} [value]
 ```
 
 | 参数 / 选项 | 类型 | 默认值 | 含义 |
 |---|---|---|---|
 | `key` | 字符串，必填 | — | 配置键 |
-| `value` | 字符串，必填 | — | 新值；列表用逗号分隔 |
+| `value` | 字符串 | — | 新值；列表用逗号分隔。没给 `--stdin` 时必填 |
+| `--stdin` | 开关 | 关 | 改从 stdin 读一行作为新值 |
 | `--yes`、`-y` | 开关 | 关 | 修改敏感配置时不询问 |
 
 值会先按声明的类型转换并校验，**然后**才写入；类型不匹配属于调用错误，退出码 2。写入之后会递增 settings 版本号，并在 API 与 worker 都在监听的 Redis 频道上广播，于是运行中的部署无需重启就能生效。这是 `config` 组里唯一需要 Redis 的子命令。
@@ -643,11 +646,18 @@ docker compose -p dtk -f docker/compose.yml exec api \
 ok  cache.content_ttl = 900
 ```
 
-敏感配置会扩大攻击面——URL 白名单、CORS 来源、调用方自带的请求代理——所以修改前会先询问确认。脚本里可以用 `-y` 跳过；不要养成顺手加的习惯。
+敏感配置会扩大攻击面——URL 白名单、CORS 来源、调用方自带的请求代理——所以修改前会先询问确认。问题里显示的新值，和 `dtk config list` 一样是掩码过的。脚本里可以用 `-y` 跳过；不要养成顺手加的习惯。
 
 ```bash
 docker compose -p dtk -f docker/compose.yml exec api \
   dtk config set security.url_allowlist "example.com,cdn.example.com" -y
+```
+
+凭据类的值——`security.webhook_secret`、`notify.channels` 里的 token——用 `--stdin` 从管道喂进去。命令行参数在命令运行期间对这台机器上的每个进程都可见：在 `ps` 里，经由 `docker exec` 还会出现在宿主机的进程列表里。它只读一行，并且和 `dtk user passwd --stdin` 一样，同时去掉结尾的 `CR` 和 `LF`。值要么作为参数给，要么从 stdin 给：两样都给或者都没给，都是调用错误，退出码 2；stdin 上是空行也会被拒绝。敏感配置的确认会去读同一个 stdin 的下一行，所以管道里要加 `-y`：
+
+```bash
+printf '%s\n' "$WEBHOOK_SECRET" | docker compose -p dtk -f docker/compose.yml \
+  exec -T api dtk config set security.webhook_secret --stdin -y
 ```
 
 没有 `dtk config reset`。要把某项配置恢复默认，就把 `dtk config list` 显示的默认值显式设回去，或者在控制台里清掉这条覆盖。
@@ -668,7 +678,7 @@ dtk identity list [OPTIONS]
 
 | 选项 | 类型 | 默认值 | 含义 |
 |---|---|---|---|
-| `--platform` | `douyin` \| `tiktok` | 全部 | 只看这个平台 |
+| `--platform` | `douyin` \| `tiktok` \| `bilibili` | 全部 | 只看这个平台 |
 | `--state` | `minting` \| `active` \| `cooling` \| `degraded` \| `retired` | 全部 | 只看处于该状态的身份 |
 | `--limit` | 整数，1–500 | `50` | 显示行数 |
 
@@ -693,11 +703,13 @@ dtk identity mint [OPTIONS]
 
 | 选项 | 类型 | 默认值 | 含义 |
 |---|---|---|---|
-| `--platform` | `douyin` \| `tiktok`，**必填** | — | 为哪个平台铸造 |
+| `--platform` | `douyin` \| `tiktok` \| `bilibili`，**必填** | — | 为哪个平台铸造 |
 | `--count` | 整数，1–20 | `1` | 铸造几个 |
 | `--proxy` | 字符串（完整 UUID） | 一个空闲代理 | 指定代理，而不是自动挑一个空闲的 |
 
-需要 `DTK_BROWSER_RPC_URL`。没有它时命令以退出码 1 失败，并告诉你去设置它或者改为导入 Cookie：
+抖音和 TikTok 通过 browser-rpc 铸造。B 站的铸造方式和身份池填充器一样：经所选代理向 B 站发一次普通 HTTP 请求，不涉及浏览器；见[身份与代理](./06-identities-and-proxies.md#b-站身份)。5.1.6 之前这条命令只认 browser-rpc，会拒绝 B 站。
+
+铸造抖音和 TikTok 需要 `DTK_BROWSER_RPC_URL`。没有它时命令以退出码 1 失败，并告诉你去设置它或者改为导入 Cookie：
 
 ```text
 error browser-rpc is not configured
@@ -713,7 +725,7 @@ docker compose -p dtk -f docker/compose.yml exec api \
 
 每个身份终身绑定一个代理。不指定 `--proxy` 时，会挑一个在该平台上还没有身份的代理——两个身份在同一平台共用一个出口地址，正是身份池要避免的那种关联。如果一个代理都没有，身份会以 `direct` 铸造出来——能用，但等池子忙起来就是关联风险。
 
-代价：铸造要驱动一个真实的无头浏览器。`browser-rpc` 容器是整个栈里最重的东西（实测预热状态下常驻 2.57 GiB、CPU 占用相当于六个核），`--count 20` 就是二十次页面加载。这不是能放进循环里跑的命令。
+代价（抖音和 TikTok）：铸造要驱动一个真实的无头浏览器。`browser-rpc` 容器是整个栈里最重的东西（实测预热状态下常驻 2.57 GiB、CPU 占用相当于六个核），`--count 20` 就是二十次页面加载。这不是能放进循环里跑的命令。B 站的铸造只是一次小请求，但它仍然是从那个代理的地址发往 B 站的一次请求。
 
 ### `dtk identity retire`
 
@@ -896,7 +908,7 @@ docker compose -p dtk -f docker/compose.yml exec api dtk proxy test b1f0
 
 | 命令 | 代价 |
 |---|---|
-| `dtk diagnose` | 真实出站请求：最多探测最早创建的 20 个代理（`MAX_PROXIES_PROBED`，所以更大的代理池只被覆盖了一部分），browser-rpc 为影子比对每个平台签一次名，冒烟步骤会花掉一个身份的一次请求。不写任何东西。`--skip-smoke` 可以去掉平台请求 |
+| `dtk diagnose` | 真实出站请求：最多探测最早创建的 20 个代理（`MAX_PROXIES_PROBED`，所以更大的代理池只被覆盖了一部分），browser-rpc 为影子比对给抖音和 TikTok 各签一次名，冒烟步骤会花掉一个身份的一次请求。不写任何东西。`--skip-smoke` 可以去掉平台请求 |
 | `dtk identity test` | 一次调度器之外的真实平台请求。不记录任何东西 |
 | `dtk fetch` | 一次调度器之外的真实平台请求，外加 `archive.enabled` 打开时的一行归档 |
 | `dtk proxy test` | 一次出站请求；除非 `--no-write`，否则会写回健康状态和地理信息 |

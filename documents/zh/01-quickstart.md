@@ -1,7 +1,7 @@
 # 快速开始
 
 > **[Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)** ——
-> 自部署的抖音 / TikTok 数据接口服务：REST、MCP 和 Web 控制台，身份池自维护。
+> 自部署的抖音 / TikTok / B 站数据接口服务：REST、MCP 和 Web 控制台，身份池自维护。
 > [文档首页](../README.zh-CN.md) · [English](../en/01-quickstart.md)
 
 读完这一页，你会在一台主机上跑起整套服务、创建好管理员账号，并成功解析第一条链接——
@@ -116,40 +116,41 @@ EOF
 身份只有两个来源，其中一个属于可选的基础设施。
 
 **跑浏览器容器**（`--profile browser`，并把 `DTK_BROWSER_RPC_URL` 指向它）：
-无头浏览器会自动铸造访客身份。worker 每 60 秒检查一次每个平台，**每次只铸造一个
+无头浏览器会自动铸造抖音和 TikTok 的访客身份。worker 每 60 秒检查一次每个平台，**每次只铸造一个
 身份**，失败时指数退避，直到身份池从低水位 `pool.min_size`（默认 3）回到
 `pool.target_size`（默认 8）。因此补池要花上几分钟，这是有意为之：
 一秒之内从同一个部署里冒出五位“新访客”，本身就比这些身份之后的任何行为都更像异常。
 
-**不跑它**（默认状态，`DTK_BROWSER_RPC_URL` 为空）：补池任务被整个跳过，
-**身份池一开始就是空的，而且会一直空着**。具体表现为：
+B 站是这一整步的例外。它的访客身份铸造不需要浏览器——经实例自己的传输层和身份的代理
+发出一次普通 HTTP 请求即可——所以不管有没有浏览器容器，worker 都会照常把 B 站身份池补满。
 
-- 控制台「身份池」页面显示无法铸造，初始化向导的铸造步骤也会直接说明，
-  而不是报错。
+**不跑它**（默认状态，`DTK_BROWSER_RPC_URL` 为空）：没有任何东西会铸造抖音和 TikTok 的身份，
+**这两个身份池一开始就是空的，而且会一直空着**。具体表现为：
+
+- 控制台「身份池」页面显示抖音和 TikTok 无法铸造（B 站仍可铸造），初始化向导的铸造步骤
+  只提供 B 站并说明原因，而不是报错。
 - `POST /api/v1/admin/identities/mint` 依然会受理请求——它返回 `202` 和 `task_ids`——
-  随后排队的任务以 `501 NOT_CONFIGURED` 失败，消息是“本实例未配置该功能。”，
+  对抖音或 TikTok，随后排队的任务以 `501 NOT_CONFIGURED` 失败，消息是“本实例未配置该功能。”，
   并带上 `error.details.reason: "browser_rpc_unconfigured"`。mint 调用不接受 `?wait=`，
   所以这个结论要在任务上（`GET /api/v1/tasks/<task_id>`）或控制台里看，
   而不是在 mint 本身的响应里。
-- 所有内容请求都会失败，返回 `503 IDENTITY_POOL_EXHAUSTED` ——
-  “当前无可用身份，预计 N 秒后恢复” —— 直到你至少导入一份 cookie。
+- 抖音和 TikTok 的所有内容请求都会失败，返回 `503 IDENTITY_POOL_EXHAUSTED` ——
+  “当前无可用身份，预计 N 秒后恢复” —— 直到你为该平台至少导入一份 cookie。
 
 不跑浏览器是受支持的部署方式，不是坏掉的部署：手动导入 cookie 的用户不需要整套
 服务里最重的那个容器，而且当 `browser-rpc` 不可达时，身份池会自动退回到手动导入。
-但它确实不是开箱即用。二选一：
+但对抖音和 TikTok 来说，它确实不是开箱即用。二选一：
 
 | 路线 | 怎么做 | 代价 |
 |---|---|---|
 | 自动铸造 | 第 4 步加上 `--profile browser` | 约 1.7 GB 镜像、预热后 2.57 GiB 内存、最多 4 核 CPU、构建更久 |
 | 手动 cookie | 跳过该 profile，第 6 步之后在「身份池」页面导入 | cookie 由你提供并负责续期；一份已登录的 cookie 等同于账号密码 |
 
-如果选浏览器，有一个所有人都会踩的坑：`CLOAKBROWSER_COMMIT` 是在**构建时**读取的，
-而且它是 compose 的*插值*变量——compose 从 `docker/.env` 或你的 shell 里读这类变量，
-**不会**读仓库根目录的 `.env`。在命令行上传入才是可靠做法。
-它刻意钉死到某个 commit 而不是 tag，因为 GitHub 上有多个组织发布了描述完全相同的
-`cloakbrowser` 仓库，浮动 tag 无法唯一确定是哪一份软件。
-如果构建时这个值为空，镜像里根本不含浏览器，并且会在 `/rpc/health` 上如实说明，
-而不是悄悄铸造出平台根本不认的合成身份。
+如果选浏览器，镜像里装哪个版本不用你操心：`docker/compose.yml` 里写着这份代码验证过的
+CloakBrowser 版本，构建时装的就是它。它钉死到某个 commit 而不是 tag，因为 GitHub 上有多个组织
+发布了描述完全相同的 `cloakbrowser` 仓库，浮动 tag 无法唯一确定是哪一份软件。
+这个 pin 随 `git pull` 和浏览器自己的依赖一起变；想有意识地换一个版本，见
+[CloakBrowser 版本固定](./02-installation.md#构建浏览器镜像cloakbrowser-版本固定)。
 
 ## 第 4 步 —— 启动服务
 
@@ -167,16 +168,11 @@ docker compose -p dtk -f docker/compose.yml up -d --wait --wait-timeout 300
 
 ```bash
 echo 'DTK_BROWSER_RPC_URL=http://browser-rpc:9000' >> .env
-CLOAKBROWSER_COMMIT=f04c23da285b3b3d3cf10c8f9d282e7adc1d52ce \
-  docker compose -p dtk -f docker/compose.yml --profile browser up -d --build
+docker compose -p dtk -f docker/compose.yml --profile browser up -d --build
 docker compose -p dtk -f docker/compose.yml --profile browser ps
 ```
 
-那个 commit 对应 CloakBrowser 0.5.10 / Chromium 146，是本仓库端到端验证过的版本；
-`.env.example` 里写它也是同样的理由——但那只是一个参考值，不是一份能直接生效的配置。
-把 `.env.example` 复制成仓库根目录的 `.env` **并不会**让这个 pin 进入构建，
-因为 compose 的插值不读那个文件：要么像上面那样写在命令行上，要么放进 `docker/.env`，
-要么用 `COMPOSE_ENV_FILES=.env` 把根目录文件喂给 Compose。要改就有意识地改。
+构建装的是 `docker/compose.yml` 指定的那个 CloakBrowser 版本，所以没有什么 pin 需要抄进 `.env`。
 `browser-rpc` 的健康检查 `start_period` 是 60 秒，所以别急着用 `ps` 的结果下结论，
 给它一分钟。
 
@@ -268,7 +264,7 @@ docker compose -p dtk -f docker/compose.yml logs api \
 
 - 用户名必须匹配 `^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$` —— 字母、数字、点、短横、
   下划线，3 到 64 个字符，且不能以标点开头。
-- 密码：API 的下限是 8 位，向导要求 12 位。
+- 密码：至少 8 位，与 API、CLI 和用户页的下限一致。
 - **没有邮件找回密码。** 恢复手段是一条 CLI 命令：
   `docker compose -p dtk -f docker/compose.yml exec api dtk user passwd <name>`。
 
@@ -287,11 +283,11 @@ User-Agent 要填同一个浏览器会话的，好让指纹和 cookie 对得上�
 
 ## 第 7 步 —— 在控制台里解析一条链接
 
-向导的冒烟测试只跑一次。要反复调用，请用侧边栏（*工具*分组下）的**「调试台」**。
+向导的冒烟测试只跑一次。要反复调用，请用侧边栏（*开发者*分组下）的**「调试台」**。
 
 1. 在左侧目录里选 `POST /api/v1/parse`。
 2. 在 `url` 里填分享链接、作品原始 URL，或者平台 App 复制出来的整段剪贴板文本。
-   短链（`v.douyin.com`、`vm.tiktok.com`）会自动跟随。
+   短链（`v.douyin.com`、`vm.tiktok.com`、`b23.tv`）会自动跟随。
 3. 把 `wait` 设成 `20` 之类的值。
 4. 提交。
 
@@ -305,16 +301,19 @@ request id、这次调用用的是哪个身份、该接口的熔断器此刻是�
 控制台用的是会话 Cookie。程序应该用 API Key，因为 Key 带权限范围，而且可以单独撤销。
 
 进入**「API Key」→「创建密钥」**。取一个在审计日志里一眼能认出来的名字，
-只勾选它真正需要的权限——本文这一遍只要 `douyin:read` 和 `tiktok:read`。
+只勾选它真正需要的权限——本文这一遍只要 `douyin:read`、`tiktok:read` 和 `bilibili:read`。
 
 | 权限范围 | 开放了什么 |
 |---|---|
 | `douyin:read` | 抖音的解析、作品、作者、评论接口 |
 | `tiktok:read` | TikTok 的同类接口 |
+| `bilibili:read` | B 站的同类接口：没有喜欢、转发、收藏和关注列表，多了热门榜和视频分 P |
 | `archive:read` | 本实例已经采集到的内容，直接由本地存储返回 |
 | `archive:export` | 一次请求遍历整个归档——这是唯一一个能把只读 Key 变成一份数据库副本的调用 |
 | `media:read` | 服务器磁盘上存了哪些媒体、占了多少空间 |
 | `media:write` | 发起下载、把某个下载置顶以免被清理、取消下载 |
+| `transcription:read` | 列出已下载视频的转写，读取转写文本 |
+| `transcription:write` | 发起、取消和删除转写 |
 | `identity:manage` | 铸造、导入、探测、退休身份。普通只读 Key 绝不该带上它 |
 | `admin` | 全部权限，含设置与用户 |
 
@@ -457,8 +456,8 @@ docker compose -p dtk -f docker/compose.yml exec api dtk diagnose
 | api 日志里没有初始化横幅 | 已经存在账号——令牌只在 `users` 表为空时签发。改从 `/login` 登录。 |
 | `SETUP_TOKEN_INVALID` | 令牌过期、已被用掉，或者因五次错误被作废。`docker compose -p dtk -f docker/compose.yml restart api` 会重新打印仍然有效的令牌，若旧的已失效则签发新的。 |
 | `503 IDENTITY_POOL_EXHAUSTED` | 身份池里没有可用身份。铸造一个，或导入一份 cookie。见第 3 步。 |
-| 铸造任务以 `501 NOT_CONFIGURED` 失败（mint 调用本身返回的是 `202`） | 没有浏览器容器。启动 `--profile browser` 并设置 `DTK_BROWSER_RPC_URL`，或者改用导入 cookie。 |
-| `browser-rpc` 不健康，日志说 "not installed in this image" | 构建时没传 `CLOAKBROWSER_COMMIT`——这个值在构建时从 shell 读取，不从根目录 `.env` 读。 |
+| 铸造任务以 `501 NOT_CONFIGURED` 失败（mint 调用本身返回的是 `202`） | 没有浏览器容器，而平台是抖音或 TikTok——B 站不需要它。启动 `--profile browser` 并设置 `DTK_BROWSER_RPC_URL`，或者改用导入 cookie。 |
+| `browser-rpc` 不健康，日志说 "not installed in this image" | 镜像是用裸的 `docker build` 构建的、没带 `--build-arg CLOAKBROWSER_COMMIT=…`，或者来自一份更早的代码——那时 `docker/compose.yml` 还没给它默认值。按第 4 步用 Compose 重新构建即可。 |
 | 铸造总是超时 | 代理连不上目标平台。先单独测代理，再怀疑浏览器。 |
 | 密码正确却返回 `RATE_LIMITED` | 按账号计数的登录限制是真的锁定：五次失败，锁十五分钟。等待，或者清掉计数器——见[故障排查](./14-troubleshooting.md)。 |
 

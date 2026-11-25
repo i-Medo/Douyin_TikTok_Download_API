@@ -1,7 +1,7 @@
 # 用户与 API 密钥
 
 > **[Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)** ——
-> 自部署的抖音 / TikTok 数据接口服务：REST、MCP 和 Web 控制台，身份池自维护。
+> 自部署的抖音 / TikTok / B 站数据接口服务：REST、MCP 和 Web 控制台，身份池自维护。
 > [文档首页](../README.zh-CN.md) · [English](../en/09-users-and-api-keys.md)
 
 这一篇讲的是"谁能在你的实例上做什么"。读完之后，你会知道该给同事开哪种控制台账号、怎么签发一把只能读抖音、别的什么都干不了的密钥、怎么让泄露的凭据立刻失效，以及如果你真的决定把某个端点开放给不带凭据的调用方，会发生什么。
@@ -35,7 +35,7 @@
 | 查看总览、资料库、下载、日志与系统信息 | 是 | 是 | 是 | 是 |
 | 查看身份池、代理、API 密钥与设置 | 是 | 是 | 是 | 否 |
 | 管理身份池与代理 | 是 | 是 | 否 | 否 |
-| 创建与撤销 API 密钥 | 是 | 是 | 否 | 否 |
+| 创建、编辑与撤销 API 密钥 | 是 | 是 | 否 | 否 |
 | 执行自检 | 是 | 是 | 否 | 否 |
 | 修改运行配置 | 是 | 是 | 否 | 否 |
 | 修改敏感配置：白名单、CORS、下载代理 | 是 | 否 | 否 | 否 |
@@ -49,8 +49,8 @@
 由此引出三个容易让人意外的结论：
 
 - **角色变更在下一次请求就生效。** 主体在每次调用时都从数据库重建，没有缓存需要等待，也不需要把人踢下线。
-- **控制台不会按角色隐藏页面**——`demo` 是唯一的例外。任何已登录用户都能打开导航里的每个页面，真正拒绝操作的是服务端。演示账号的侧边栏被裁剪过，因为一个陌生人面对一堆必然 403 的链接学不到任何东西；而运维者看到「用户」链接却被拒绝，反倒能了解自己实例的状态。「用户」页面对非管理员隐藏账号列表并禁用按钮，因为一个所有控件都会报错的页面，比一个说明原因的页面更糟。
-- **`demo` 角色不能手动指定。** 它由 `demo.enabled` 这个开关生成，用户接口会拒绝把任何账号创建或改成这个角色——否则就会出现第二个演示账号，密码是管理员自己选的、也没有配套的 API 密钥。
+- **控制台不会按角色隐藏页面**——`demo` 是唯一的例外。任何已登录用户都能打开导航里的每个页面，真正拒绝操作的是服务端。演示账号的侧边栏被裁剪过，因为一个陌生人面对一堆必然 403 的链接学不到任何东西；而运维者看到「用户」链接却被拒绝，反倒能了解自己实例的状态。页面内部则反过来：你的角色用不了的控件根本不画出来，而不是画成禁用状态。非管理员在「用户」页面上看不到账号列表和账号相关的按钮，只有一行说明原因；operator 以下的角色在「API Key」页面上没有创建、编辑和撤销。一个所有控件都会报错的页面，比一个说明原因的页面更糟。
+- **`demo` 角色不能手动指定。** 它由 `demo.enabled` 这个开关生成，用户接口会拒绝把任何账号创建或改成这个角色——否则就会出现第二个演示账号，密码是管理员自己选的、也没有配套的 API 密钥。演示账号本身同样碰不得：服务端拒绝修改它的角色、重置它的密码或删除它。以前在它的角色上手一滑，就能把登录页公开打印密码的那个账号变成管理员；而重置密码会让登录页上印着的那个密码失效。要换密码请到**设置 → 演示模式**里重新签发这一对凭据，要撤下演示就把 `demo.enabled` 关掉。「用户」页面上它那一行是锁定的，并链接到设置页。演示对外公开了什么——开没开、账号名、密钥的前缀和 scope，但绝不包括密码和密钥本身——任何 viewer 及以上角色都能通过 `GET /api/v1/admin/demo` 读到；重新签发仍然只有管理员能做。
 
 ## 管理控制台账号
 
@@ -88,9 +88,13 @@ curl -X POST http://127.0.0.1:8000/api/v1/admin/users \
 
 用「用户」表格每一行上的角色下拉框，或者 `PUT` 一个 `{"role": ...}`。其它什么都不变，也不会登出任何会话。
 
+控制台会先确认再保存；如果这次修改是授予 `admin`，或者是给你当前登录的账号降级，还会额外警告一次。这个下拉框以前一改就保存，而鼠标手滑不算决定。下拉框里永远不会出现 `demo`。
+
 ### 重置他人的密码
 
 `PUT` 一个 `{"password": ...}`。这是管理员替忘记密码的人做的重置，它刻意**不**要求提供当前密码——那道校验在这里毫无意义，只会挡住想帮忙的管理员。该账号打开过的所有会话都会被撤销，包括他此刻正坐在前面的那个。响应里的 `revoked_sessions` 会告诉你撤销了几个。
+
+控制台里对应的是该账号那一行上的**重置密码**。你自己那一行没有这个按钮：用它会把当前标签页也登出，而且自己的密码应当走要求输入当前密码的那个表单。重置之后不会显示任何机密，提示里只写明是哪个账号、登出了几个会话，所以请通过可信的渠道把新密码告诉对方。
 
 修改**自己**的密码走的是另一个端点，并且必须提供当前密码——见[密码](#密码)。
 
@@ -241,9 +245,11 @@ curl -X POST http://127.0.0.1:8000/api/v1/admin/api-keys \
 | `rate_limit` | 每分钟请求数，1 到 100000，或者 `null` 表示沿用实例默认值。 |
 | `expires_at` | 未来的 ISO 时间戳，或 `null` 表示永不过期。过去的时间戳会被 `INVALID_PARAM` 拒绝。 |
 
-控制台提供的有效期选项是永不过期、7、30、90、365 天；API 接受任何未来的时刻。
+控制台提供的有效期选项是永不过期、7、30、90、365 天；API 接受任何未来的时刻。它的 scope 选择器提供两个起点：**全部平台读取**（`douyin:read`、`tiktok:read`、`bilibili:read`）和**只读**（在此之上再加 `archive:read`、`media:read` 和 `transcription:read`）。点一下会替换当前勾选的集合，之后各个勾选框仍可单独修改。两者都不含任何写入或管理类 scope，因为一个带 `media:write` 的预设，离把磁盘写满只差一次点击。
 
 创建密钥走 `manage_pool`：需要 **operator** 及以上角色；如果你是用密钥而不是会话来调用的，还需要 `admin` 或 `identity:manage` scope。密钥永远属于创建它的人，没有任何办法替别人签发一把密钥。
+
+密钥的名称和 scope 之后可以修改，密钥本身不变：`PATCH /api/v1/admin/api-keys/{key_id}`，传 `name`、`scopes` 或两者都传，控制台里是该行的**编辑**。`scopes` 是整体替换，不是追加。正在使用这把密钥的程序拿着的还是原来那个值，下一次调用就带上新的 scope——这正是它存在的理由：新版本加了一个平台，就会多出一个读取 scope，而没有编辑功能时，想让一把现有的密钥获得它，只能另签一把，再分发给每一个用旧密钥的脚本。权限门与创建时相同，下文的越权检查也同样适用。已撤销的密钥，以及演示账号的密钥（它的 scope 由演示模式决定，请改为重新签发演示凭据），编辑请求会以 `INVALID_PARAM` 被拒绝。
 
 ### 密钥的样子，以及唯一一次能看到它的时刻
 
@@ -257,22 +263,27 @@ dtk_9f3c1a7b2e08_Vn4kQ2xR8sT1yU6wZ0aB3cD5eF7gH9jK
 
 ### 列出密钥
 
-`GET /api/v1/admin/api-keys` 返回**实例上的全部密钥**，最新的在前；加 `?mine_only=true` 只看自己的。读取列表走 `read_admin`——任何已登录的控制台用户，包括 viewer，都能看到所有人密钥的名称、前缀、归属、scope、限额和最近使用时间。响应里没有任何密文，但这份清单在账号之间并不保密。控制台页面另外提供了搜索框以及按状态、按 scope 的筛选，全部在浏览器里对完整列表求值。
+`GET /api/v1/admin/api-keys` 返回**实例上的全部密钥**，最新的在前；加 `?mine_only=true` 只看自己的。读取列表走 `read_admin`——任何已登录的控制台用户，包括 viewer，都能看到所有人密钥的名称、前缀、归属、scope、限额和最近使用时间。响应里没有任何密文，但这份清单在账号之间并不保密。控制台页面会显示所有者——对能读取账号列表的管理员显示用户名，对其他人显示「你」或「其他账号」——它的**只看我的密钥**开关就是 `mine_only`。搜索框以及按状态、按 scope 的筛选，都在浏览器里对完整列表求值。
+
+能读抖音或 TikTok、却不能读 B 站的有效密钥会被标出来。密钥保留签发时的 scope，升级不会给它添加任何新 scope，所以 B 站加入之前签发的每一把密钥，在有人给它加上 `bilibili:read` 之前调用 B 站都会被拒绝。页面上有一条横幅统计这类密钥的数量，operator 在每一把旁边都能看到**添加 bilibili:read**，它就是上面那个编辑操作，只多加了这一个 scope。持有 `admin` 的密钥不会被标出，它本来就什么都能访问。
 
 `last_used_at` 会在该密钥每一次通过认证的请求上写入，所以撤销之前想确认"还有东西在用它吗"，看这一列最快。
 
-## 八个 scope
+## 十一个 scope
 
 一个 scope 就是一组端点。只要密钥持有某个端点接受的任意一个 scope，它就能访问该端点。
 
 | Scope | 打开了什么 |
 |---|---|
-| `douyin:read` | 抖音的全部读取：`GET /api/v1/douyin/video`、`/video/comments`、`/video/comments/replies`、`/user`、`/user/posts`、`/user/likes`、`/mix/posts`；针对抖音链接的 `POST /api/v1/parse` 和 `POST /api/v1/tasks/batch`；签名工具 `POST /api/v1/tools/sign`、`/decode`、`GET /api/v1/tools/parse-url`、`POST /api/v1/tools/parse-batch`；`POST /api/v1/archive/recheck` 与 `/archive/backfill`；以及回读上述调用创建的任务。 |
-| `tiktok:read` | TikTok 上的同一组，外加只有 TikTok 提供的 `/user/followers` 和 `/user/following`。只持有这个 scope 的密钥访问 `/api/v1/douyin/...` 会被拒绝，REST 和 MCP 一视同仁。 |
+| `douyin:read` | 抖音的全部读取：`GET /api/v1/douyin/video`、`/video/comments`、`/video/comments/replies`、`/user`、`/user/posts`、`/user/likes`、`/user/collections`、`/user/bookmarks`、`/collection/posts`、`/mix/posts`、`/user/mixes`、`/video/related`、`/music`、`/music/posts`、`/hashtag`、`/live`、`/live/ranking`、`/live/status`、`/trending`；针对抖音链接的 `POST /api/v1/parse` 和 `POST /api/v1/tasks/batch`；签名工具 `POST /api/v1/tools/sign`、`/decode`、`GET /api/v1/tools/parse-url`、`POST /api/v1/tools/parse-batch`；`POST /api/v1/archive/recheck` 与 `/archive/backfill`；以及回读上述调用创建的任务。 |
+| `tiktok:read` | TikTok 上的同一组（没有 `/trending` 和 `/live/ranking`），外加只有 TikTok 提供的 `/user/reposts`、`/user/followers`、`/user/following`、`/collection` 和 `/hashtag/posts`，以及 `/search/posts` 和 `/search/users`。只持有这个 scope 的密钥访问 `/api/v1/douyin/...` 会被拒绝，REST 和 MCP 一视同仁。 |
+| `bilibili:read` | B 站的读取：`GET /api/v1/bilibili/video`、`/video/comments`、`/video/comments/replies`、`/user`、`/user/posts`、`/user/collections`、`/collection/posts`、`/mix/posts`、`/user/mixes`、`/video/related`、`/search/posts`、`/search/users`、`/live`、`/trending`，以及只有 B 站提供的 `/video/parts` 和 `/popular`；针对 B 站链接的 `POST /api/v1/parse` 和 `POST /api/v1/tasks/batch`；与 `douyin:read` 相同的那些工具和归档调用；以及取回上述任一调用创建的任务。B 站不提供的那些抖音、TikTok 路由会返回 `UNSUPPORTED_CONTENT`——见 [REST API 指南](./11-api.md#b-站)。只持有这个 scope 的密钥访问 `/api/v1/douyin/...` 和 `/api/v1/tiktok/...` 会被拒绝。 |
 | `archive:read` | 本实例已经存下来的内容，直接从 Postgres 返回、不碰平台：`GET /api/v1/archive`、`/archive/stats`、`/archive/collections`、`GET /api/v1/archive/{platform}/{content_id}`。刻意与平台读取权限分开——开放一个平台端点，不应该顺带开放这台实例历史上采集到的一切。 |
-| `archive:export` | `GET /api/v1/archive/export`，一次请求遍历整个归档。它单独占一个 scope，因为这是唯一一个能把只读密钥变成数据库副本的调用。 |
+| `archive:export` | `GET /api/v1/archive/export`，一次请求遍历整个归档；以及 `POST /api/v1/archive/export`，只导出请求体里点名的作品。它单独占一个 scope，因为这是唯一一个能把只读密钥变成数据库副本的调用。 |
 | `media:read` | 下载记录及其字节内容：`GET /api/v1/downloads`、`/downloads/storage`、`/downloads/{download_id}` 和 `/downloads/{download_id}/files/{name}`。它还会让归档列表 `GET /api/v1/archive` 多返回本地媒体那一块。 |
-| `media:write` | 一切发起或改变下载的操作：`POST /api/v1/downloads`、`/downloads/retry`、`/downloads/deduplicate`、`POST /api/v1/downloads/{download_id}/pin`、`DELETE /api/v1/downloads/{download_id}`——以及素材库的合集（`POST`、`PATCH`、`DELETE /api/v1/archive/collections...`）和 `POST /api/v1/archive/delete`。与 `media:read` 分开，是因为发起一次下载会消耗一个身份、占用磁盘：它是这套 API 里唯一一个长得像读、却对宿主机留下持久副作用的调用。 |
+| `media:write` | 一切发起或改变下载的操作：`POST /api/v1/downloads`、`/downloads/retry`、`/downloads/deduplicate`、`POST /api/v1/downloads/{download_id}/pin`、`DELETE /api/v1/downloads/{download_id}`、`DELETE /api/v1/downloads/{download_id}/files`——以及素材库的合集（`POST`、`PATCH`、`DELETE /api/v1/archive/collections...`）和 `POST /api/v1/archive/delete`。与 `media:read` 分开，是因为发起一次下载会消耗一个身份、占用磁盘：它是这套 API 里唯一一个长得像读、却对宿主机留下持久副作用的调用。 |
+| `transcription:read` | 转写记录：`GET /api/v1/transcriptions` 和 `GET /api/v1/transcriptions/{transcription_id}`，以及通过 REST 或 MCP 取回 `media.transcribe` 任务结果。 |
+| `transcription:write` | 任何发起或移除转写的操作：`POST /api/v1/transcriptions`、`DELETE /api/v1/transcriptions/{transcription_id}`（取消）、`POST /api/v1/transcriptions/delete`，以及 MCP 的 `transcribe_video`。它能读 `transcription:read` 能读的一切。单独成一个权限，是因为每一次都会在本机 CPU 上把语音模型跑满整段视频的时长。 |
 | `identity:manage` | 身份池及其周边机制：`/api/v1/admin/identities/*`、`/api/v1/admin/proxies/*`、`/api/v1/admin/watchlist/*`、`POST /api/v1/admin/diagnose`、`POST /api/v1/admin/notifications/test`、API 密钥这几个路由本身、只读的管理面板（配置列表、请求日志、审计日志、指标、接口访问控制）、`POST /api/v1/tools/identity`，以及数据调用上的 `identity=` 和 `explain=` 参数。不要把它给普通的只读密钥：`GET /api/v1/admin/identities/{id}/cookies/reveal` 会把解密后的 Cookie 罐交出来。 |
 | `admin` | 一切。scope 校验遇到它直接短路，所以持有 `admin` 的密钥能通过实例上的每一道 scope 关卡。它唯一做不到的是抬高所属账号的角色——见下文。 |
 
@@ -286,13 +297,13 @@ dtk_9f3c1a7b2e08_Vn4kQ2xR8sT1yU6wZ0aB3cD5eF7gH9jK
 
 **即便密钥属于管理员，scope 依然照查。** 自部署实例上几乎每一把密钥都属于 admin 账号，所以"管理员绕过 scope"这种捷径，会让 `archive:export`——那个唯一能交出数据库副本的调用——恰好在它被设计来防护的部署形态里彻底失效。代码没有走这条捷径。
 
-**密钥不可能被授予其创建者本身不持有的 scope。** 当发起签发的调用方本身也是一把密钥时，请求的 scope 会与它持有的取交集，多出来的部分以 `FORBIDDEN_SCOPE` 拒绝，并列出被拒的和实际持有的。没有这条，一把只有 `identity:manage` 的密钥——它被 `GET /api/v1/admin/users` 拒绝、也被敏感配置的写入拒绝——就可以给自己签一把 `scopes: ["admin"]` 的密钥，前后两个请求就把两件事都做了。控制台会话不受这一条约束，因为它本来就由角色而不是 scope 来限定，而且该路由已经要求 operator 角色。
+**密钥不可能被授予其创建者本身不持有的 scope。** 当发起签发的调用方本身也是一把密钥时，请求的 scope 会与它持有的取交集，多出来的部分以 `FORBIDDEN_SCOPE` 拒绝，并列出被拒的和实际持有的。没有这条，一把只有 `identity:manage` 的密钥——它被 `GET /api/v1/admin/users` 拒绝、也被敏感配置的写入拒绝——就可以给自己签一把 `scopes: ["admin"]` 的密钥，前后两个请求就把两件事都做了。编辑同样受这条检查约束：新的列表里不能有发起调用的那把密钥自己不持有的 scope。控制台会话不受这一条约束，因为它本来就由角色而不是 scope 来限定，而且该路由已经要求 operator 角色。
 
 **密钥携带其所属账号的角色，角色门槛依旧生效。** 所以 operator *可以*签出一把带 `admin` scope 的密钥，而这把密钥仍然够不到 `/api/v1/admin/users`，也改不了敏感配置——那些地方查的是所属账号的角色，读到的是 `operator`。把一个账号降级，它名下所有密钥在下一次请求就同步降权；把账号删掉，密钥一起消失。
 
 **密钥不能修改密码**，无论是主人的还是别人的。那个端点只接受控制台会话。
 
-**密钥不适合转手给别人。** 密钥没有对象级归属：任何 operator 都能撤销任何密钥，任何持有 `identity:manage` 的密钥都能把请求指定到池子里的任意身份上。如果两个人需要各自独立的影响范围，请给他们两个账号，而不是一个账号下的两把密钥。
+**密钥不适合转手给别人。** 密钥没有对象级归属：任何 operator 都能编辑或撤销任何密钥，任何持有 `identity:manage` 的密钥都能把请求指定到池子里的任意身份上。如果两个人需要各自独立的影响范围，请给他们两个账号，而不是一个账号下的两把密钥。
 
 ## 限流不是计费
 
@@ -326,6 +337,8 @@ dtk_9f3c1a7b2e08_Vn4kQ2xR8sT1yU6wZ0aB3cD5eF7gH9jK
 - 它不可撤销。被撤销的密钥就是撤销了；请另签一把。
 - 还在用这把密钥的东西会开始收到 `401 UNAUTHENTICATED`。
 
+撤销演示对外公开的那把密钥时，无论是单独撤销还是批量撤销，都会先给出警告：在重新签发演示凭据之前，所有访客都调用不了演示 API，演示账号则仍然可以登录。
+
 列表里的状态列由记录本身推导：`active`、`expired`（`expires_at` 已过）或 `revoked`。撤销一把已经撤销的密钥不会有任何改变，但仍然会写一条审计记录，detail 里带 `already_revoked: true`。
 
 按脚本或主机一把一把地签发。这样一次泄露就只是一次撤销，而审计日志里的名字会直接告诉你该去清理哪台机器。
@@ -352,7 +365,7 @@ curl -H 'Authorization: Bearer dtk_9f3c1a7b2e08_...' \
 - **密钥优先于 cookie。** 如果一个请求两者都带且密钥有效，胜出的是密钥的主体——包括它更窄的 scope。如果密钥是未知的、过期的或已撤销的，请求会退回去用 cookie。
 - **错误的凭据绝不会被降级成匿名。** 携带了一把服务端不认的密钥的请求，即使打在已开放给匿名调用的端点上，也会明确收到 `401`。悄悄降级会把"你的密钥过期了"变成"你的密钥能用但看得更少"，后者要难查得多。
 
-`/mcp` 端点只接受 API 密钥（两个请求头都行），你要是送了会话 cookie，它会明确告诉你。密钥必须持有 `douyin:read` 或 `tiktok:read` 才能完成握手；随后每个工具会针对它实际被要求的平台再校验一次。见 [MCP 与 AI 客户端](./12-mcp.md)。
+`/mcp` 端点只接受 API 密钥（两个请求头都行），你要是送了会话 cookie，它会明确告诉你。密钥必须持有 `douyin:read`、`tiktok:read` 或 `bilibili:read` 才能完成握手；随后每个工具会针对它实际被要求的平台再校验一次。见 [MCP 与 AI 客户端](./12-mcp.md)。
 
 ### 请求被拒绝时
 
@@ -382,7 +395,9 @@ curl -H 'Authorization: Bearer dtk_9f3c1a7b2e08_...' \
 
 每个开关的含义都是「这个接口需要 API Key」，所以 ON 才是受保护状态，全开即全安全：开关打开时该行显示**需要 Key**，关掉之后显示**无需 Key**。把某个开关关掉才是移除凭据校验，也正是这个方向会让页面要求你确认。
 
-`api.public_endpoints` 被标记为 SENSITIVE，因此写入它需要管理员、`admin` scope，以及请求体里的 `confirm: true`。控制台会从自己的确认对话框补上这个确认。每一次改动都会以 `settings.updated_sensitive` 写入审计日志。
+确认对话框，以及列出所有已开放路由的那张警告卡片，都会写明该路由服务哪些平台。带 `{platform}` 的路由服务本版本支持的所有平台，以后版本新增的平台也算在内：B 站加入之前开放的路由，从 B 站上线那天起就开始消耗 B 站的身份池，而页面上什么都没说。警告卡片上还有一个**全部关闭**，点了会先确认。
+
+`api.public_endpoints` 被标记为 SENSITIVE，因此写入它需要管理员、`admin` scope，以及请求体里的 `confirm: true`。控制台会从自己的确认对话框补上这个确认。管理员以下的角色在这个页面上看不到开关，也看不到**全部关闭**，只有一行说明原因。每一次改动都会以 `settings.updated_sensitive` 写入审计日志。
 
 ### 永远无法开放的部分
 
@@ -398,7 +413,7 @@ curl -H 'Authorization: Bearer dtk_9f3c1a7b2e08_...' \
 
 ### 开放某个路由是必要条件，不是充分条件
 
-未认证的调用方运行在一个匿名主体上，它**恰好持有两个 scope**：`douyin:read` 和 `tiktok:read`。永远没有 admin，永远没有写权限。
+未认证的调用方运行在一个匿名主体上，它**恰好持有三个 scope**：`douyin:read`、`tiktok:read` 和 `bilibili:read`。永远没有 admin，永远没有写权限。
 
 所以在配置里开放 `GET /api/v1/downloads` 毫无意义：该路由依然要求 `media:read`，匿名主体没有它，调用方拿到的是 `403` 而不是 `401`。实际上真正适合开放的，是平台读取端点、`/api/v1/parse`、`/api/v1/tasks/batch`、`/api/v1/tools` 下的链接与签名工具、用于回读上述任务的 `/api/v1/tasks/{task_id}`，以及 `/api/v1/system/status`。
 
@@ -434,6 +449,7 @@ curl -H 'Authorization: Bearer dtk_9f3c1a7b2e08_...' \
 | `user.password_changed` | 有人修改自己的密码 |
 | `user.sessions_revoked` | 有人登出自己的其它设备 |
 | `api_key.created` | 签发密钥，记录名称、前缀、scope 和限额 |
+| `api_key.updated` | 编辑密钥的名称或 scope，记录改动前后的值 |
 | `api_key.revoked` | 撤销密钥 |
 | `settings.updated_sensitive` | 修改 SENSITIVE 配置，包括 `api.public_endpoints` |
 

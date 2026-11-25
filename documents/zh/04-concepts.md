@@ -1,7 +1,7 @@
 # 核心概念
 
 > **[Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)** ——
-> 自部署的抖音 / TikTok 数据接口服务：REST、MCP 和 Web 控制台，身份池自维护。
+> 自部署的抖音 / TikTok / B 站数据接口服务：REST、MCP 和 Web 控制台，身份池自维护。
 > [文档首页](../README.zh-CN.md) · [English](../en/04-concepts.md)
 
 本页讲的是整套系统背后的心智模型。读完之后，你应该能在发出请求之前就预判实例会怎么处理它，并且能区分三种从外部看起来完全一样的失败：真正的 bug、平台改动，以及系统完全按设计工作。
@@ -54,7 +54,7 @@
 
 | 组成 | 具体是什么 | 存放位置 |
 | --- | --- | --- |
-| Cookie jar | 平台自己签发的会话 cookie —— 至少要有 `ttwid`，理想情况还包括 `odin_tt`、`s_v_web_id`、`msToken`、`uifid` | `identities.cookies_encrypted`，AES-256-GCM，行 id 作为附加认证数据绑定进去 |
+| Cookie jar | 平台自己签发的会话 cookie —— 抖音和 TikTok 至少要有 `ttwid`，理想情况还包括 `odin_tt`、`s_v_web_id`、`msToken`、`uifid`；B 站是 `buvid3` | `identities.cookies_encrypted`，AES-256-GCM，行 id 作为附加认证数据绑定进去 |
 | 指纹 | 浏览器系列与主版本号、User-Agent、`navigator.platform`、屏幕尺寸、语言、时区、`hardwareConcurrency`、`deviceMemory` | `identities.fingerprint`（JSONB） |
 | 代理绑定 | 这份 jar 是在哪个出口后面铸造的，或者为空表示直连 | `identities.proxy_id` |
 | 历史 | 连续失败次数、冷却时间、状态、最近使用时间 | `identities.state`、`consecutive_fails`、`cooldown_until`、`last_used_at` |
@@ -93,7 +93,7 @@ stateDiagram-v2
 
 | 状态 | 含义 | 是否参与调度 |
 | --- | --- | --- |
-| `minting` | 浏览器正在铸造它 | 否 |
+| `minting` | 正在铸造中 | 否 |
 | `active` | 正常轮换 | 是 |
 | `cooling` | 命中风控后退避中 | 仅当调用方按名字指定（pin）它时 |
 | `degraded` | 退避已到上限，属于最后手段 | 仅当活跃池为空时 |
@@ -111,15 +111,19 @@ stateDiagram-v2
 
 浏览器跑在一个独立的长驻服务里（`browser-rpc`，通过 `DTK_BROWSER_RPC_URL` 访问），不是每次调用现拉一个：冷启动一个浏览器要花好几秒。
 
+B 站是例外。它的访客会话——`buvid3` 和 `buvid4`——由一次普通的 HTTP 请求发放，也就是站点的 `/x/frontend/finger/spi`，所以 B 站访客身份的铸造不需要浏览器。这一次请求走的是实例自己那套模拟 TLS 指纹的传输层，并经过这个身份将来要绑定的代理发出，因此会话依然诞生在日后花掉它的那个出口上——没有浏览器容器的部署也照样能维持一个 B 站身份池。
+
 ### 速度本身就是正确性的一部分
 
-池填充器（`src/dtk/worker/pool_filler.py`）**每个 tick 只铸造一个身份**，铸造期间持有一把跨进程的 Redis 锁，这样 `--scale worker=N` 不会把一次铸造变成 N 次；铸造持续失败时按指数退避（60 秒起，翻倍至 3600 秒上限）。因此从低水位补到目标值要花上几分钟。这是刻意的：一个部署在一秒内冒出五个全新访客，本身就比这些身份之后要做的任何事都更像信号。没有任何请求会等待铸造——它完全不在请求路径上。
+池填充器（`src/dtk/worker/pool_filler.py`）**每个 tick 只铸造一个身份**，铸造期间持有一把跨进程的 Redis 锁，这样 `--scale worker=N` 不会把一次铸造变成 N 次；铸造持续失败时按指数退避（60 秒起，翻倍至 3600 秒上限）。退避按铸造途径分开计算——浏览器一条，B 站的普通 HTTP 一条——所以浏览器容器挂了，不会让 B 站身份池停止补充。因此从低水位补到目标值要花上几分钟。这是刻意的：一个部署在一秒内冒出五个全新访客，本身就比这些身份之后要做的任何事都更像信号。没有任何请求会等待铸造——它完全不在请求路径上。
 
 | 配置项 | 默认值 | 决定什么 |
 | --- | --- | --- |
 | `pool.min_size` | 3 | 每个平台的低水位；低于它填充器开始补货 |
 | `pool.target_size` | 8 | 一直补到可用数量达到这个值 |
 | `pool.max_fail_streak` | 3 | 连续失败次数超过它，该身份不再计入池水位，填充器会补一个新的而不是把它算进去 |
+
+每个平台都可以用自己的水位覆盖前两项——`pool.douyin.*`、`pool.tiktok.*` 和 `pool.bilibili.*`——见[配置参考](./03-configuration.md)。
 
 填充器读的是**可用**数量——连续失败次数仍低于 `pool.max_fail_streak` 的存活身份——而不是行数。一个每次请求都失败的身份仍然是"存活"的（它冷却、退避到期、被提回、再失败），所以按行数统计会让池子永远停在目标值上却什么都服务不了。
 
@@ -131,19 +135,21 @@ stateDiagram-v2
 
 ### 没有浏览器时
 
-不设 `DTK_BROWSER_RPC_URL` 就完全没有铸造能力，这个后台任务会被整体跳过，而不是每分钟打一条错误日志。这类部署依靠**导入**的 cookie 过日子：你从自己的浏览器里粘贴一份 jar，实例负责解析。四种格式会被自动识别——`Cookie:` 请求头、cookie 编辑器扩展导出的 JSON 数组、Netscape 的 `cookies.txt`、以及一行一个的 `key=value`——并且在存储之前会把解析结果展示给你，包括找到了哪些 cookie、这份 jar 是否携带已登录会话（`sessionid`、`sid_tt`、`sid_guard` 等）、以及推断出的浏览器。见[身份与代理](./06-identities-and-proxies.md)。
+不设 `DTK_BROWSER_RPC_URL` 就没有抖音和 TikTok 的铸造能力：这两个池子会被放着不管，而不是每分钟打一条错误日志；只有走普通 HTTP 铸造的 B 站仍会自己补充。对另外两个平台，这类部署依靠**导入**的 cookie 过日子：你从自己的浏览器里粘贴一份 jar，实例负责解析。四种格式会被自动识别——`Cookie:` 请求头、cookie 编辑器扩展导出的 JSON 数组、Netscape 的 `cookies.txt`、以及一行一个的 `key=value`——并且在存储之前会把解析结果展示给你，包括找到了哪些 cookie、这份 jar 是否携带已登录会话（`sessionid`、`sid_tt`、`sid_guard` 等，或 B 站的 `SESSDATA`）、以及推断出的浏览器。见[身份与代理](./06-identities-and-proxies.md)。
 
 导入的已登录 jar 比访客身份价值高得多，泄露的危害也大得多。它同时也是下面调度器一节里 pin 机制存在的理由。
 
 ## 请求签名
 
-两个平台都要求携带由它们自己的 JavaScript 计算出来的 query 参数和请求头。本项目用纯 Python 重新实现了这些算法（`src/dtk/signing/native/`），耗时以微秒计且没有外部依赖；同时保留浏览器作为兜底，由它执行站点真实的代码（`src/dtk/signing/rpc.py`）。
+抖音和 TikTok 都要求携带由它们自己的 JavaScript 计算出来的 query 参数和请求头。本项目用纯 Python 重新实现了这些算法（`src/dtk/signing/native/`），耗时以微秒计且没有外部依赖；同时保留浏览器作为兜底，由它执行站点真实的代码（`src/dtk/signing/rpc.py`）。
+
+B 站的签名是 WBI（`w_rid` + `wts`），在进程内由站点公开的两把公钥算出。这两把公钥从 B 站的 `nav` 接口取得，每个进程缓存一小时；刷新失败时，一天以内的旧公钥会继续使用。这里没有什么需要浏览器补上的东西，所以无论 `signing.mode` 怎么设，browser-rpc 都不会给 B 站签名——下面的模式只决定抖音和 TikTok 用哪个签名器。
 
 `signing.mode` 决定优先用哪一个，出厂值是 `native`。
 
 | 模式 | 行为 |
 | --- | --- |
-| `native` | 全部在进程内签名。浏览器负责铸造身份，而不是负责给它们的请求签名。 |
+| `native` | 全部在进程内签名。浏览器负责铸造抖音和 TikTok 的身份，而不是负责给它们的请求签名。 |
 | `rpc` | 每个签名都优先走 `browser-rpc`。平台哪天换了新 SDK、移植的算法失效时，就切到这里。 |
 | `auto` | 默认走 native，但平台自家 SDK 会签名保护的端点除外，以及某个端点的风控率显示签名正在被拒绝时除外。 |
 
@@ -161,7 +167,7 @@ TikTok 会直接验证这一点：同样一串已签名的字节，换成 Firefo
 
 2026-09-08 对线上页面实测的结论：抖音的 `verifyFp` query 参数**就是**计算这个签名的那个浏览器的 `s_v_web_id` cookie。在一个会话里签名、却用另一个会话的 cookie 发出去，两者指向的就是不同的访客。
 
-两个平台都不会为此返回一个干净的拒绝。它们的做法是扣下载荷——HTTP 200、信封完整、里面什么都没有。这看起来和限流一模一样，所以在你排查这类问题之前，值得先理解这一点。
+抖音和 TikTok 都不会为此返回一个干净的拒绝。它们的做法是扣下载荷——HTTP 200、信封完整、里面什么都没有。这看起来和限流一模一样，所以在你排查这类问题之前，值得先理解这一点。
 
 同样的耦合也体现在 native 签名器里：
 
@@ -177,6 +183,24 @@ TikTok 会直接验证这一点：同样一串已签名的字节，换成 Firefo
 ## 调度器
 
 调度器只回答一个问题——*现在哪个身份可以发这个请求？*——或者给出一个能展示给调用方、并写进 `request_log` 的拒绝理由。
+
+### 谁能被选中：轮换与登录分层
+
+排序之前，调度器先决定这个请求到底能交给哪些身份，以及按什么顺序分层（`src/dtk/scheduler/scheduler.py` 里的 `_rotation_pool`）。下面讲的排序，只在同一层内部排先后。
+
+- **先看轮换。** 只服务点名请求的身份永远不会被选中；限定了接口清单的身份，只在清单里的接口上被选中。见[让身份退出轮换](./06-identities-and-proxies.md#让身份退出轮换)。
+- **再看这个接口给游客什么。** 每个接口对第一页（`login`）和之后每一页（`paging_login`）分别声明：游客不吃亏、优先用登录态、必须登录。能力表会把两者都报出来。
+
+| 游客拿到的 | 分层顺序 | 轮换里没有登录身份时 |
+| --- | --- | --- |
+| 和登录态一样，`pool.<platform>.guests_first` 开启（默认） | 先游客，再登录身份 | 只有游客 |
+| 和登录态一样，这个开关关闭 | 游客和登录身份同一层，按最近使用排 | 只有游客 |
+| 更少——优先用登录态（抖音作者作品、B 站评论的第一页） | 只有登录身份 | 由游客应答，结果带 `meta.guest_fallback` 标记，且不缓存 |
+| 什么都没有——必须登录（上面两个接口的第一页之后、B 站评论回复的第一页之后，以及抖音作者喜欢列表的每一页） | 只有登录身份 | 立刻以 `no_login` 拒绝 |
+
+每一层里先选 active 的身份，这一层一个 active 都没有了才用 degraded 的；冷却中的身份永远不会被选中。前面各层的身份都在请求中或者额度用完了，才会轮到后一层：忙着的游客会让位给空闲的登录身份，所以游客优先只决定谁先上，从不拒绝一个本可以由空闲登录身份承载的请求。对接口优先使用的登录身份则刻意反过来——它要等，而不是换成游客，否则实例一忙，大部分第一页都会落到游客手里。
+
+`guests_first` 是按平台的运行时配置，每个请求都会重新读取，开关就在调度器页面的覆盖卡片上。背后的理由，以及每一行依据的实测，见[哪些内容需要登录身份](./06-identities-and-proxies.md#哪些内容需要登录身份)。
 
 ### 健康度排序
 
@@ -212,13 +236,19 @@ score = success_rate × (1 − risk_rate) × 0.5 ^ consecutive_fails
 | --- | --- | --- | --- |
 | `*.content_detail` | 5 | 0.30 | 1.0 |
 | `*.author_profile` | 4 | 0.20 | 1.2 |
+| `*.related_posts`、`*.live_room`、`*.live_room_by_id` | 4 | 0.20 | 1.2 |
+| `*.music_detail`、`*.hashtag_detail`、`*.live_status`、`douyin.trending` | 4 | 0.20 | 1.0 |
 | `*.author_posts` | 3 | 0.12 | 1.8 |
 | `*.author_likes` | 3 | 0.12 | 1.8 |
 | `*.comments`、`*.comment_replies` | 3 | 0.15 | 1.5 |
-| `*.mix_posts` | 3 | 0.15 | 1.5 |
+| `douyin.live_ranking` | 3 | 0.15 | 1.2 |
+| `*.mix_posts`、`*.author_mixes`、`*.music_posts`、`tiktok.hashtag_posts` | 3 | 0.15 | 1.5 |
 | `tiktok.author_followers`、`tiktok.author_following` | 3 | 0.12 | 1.8 |
+| `tiktok.search_posts`、`tiktok.search_authors` | 2 | 0.08 | 1.8 |
 | `*.session_check` | 3 | 0.20 | 1.0 |
 | 任何未注册的端点 | 3 | 0.15 | 1.5 |
+
+带通配符的几行是抖音和 TikTok 的数值。B 站的端点在 `src/dtk/scheduler/policies.py` 里以自己的名字单独登记，其中包括 `bilibili.content_streams`——视频详情为拿到可播放文件而发的第二个请求。最需要知道的是 `bilibili.author_posts`，也就是 UP 主投稿列表：它是 B 站看管最严的端点，令牌桶也是所有 B 站端点里最慢的。
 
 每秒填充 `0.12` 意味着突发额度用完之后，单个身份在该端点上每 8.3 秒才能发一个请求。这就是单个身份的吞吐上限——想更快，办法是增加身份，而不是调大桶。风险权重会在该端点把身份打到风控时，乘进这个身份要承受的冷却时长。
 
@@ -246,12 +276,13 @@ score = success_rate × (1 − risk_rate) × 0.5 ^ consecutive_fails
 
 ### 拒绝
 
-等待是有界的：`sched.max_wait_seconds`（默认 `10`），每 250 毫秒轮询一次。早点拒绝好过无限排队——让调用方挂一分钟再失败，比立刻告诉它稍后重试更糟。有两种拒绝会完全跳过等待，因为再轮询也改变不了答案。
+等待是有界的：`sched.max_wait_seconds`（默认 `10`），每 250 毫秒轮询一次。早点拒绝好过无限排队——让调用方挂一分钟再失败，比立刻告诉它稍后重试更糟。有三种拒绝会完全跳过等待，因为再轮询也改变不了答案。
 
 | `reject_reason` | 含义 | 是否等待 | 调用方看到的错误 |
 | --- | --- | --- | --- |
 | `circuit_open` | 该端点对所有人熔断中 | 否 | `ENDPOINT_CIRCUIT_OPEN`（503） |
 | `pinned_unavailable` | 指定的身份已退休、仍在铸造中、或属于另一个平台 | 否 | `INVALID_PARAM`（400） |
+| `no_login` | 该接口必须登录，而轮换里没有可用于它的登录身份 | 否 | `IDENTITY_LOGIN_REQUIRED`（503），带 `details.cooling` |
 | `no_identity` | 该平台没有任何 active 或 degraded 身份 | 是 | `IDENTITY_POOL_EXHAUSTED`（503） |
 | `no_token` | 所有候选在该端点上都没额度了 | 是 | `IDENTITY_POOL_EXHAUSTED`（503） |
 | `all_inflight` | 所有候选都在请求中 | 是 | `IDENTITY_POOL_EXHAUSTED`（503） |
@@ -260,7 +291,7 @@ score = success_rate × (1 − risk_rate) × 0.5 ^ consecutive_fails
 
 `pinned_unavailable` 刻意是 400 而不是 503：池子好好的，而且等待也修不好一个指向无法服务该请求的身份的参数。
 
-`queue_full` 是这张表里的异类。它是提交撞上队列上限时由 API 抛出的（`src/dtk/api/routes/operations.py`），那时还没有任务可以调度，所以它只出现在错误信封的 `details.reject_reason` 里，永远不会写成一行 `request_log`。其余六个才是调度器自己的理由，也只有它们能在「日志」页面上被查到。
+`queue_full` 是这张表里的异类。它是提交撞上队列上限时由 API 抛出的（`src/dtk/api/routes/operations.py`），那时还没有任务可以调度，所以它只出现在错误信封的 `details.reject_reason` 里，永远不会写成一行 `request_log`。其余七个才是调度器自己的理由，也只有它们能在「日志」页面上被查到。
 
 ### 指定身份（pin）
 
@@ -325,7 +356,7 @@ score = success_rate × (1 − risk_rate) × 0.5 ^ consecutive_fails
 
 ### 重试
 
-`network_error` 会换**另一个**身份重试——最多 `MAX_TRANSPORT_ATTEMPTS`（3）次——因为故障在出口而不在请求本身。如果三个不同出口都够不到平台，问题就不在身份上，调用方会收到一个 500，里面写着最后一次的错误。
+`network_error` 会换**另一个**身份重试——最多 `MAX_TRANSPORT_ATTEMPTS`（3）次——因为故障在出口而不在请求本身。如果三个不同出口都够不到平台，问题就不在身份上，调用方会收到 `UPSTREAM_UNREACHABLE`（502），里面写着最后一次的错误，以及那一次有没有走代理。它以前是 500 `INTERNAL`，等于让调用方去报 bug，而原因几乎总是这台机器的出网——比如在中国大陆的服务器上不给身份配代理就去访问 TikTok。
 
 `risk_control` 和 `business_error` 不重试。它们是答案。
 
@@ -367,7 +398,7 @@ GET  /api/v1/tasks/{task_id}  -> 200 {"state": "done", "data": {...}}
 
 `error.code` 是一个稳定的枚举，可以拿来做分支判断；它只增不改、永不重命名、永不翻译。旁边的 `error.message` 是本地化的（`?lang=zh`），绝不能拿来解析。**已完成结果**上的 `meta.request_id`——`?wait=` 及时完成的那次调用，或者轮询任务取回的结果——才是写进 `request_log` 的那个 id，这也是 bug 报告能被跟进的原因。而确认提交的那个 `202` 上，它只是 HTTP 的关联 id（与 `X-Request-ID` 响应头同值），没有属于自己的日志行：真正执行这个任务的 worker 会另生成一个 fetch 请求 id，「日志」页面上留下的是后者。
 
-有一部分错误码被标记为不可重试并对外公布，这样 agent 不会在一个永久性失败上把预算烧光：`INVALID_URL`、`UNSUPPORTED_CONTENT`、`INVALID_PARAM`、`UNAUTHENTICATED`、`FORBIDDEN_SCOPE`、`NOT_FOUND`、`CONTENT_PRIVATE`、`UPSTREAM_CHANGED`、`CANCELLED`、`METHOD_NOT_ALLOWED`、`UNSUPPORTED_MEDIA_TYPE`、`NOT_CONFIGURED`，以及两个 setup 相关的码。完整说明见 [REST API 指南](./11-api.md)和 [MCP 与 AI 客户端](./12-mcp.md)。
+有一部分错误码被标记为不可重试并对外公布，这样 agent 不会在一个永久性失败上把预算烧光：`INVALID_URL`、`UNSUPPORTED_CONTENT`、`INVALID_PARAM`、`UNAUTHENTICATED`、`FORBIDDEN_SCOPE`、`NOT_FOUND`、`CONTENT_PRIVATE`、`MEDIA_WITHHELD`、`UPSTREAM_CHANGED`、`CANCELLED`、`METHOD_NOT_ALLOWED`、`UNSUPPORTED_MEDIA_TYPE`、`NOT_CONFIGURED`，以及两个 setup 相关的码。完整说明见 [REST API 指南](./11-api.md)和 [MCP 与 AI 客户端](./12-mcp.md)。
 
 ### 每个请求一行记录
 
@@ -386,8 +417,8 @@ GET  /api/v1/tasks/{task_id}  -> 200 {"state": "done", "data": {...}}
 | 配置项 | 默认值 | 适用范围 |
 | --- | --- | --- |
 | `cache.content_ttl` | 1800 秒 | 作品详情 |
-| `cache.author_ttl` | 900 秒 | 作者主页 |
-| `cache.list_ttl` | 300 秒 | 作品列表、评论、回复、喜欢、合集、粉丝、关注 |
+| `cache.author_ttl` | 900 秒 | 作者主页、音乐、话题 |
+| `cache.list_ttl` | 300 秒 | 作品列表、评论、回复、喜欢、合集、粉丝、关注、搜索结果、热榜、直播间、直播间观众榜与在播查询 |
 
 缓存命中不消耗任何身份额度，这使它成为身份池最便宜的保护。它仍然会作为一次请求被记录，并带上 `cache_hit` 标记——如果「日志」页面把它们略去，一个已经开始服务全部流量的缓存看起来就会像一个没人调用的端点。
 
@@ -435,6 +466,7 @@ GET  /api/v1/tasks/{task_id}  -> 200 {"state": "done", "data": {...}}
 | --- | --- |
 | `douyin:read` | 抖音平台读取 |
 | `tiktok:read` | TikTok 平台读取 |
+| `bilibili:read` | B 站平台读取 |
 | `archive:read` | 读取这个实例已经存下来的内容 |
 | `archive:export` | 一次请求遍历整个归档 |
 | `media:read` | 查看磁盘上存了哪些媒体 |
@@ -466,7 +498,7 @@ GET  /api/v1/tasks/{task_id}  -> 200 {"state": "done", "data": {...}}
 
 ### 把端点开放给公众
 
-默认情况下每个端点都需要凭据。`api.public_endpoints` 以 `"<METHOD> <路径模板>"` 的形式列出例外，写法与 API 文档中完全一致。有三组路径**永远**不能被开放，无论配置怎么写——`/api/v1/admin/*`、`/api/v1/auth/*` 和 `/api/setup/*`——而且没有覆盖开关。已开放端点上的匿名调用方只获得 `douyin:read` 和 `tiktok:read`，别无其他，并且按客户端地址而不是按密钥限流。
+默认情况下每个端点都需要凭据。`api.public_endpoints` 以 `"<METHOD> <路径模板>"` 的形式列出例外，写法与 API 文档中完全一致。有三组路径**永远**不能被开放，无论配置怎么写——`/api/v1/admin/*`、`/api/v1/auth/*` 和 `/api/setup/*`——而且没有覆盖开关。已开放端点上的匿名调用方只获得 `douyin:read`、`tiktok:read` 和 `bilibili:read`，别无其他，并且按客户端地址而不是按密钥限流。
 
 有一个细节：错误的凭据和没有凭据不是一回事。发来了一个被实例拒绝的密钥的调用方，即便在开放端点上也会被明确告知。悄悄把它降级成匿名，会把"你的密钥过期了"变成"你的密钥能用但看到的更少"，而后者是两者中更难排查的那个。更多内容见[用户与 API 密钥](./09-users-and-api-keys.md)和[安全](./15-security.md)。
 
@@ -481,10 +513,11 @@ GET  /api/v1/tasks/{task_id}  -> 200 {"state": "done", "data": {...}}
 | `ENDPOINT_CIRCUIT_OPEN` | 5 分钟内该端点上 ≥20 个请求中有 ≥60% 失败，且涉及 ≥3 个身份 | 多半不在实例这边。查签名器和平台。 |
 | 浏览器里能打开的链接却返回 `NOT_FOUND` | 平台回答说这个作品已删除、私密或仅作者可见 | 不是。按设计，`business_error` 不消耗身份健康度。 |
 | `UPSTREAM_RISK_CONTROL` | 那个身份被拒绝了——已冷却、连续失败次数 +1 | 单独看不是 bug。整个池子同时中招才是事件。 |
+| B 站 UP 主投稿列表上的 `UPSTREAM_RISK_CONTROL` | 同一出口短时间内的一串请求，会让 B 站在几分钟内只回 HTTP 412 页面，请求头怎么改都一样 | 不是。把请求摊开；代理有帮助。见[故障排查](./14-troubleshooting.md#b-站-up-主投稿列表返回-http-412)。 |
 | `UPSTREAM_CHANGED` | 响应结构不再符合解析器的预期 | 值得上报。附上 `request_id`。 |
 | 「日志」页面出现 `signature.refused` 或 `signature.rejected` | 被拒的是*我们的签名*，不是身份 | 请上报——平台的 SDK 很可能动了。 |
 | 一个永远恢复不了的 degraded 身份 | 提回 active 不会清空连续失败计数，只有成功才会 | 不是。如果这些失败不是它的错，手动重置它。 |
-| 身份一直铸造不出来，还没有报错 | 没有配 `DTK_BROWSER_RPC_URL`，或者所有代理都已被绑定 | 不是。「身份池」页面上的铸造日志会写明原因。 |
+| 身份一直铸造不出来，还没有报错 | 没有配 `DTK_BROWSER_RPC_URL`（仅限抖音和 TikTok——B 站不需要它），或者所有代理都已被绑定 | 不是。「身份池」页面上的铸造日志会写明原因。 |
 
 总体形状是：**平台回答了，身份无辜；平台拒绝了，身份买单；什么都没回答，出口买单；而如果被拒的是我们自己的签名，身份照样买单，但规则名会告诉你该去哪儿看。**
 

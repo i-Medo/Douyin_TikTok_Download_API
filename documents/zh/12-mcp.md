@@ -1,10 +1,10 @@
 # MCP 与 AI 客户端
 
 > **[Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)** ——
-> 自部署的抖音 / TikTok 数据接口服务：REST、MCP 和 Web 控制台，身份池自维护。
+> 自部署的抖音 / TikTok / B 站数据接口服务：REST、MCP 和 Web 控制台，身份池自维护。
 > [文档首页](../README.zh-CN.md) · [English](../en/12-mcp.md)
 
-这一页讲怎么把 AI 客户端——Claude Code、Claude Desktop、Codex CLI、Cherry Studio，或者任何支持 MCP 的工具——接到你自己的实例上，八个工具各自做什么，以及返回的东西该怎么读。读完你应该能配好一个客户端、用 `curl` 验证连通性，并且认得出导致大部分连接失败的那两个错误。
+这一页讲怎么把 AI 客户端——Claude Code、Claude Desktop、Codex CLI、Cherry Studio，或者任何支持 MCP 的工具——接到你自己的实例上，十个工具各自做什么，以及返回的东西该怎么读。读完你应该能配好一个客户端、用 `curl` 验证连通性，并且认得出导致大部分连接失败的那两个错误。
 
 ## MCP 接入点是什么
 
@@ -18,10 +18,10 @@ MCP 服务器跑在 **API 进程内部**。它不是 REST API 的包装层：RES
 
 在围绕它设计代理之前，有两条刻意的限制值得先知道：
 
-- **只有八个工具，不会更多。** 每多一个工具，代理挑对工具的准确率都会有可测量的下降，所以新能力应该是现有工具的一个参数，而不是第九个工具。如果你需要覆盖这个实例全部能力的接口，请用 [REST API](./11-api.md)。
+- **十个工具，刻意少。** 每多一个工具，代理挑对工具的准确率都会有可测量的下降，所以新能力应该是现有工具的一个参数，而不是一个新工具。单独成为工具的 `download_media` 和 `transcribe_video`，恰好是会改变本实例的两个，各自需要单独的写权限。如果你需要覆盖这个实例全部能力的接口，请用 [REST API](./11-api.md)。
 - **没有任何工具能碰到凭证。** 这里没有身份工具、没有 Cookie 工具、没有代理工具，`pool_status` 返回的也只是计数和熔断状态，而不是数据行。这是结构性的保证——那些工具根本不存在——而不是某个人要记得写的权限检查。接到这个实例上的代理读不到、也导不出你的 Cookie，更不可能被话术骗着去做。
 
-工具做的全部是读操作。下载、关注列表、设置、身份管理和用户管理属于控制台和 REST 的地盘，见[下载、资料库与关注列表](./08-downloads-and-library.md)和[用户与 API 密钥](./09-users-and-api-keys.md)。
+其余工具全部是读操作。`download_media` 把作品媒体保存到本实例的磁盘上，`transcribe_video` 转写保存在那里的视频；关注列表、设置、身份管理和用户管理仍属于控制台和 REST 的地盘，见[下载、资料库与关注列表](./08-downloads-and-library.md)和[用户与 API 密钥](./09-users-and-api-keys.md)。
 
 ## 接入地址
 
@@ -34,7 +34,7 @@ MCP 服务器跑在 **API 进程内部**。它不是 REST API 的包装层：RES
 | 认证 | API Key，放在 `Authorization: Bearer …` 或 `X-API-Key: …` 里 |
 | 必需的 `Accept` | `application/json, text/event-stream` |
 | 服务名 / 版本 | `dtk` / 已安装的包版本 |
-| 工具 | 8 个，全部只读 |
+| 工具 | 10 个；`download_media` 和 `transcribe_video` 是写工具 |
 | 工具文本语言 | 始终是英文 |
 
 **末尾的斜杠要保留。** 接入点是 `/mcp/`；`/mcp` 会以 `307 Temporary Redirect` 跳到它。行为规范的客户端会在 307 之后重发 POST 请求体，根本察觉不到；但如果客户端跳转后改用 GET，或者干脆不跟随跳转，报出来的错看起来就像认证有问题。配置时带上斜杠，这个问题就永远不会出现。
@@ -49,7 +49,7 @@ MCP 服务器跑在 **API 进程内部**。它不是 REST API 的包装层：RES
 
 - **请求头：** `Authorization: Bearer dtk_…` 或 `X-API-Key: dtk_…` 均可，两者都在解析 JSON-RPC 请求体之前就被检查。
 - **控制台的会话 Cookie 会被拒绝。** Cookie 是浏览器自动带上的，Key 是程序主动出示的。如果这里接受 Cookie，那么任何能从已登录浏览器里发出请求的东西都能碰到 MCP 接入点。
-- **Key 至少要有一个平台的读权限。** 传输层要求 `douyin:read`、`tiktok:read` 或 `admin`；一个只有 `archive:read` 的 Key 会在任何工具运行之前就被 `FORBIDDEN_SCOPE` 拒掉。
+- **Key 至少要有一个 MCP 工具使用的权限。** 传输层接受平台读取、媒体、转写或 `admin` 权限；一个只有 `archive:read` 的 Key 会在任何工具运行之前就被 `FORBIDDEN_SCOPE` 拒掉。
 - **限流用的就是 REST 那一套限流器**，按 API Key 计数：`api.default_rate_limit_per_min`（默认 **120** 次/分钟），除非该 Key 自己带了限额。注意每一次 JSON-RPC 调用都是一个 HTTP 请求，所以 `initialize`、`tools/list` 和每一次 `tools/call` 都各算一次。
 - **把接口开放给匿名调用者并不会顺带开放 MCP。** “接口访问控制”作用于 REST 路径，MCP 的守卫无论如何都要求一个真实的 Key。
 
@@ -61,7 +61,7 @@ MCP 服务器跑在 **API 进程内部**。它不是 REST API 的包装层：RES
 
 401 还会带上 `WWW-Authenticate: Bearer realm="dtk"`。
 
-创建 Key：控制台 → **访问控制 → API Key**，或者 `POST /api/v1/admin/api-keys`。只给它 `douyin:read`、`tiktok:read` 或两者，别给多余的。完整的 Key 只在创建时显示一次，之后无法找回；丢了就撤销重建。详见[用户与 API 密钥](./09-users-and-api-keys.md)。
+创建 Key：控制台 → **访问控制 → API Key**，或者 `POST /api/v1/admin/api-keys`。平台工具使用 `douyin:read` / `tiktok:read` / `bilibili:read`，下载使用 `media:write`，转写使用 `transcription:write`；后续读取任务结果可授予对应的 read 权限。
 
 ## 工具
 
@@ -74,73 +74,80 @@ MCP 服务器跑在 **API 进程内部**。它不是 REST API 的包装层：RES
 | `list_comments` | 分页列出某作品的一级评论 | `{platform}.comments` |
 | `get_content_history` | 读取某作品或作者已记录的指标历史 | 无——读本地数据库 |
 | `pool_status` | 身份池与接口健康度 | 无——读 Redis 和本地数据库 |
+| `download_media` | 把作品媒体保存到本实例 | `media.download` |
+| `transcribe_video` | 转写一个已下载完成的视频 | `media.transcribe` |
 | `get_task_result` | 取回没能在限时内完成的结果 | 无 |
 
 第三列的 endpoint 名字，就是调度器、熔断器、健康看板和请求日志用的同一套键，所以代理发起的调用很容易在[运维](./10-operations.md)里找到对应记录。
 
-`platform` 取值为 `douyin` 或 `tiktok`。**所有 ID 都是字符串**，绝不是数字：抖音和 TikTok 的 ID 超出了 JavaScript 安全整数范围，把它们当数字解析的客户端会悄无声息地把值弄坏。
+`platform` 取值为 `douyin`、`tiktok` 或 `bilibili`。**所有 ID 都是字符串**，绝不是数字：抖音和 TikTok 的 ID 超出了 JavaScript 安全整数范围，把它们当数字解析的客户端会悄无声息地把值弄坏。B 站视频用 bvid，如 `BV1xx411c7mD`——也接受 av 号（`av170001` 或纯 `170001`）并会换算，结果里始终是 bvid——B 站作者用数字 `mid`。B 站的完整细节见 [REST API 指南](./11-api.md#b-站)。
 
 ### `parse_url`
 
 | 参数 | 必填 | 含义 |
 | --- | --- | --- |
-| `url` | 是 | 一个抖音或 TikTok 链接，或者包含链接的分享文本。短链（`v.douyin.com`、`vm.tiktok.com`）由服务端跟随展开。 |
+| `url` | 是 | 一个抖音、TikTok 或 B 站链接，或者包含链接的分享文本。短链（`v.douyin.com`、`vm.tiktok.com`、`b23.tv`、`bili2233.cn`）由服务端跟随展开。 |
 
-手上是链接而不是 ID 时就从这里开始：它自己判断平台和资源类型。夹带链接的分享文案也能接受——取字符串里的第一个 URL。
+手上是链接而不是 ID 时就从这里开始：它自己判断平台和资源类型。夹带链接的分享文案也能接受——取字符串里的第一个 URL。除了作品和作者主页，它也认音乐链接（抖音 `/music/<id>`、TikTok `/music/<标题>-<id>`）、话题链接（抖音 `/hashtag/<id>`、TikTok `/tag/<名称>`）和直播间链接（`live.douyin.com/<id>`、抖音 App 分享出来的直播链接、TikTok `/@<用户名>/live`、`live.bilibili.com/<id>`），返回与同名 REST 接口相同的内容——直播间正在直播时还带拉流地址。
 
 返回 `status`、`task_id`、`platform`、`resource`、`url`（归类后的链接）和 `data`。
 
-以下情况会直接拒绝、不消耗任何配额：链接的域名不属于抖音或 TikTok（`INVALID_URL`）；链接在受支持的域名上但不指向作品或作者主页——信息流、搜索页、设置页（`UNSUPPORTED_CONTENT`）；以及指向直播间、合集、音乐页、话题或搜索结果的链接，这套工具没有对应的 endpoint（`UNSUPPORTED_CONTENT`）。
+以下情况会直接拒绝、不消耗任何配额：链接的域名不属于抖音、TikTok 或 B 站（`INVALID_URL`）——`bilibili.tv` 也在此列，它是另一个服务；链接在受支持的域名上但不指向任何可获取的内容——信息流、设置页（`UNSUPPORTED_CONTENT`）；以及指向合集或搜索结果的链接，这套工具没有对应的 endpoint（`UNSUPPORTED_CONTENT`）。这两样 REST API 都能读：`/mix/posts` 和 `/search/posts`。
 
 ### `get_video`
 
 | 参数 | 必填 | 含义 |
 | --- | --- | --- |
-| `platform` | 是 | `douyin` 或 `tiktok` |
-| `content_id` | 是 | 字符串形式的作品 ID：抖音是 `aweme_id`，TikTok 是 item id |
+| `platform` | 是 | `douyin`、`tiktok` 或 `bilibili` |
+| `content_id` | 是 | 字符串形式的作品 ID：抖音是 `aweme_id`，TikTok 是 item id，B 站是 bvid（也接受 av 号） |
 
-在 `data` 下返回归一化后的作品——作者、统计数据、媒体地址、标签。
+在 `data` 下返回归一化后的作品——作者、统计数据、媒体地址、标签。B 站的多 P 视频算一个作品，媒体流是第一个分 P 的。
 
 ### `get_user`
 
 | 参数 | 必填 | 含义 |
 | --- | --- | --- |
-| `platform` | 是 | `douyin` 或 `tiktok` |
-| `uid` | 是 | 抖音：`sec_user_id`（以 `MS4wLjAB` 开头）。TikTok：`secUid`，实在只有 `@handle` 时也可以传。 |
+| `platform` | 是 | `douyin`、`tiktok` 或 `bilibili` |
+| `uid` | 是 | 抖音：`sec_user_id`（以 `MS4wLjAB` 开头）。TikTok：`secUid`，实在只有 `@handle` 时也可以传。B 站：数字 `mid`。 |
 
 结果里的 `uid` 才是这个作者的稳定标识。TikTok 的 `@handle` 是会变的，所以代理后续调用应该带上这里返回的 `uid`，而不是 handle。
 
-只有 TikTok 的资料接口接受 handle。抖音上传 handle 会被拒绝，并附带一句提示：改用 `parse_url` 传一个主页链接，由它来解析——那是抖音 handle 转成 ID 的唯一路径。
+只有 TikTok 的资料接口接受 handle。抖音上传 handle 会被拒绝，并附带一句提示：改用 `parse_url` 传一个主页链接，由它来解析——那是抖音 handle 转成 ID 的唯一路径。B 站根本没有 handle。
 
 ### `list_user_posts`
 
 | 参数 | 必填 | 含义 |
 | --- | --- | --- |
-| `platform` | 是 | `douyin` 或 `tiktok` |
-| `uid` | 是 | 作者的稳定 ID。这里**不接受** TikTok 的 `@handle`——先调 `get_user`。 |
+| `platform` | 是 | `douyin`、`tiktok` 或 `bilibili` |
+| `uid` | 是 | 作者的稳定 ID（B 站是 `mid`）。这里**不接受** TikTok 的 `@handle`——先调 `get_user`。 |
 | `cursor` | 否 | 上一页返回的不透明 `cursor`。第一页不传；原样回传，永远不要去解析它。 |
-| `count` | 否 | 每页条数，**1–50**。不传就用平台自己的默认值。 |
+| `count` | 否 | 每页条数，**1–50**，且不超过平台本身的上限：**TikTok 35，B 站 20**。不传就用平台自己的默认值。 |
 
 在 `data` 下返回一页数据，带 `cursor` 和 `has_more`。`has_more` 为 false 时停止。
 
-`count` 上限是 50，因为两个平台都会对更大的值悄悄截断，结果就是代理拿到的条目比它要的少，而且没有任何提示。把每页调大并不能更快抓完一个大号——老老实实用 cursor 翻页。
+`count` 上限是 50，因为抖音和 TikTok 都会对更大的值悄悄截断，结果就是代理拿到的条目比它要的少，而且没有任何提示。平台本身的上限也会检查，和 REST 路由一样：TikTok 对超过 35 的一页会回答得像这个作者没有作品，B 站则直接拒绝超过 20 的一页，所以两者在这里都会在发出任何请求之前返回 `INVALID_PARAM`。5.1.6 之前 MCP 只检查 50。把每页调大并不能更快抓完一个大号——老老实实用 cursor 翻页。
+
+B 站的 UP 主投稿列表是 B 站防得最严的接口：同一个出口短时间内连发一串请求，接下来几分钟都会拿到 HTTP 412，到这边就是 `UPSTREAM_RISK_CONTROL`。代理遍历一位 B 站作者时应该慢慢翻页，而不是快速重试；见[故障排查](./14-troubleshooting.md#b-站-up-主投稿列表返回-http-412)。
 
 ### `list_comments`
 
 | 参数 | 必填 | 含义 |
 | --- | --- | --- |
-| `platform` | 是 | `douyin` 或 `tiktok` |
+| `platform` | 是 | `douyin`、`tiktok` 或 `bilibili` |
 | `content_id` | 是 | 要看评论的作品 ID |
 | `cursor` | 否 | 同上 |
-| `count` | 否 | 同上，1–50 |
+| `count` | 否 | 同上。B 站上会被忽略，它的评论接口不接受每页条数，但超过 20 的值在那里仍会被拒绝 |
+| `sort` | 否 | `hot`（默认，最热）或 `new`（最新）。只有 B 站支持 `new`；抖音和 TikTok 按自己的方式排序，传 `new` 会返回 `INVALID_PARAM`。翻页时带上同一个值 |
 
-只返回一级评论。楼中楼回复是另一项能力，这套工具不暴露——这正是“只有八个工具”所付出的代价之一。代理确实需要时，走 REST 的 `/api/v1/{platform}/video/comments/replies`。
+在 B 站上，访客身份只能拿到最热的三条评论（`sort` 为 `new` 时是最新的三条），并被告知这就是最后一页。所以第一页优先用已登录的 B 站身份，没有时退回访客，并标上 `guest_fallback`（见[读取返回结果](#读取返回结果)）；后续页必须用已登录身份，没有就返回 `IDENTITY_LOGIN_REQUIRED`。
+
+只返回一级评论。楼中楼回复是另一项能力，这套工具不暴露——这正是“工具要少”所付出的代价之一。代理确实需要时，走 REST 的 `/api/v1/{platform}/video/comments/replies`。
 
 ### `get_content_history`
 
 | 参数 | 必填 | 含义 |
 | --- | --- | --- |
-| `platform` | 是 | `douyin` 或 `tiktok` |
+| `platform` | 是 | `douyin`、`tiktok` 或 `bilibili` |
 | `content_id` | 是 | 作品 ID；如果要看粉丝数历史，则传作者 ID |
 | `since` | 否 | ISO 8601 日期或时间戳，例如 `2026-01-15` 或 `2026-01-15T00:00:00Z`。默认最近 **30 天**。 |
 
@@ -175,13 +182,38 @@ MCP 服务器跑在 **API 进程内部**。它不是 REST API 的包装层：RES
 
 这个结果里不会出现任何凭证、身份 ID、Cookie、指纹或代理地址。
 
+### `download_media`
+
+接受完整作品 `url`，或者 `platform` 加 `content_id`；短链接仍需先调用 `parse_url`。`skip_existing` 默认是 true，因此代理重复调用会复用磁盘上已有的文件。在 B 站上，`part`（从 1 开始）用来保存多 P 视频的某一 P；URL 里的 `?p=` 也是同一个意思，每一 P 都有自己的 `download_id`。
+
+它需要 `media:write`，并且会改变本实例：文件会写到运营者的磁盘上，本实例还没解析过的作品会先通过身份池抓取一次。工具最多等待 `api.mcp_tool_timeout`。完成时返回保存下来的下载记录和 `download_id`；耗时更长时返回 `pending`，带一段 `message`、交给 `get_task_result` 的 `task_id`，以及 `download_id`。什么都没存下的下载——没有可抓取的媒体，或者被取消——会作为工具错误返回并说明原因，而不是 `ok`。文件保留在服务端媒体卷上，不通过 MCP 传输。
+
+转写使用以下链路：
+
+```text
+parse_url → download_media(url) → transcribe_video(download_id)
+```
+
+### `transcribe_video`
+
+传入 `download_media` 返回的 `download_id`、可选的 `normalize`（默认 `true`）和可选的 `refresh`。它需要 `transcription:write`，并且转写服务的 compose profile 必须在运行。FunASR 处理中英混合语音；中文 ITN 会按上下文转换口语数字、日期、金额等表达。同一个视频已有完成的转写时会直接复用，除非 `refresh` 为 true；复用还会区分归一化开关、引擎版本以及实例配置的 fallback/fail 策略；转写进行中再次请求会加入正在跑的那一个。工具最多等待 `api.mcp_tool_timeout`，完成则返回全文，超时则返回 `pending`，带一段 `message`、`task_id` 和 `transcription_id`。失败或被取消的转写会作为工具错误返回并说明原因。
+
+客户端携带 MCP 的 `_meta.progressToken` 时，同一次工具调用在等待期间还会发送
+`notifications/progress`。更新会标明当前流水线阶段（`queued`、`decode`、`vad`、
+`asr`、`punctuation`、`normalization` 或 `done`）；ASR 阶段同时给出媒体处理进度，并且只发送
+本次新增的临时识别文本。这些文字是追加式的原始 ASR 临时稿：标点和中文数字、日期
+归一化都在识别结束后统一执行，因此最终工具结果才是权威文本，也可能修订临时稿。
+未请求或不展示 MCP progress 的客户端保持原有行为，只会看到最终结果。progress 属于
+客户端 UI 旁路，不保证进入模型上下文。当前 Dify 内置 MCP 客户端未在 `tools/call` 中
+设置进度回调，并会忽略进度通知，因此不属于实时展示支持范围。
+
 ### `get_task_result`
 
 | 参数 | 必填 | 含义 |
 | --- | --- | --- |
 | `task_id` | 是 | 某次返回 `status: "pending"` 的工具调用给出的 task id |
 
-除此之外没有别的理由调它。其他每个工具都会自己等结果，所以一上来就调这个的代理，是在轮询一件根本没人排队的活。
+除此之外没有别的理由调它。其他每个工具都会自己等结果，所以一上来就调这个的代理，是在轮询一件根本没人排队的活。对下载和转写，它返回的是保存下来的记录，和原工具本该返回的完全一样，没有可返回的内容时也同样报错。
 
 ## 读取返回结果
 
@@ -201,6 +233,7 @@ MCP 服务器跑在 **API 进程内部**。它不是 REST API 的包装层：RES
 - `data` 就是数据模型本身——和 REST 返回的归一化结构一致，并且已经从任务信封里拆出来了，代理不用比 schema 描述的层级再往下挖一层。
 - `cached` 在任务记录了这一信息时出现，表示这个答案是否真的产生了一次上游请求。相隔一分钟的两次调用完全可能返回相同数据，第二次带 `cached: true`。默认缓存 TTL：作品 1800 秒、资料 900 秒、列表 300 秒，见[配置参考](./03-configuration.md)。
 - `task_id` 的作用是让这次调用能和请求日志对上，也让 `pending` 的结果可以稍后取回。
+- 没有可用的登录身份、由访客身份应答时，会出现 `guest_fallback: true` 和一条 `note`。数据是真的；`note` 说明访客在这个接口上看不到什么：在抖音作者作品列表上，排在前面的未必是最新的作品；在 B 站评论上，只有最热的三条，后面没有了。
 
 分页工具会把 `cursor` 和 `has_more` 放在 `data` 里面。
 
@@ -250,21 +283,24 @@ again. (error code ENDPOINT_CIRCUIT_OPEN)
 
 | 错误码 | 对代理意味着什么 | 能重试吗 |
 | --- | --- | --- |
-| `INVALID_URL` | 不是受支持的抖音或 TikTok 链接 | 不能——改请求 |
+| `INVALID_URL` | 不是受支持的抖音、TikTok 或 B 站链接 | 不能——改请求 |
 | `UNSUPPORTED_CONTENT` | 能识别，但不是作品或作者主页 | 不能 |
 | `INVALID_PARAM` | 平台名不对、ID 为空、`count` 越界、`since` 解析不了，或者在需要稳定 ID 的地方传了 handle | 不能 |
 | `FORBIDDEN_SCOPE` | 这个 Key 没被授予该平台 | 不能 |
 | `NOT_FOUND` | 作品或作者不存在 | 不能 |
 | `CONTENT_PRIVATE` | 存在，但游客身份看不到 | 不能 |
+| `MEDIA_WITHHELD` | 作品读到了，但平台不给它的媒体（TikTok Shop 带货视频） | 不能 |
 | `UPSTREAM_CHANGED` | dtk 的解析器坏了，换个请求也绕不过去 | 不能——请提 issue |
 | `ENDPOINT_CIRCUIT_OPEN` | 该 endpoint 的熔断器已跳闸 | 能，等消息里说的时长 |
 | `IDENTITY_POOL_EXHAUSTED` | 当前没有可用身份 | 能——池子会自己补 |
+| `IDENTITY_LOGIN_REQUIRED` | 抖音作者作品列表或 B 站作品评论的后续页，而没有登录身份来处理 | 不能——要运维导入登录态 Cookie。第一页仍然可用 |
 | `UPSTREAM_RISK_CONTROL` | 平台对这次请求做了风控 | 能，退避后再试 |
+| `UPSTREAM_UNREACHABLE` | 平台根本没应答：每次尝试都在网络层失败，多半是这台实例的出网问题 | 能，但如果反复出现，要的是运维配代理，而不是继续重试 |
 | `RATE_LIMITED` | 触到了这个 Key 自己的限额 | 能，等消息里说的时长 |
 | `TASK_NOT_FOUND` | task id 不存在，或结果已过保留期 | 看消息——过保留期的那种会直接说明等待没有用 |
 | `INTERNAL` | 请求在 dtk 内部就失败了 | 能，但要去看日志 |
 
-有五个错误码的解释离不开健康状态——熔断打开、身份池耗尽、上游风控、签名失败和内部错误——这几种消息里会额外带上该 endpoint 的熔断状态和上次成功时间。异常文本只写日志、绝不外发：它可能包含主机名、查询串或请求头，这些都不该进入模型的上下文。
+有六个错误码的解释离不开健康状态——熔断打开、身份池耗尽、上游风控、签名失败、上游不可达和内部错误——这几种消息里会额外带上该 endpoint 的熔断状态和上次成功时间。异常文本只写日志、绝不外发：它可能包含主机名、查询串或请求头，这些都不该进入模型的上下文。
 
 ## 作用于代理的权限范围
 
@@ -274,13 +310,18 @@ again. (error code ENDPOINT_CIRCUIT_OPEN)
 | --- | --- |
 | `douyin:read` | 打开接入点；允许调用抖音相关工具 |
 | `tiktok:read` | 打开接入点；允许调用 TikTok 相关工具 |
-| `admin` | 全部允许，包括两个平台 |
+| `bilibili:read` | 打开接入点；允许调用 B 站相关工具 |
+| `media:write` | 打开接入点；允许调用 `download_media` |
+| `media:read` | 打开接入点；允许取回媒体下载任务结果 |
+| `transcription:write` | 打开接入点；允许调用 `transcribe_video` |
+| `transcription:read` | 打开接入点；允许取回转写任务结果 |
+| `admin` | 全部允许，包括所有平台 |
 | 只有其他权限范围 | 接入点直接以 `FORBIDDEN_SCOPE` 拒绝 |
 
 有两条规则常常出人意料：
 
 - **Key 受限于它创建时的权限范围，哪怕拥有者是管理员。** 自托管实例上几乎每个 Key 都属于 admin 用户；一个只有 `douyin:read` 的 Key，通过 MCP 照样读不了 TikTok，就跟它调 `GET /api/v1/tiktok/video` 会被拒一样。
-- **task id 不是绕过检查的后门。** `get_task_result` 会重新检查它要取回的那个任务属于哪个平台，所以只授权了一个平台的 Key，无法靠着从别处看到的 id 去读另一个平台的数据。（由 `parse_url` 排队的任务，其 endpoint 名里没有平台；那种情况下的检查发生在链接被归类时，也就是入队之前。）
+- **task id 不是绕过检查的后门。** `get_task_result` 要求的权限，就是当初排队这个任务所需要的权限——和 `GET /api/v1/tasks/{id}` 用的是同一张表：平台调用要该平台的读权限，`parse_url` 的任务要任一平台的读权限，下载要媒体权限，转写要转写权限。所以只授权了一个平台的 Key，无法靠着从别处看到的 id 去读其他平台的数据；媒体或转写 Key 也读不到其他任何东西。维护类任务——代理探测、身份铸造——需要 `admin` 或 `identity:manage`，代理用的 Key 本来就不该有这两个权限。
 
 走 stdio 时没有传输层身份可以约束：代理自己拉起了这个进程，本来就拥有该进程的一切，包括数据库。这是把 stdio 留给本机使用的理由，而不是 HTTP 传输的缺口。
 
@@ -382,12 +423,12 @@ curl -sS -X POST http://127.0.0.1:8000/mcp/ \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 ```
 
-传输层是流式返回的，所以你拿到的是一个 server-sent-events 帧——一行 `event: message`，后面跟着装有 JSON-RPC 结果的 `data:`——而不是一个裸 JSON 响应体。`tools/list` 成功时会列出全部八个工具。由于服务是无状态的，`tools/list` 和 `tools/call` 都不需要先做 `initialize` 握手，所以这条命令可以直接当健康检查用。
+传输层是流式返回的，所以你拿到的是一个 server-sent-events 帧——一行 `event: message`，后面跟着装有 JSON-RPC 结果的 `data:`——而不是一个裸 JSON 响应体。`tools/list` 成功时会列出全部十个工具。由于服务是无状态的，`tools/list` 和 `tools/call` 都不需要先做 `initialize` 握手，所以这条命令可以直接当健康检查用。
 
 失败时长这样：
 
 - `401`，`"code": "UNAUTHENTICATED"`——没带 Key 请求头，或者 Key 写错了、被撤销了、过期了。
-- `403`，`"code": "FORBIDDEN_SCOPE"`——Key 有效，但没有任何平台读权限。
+- `403`，`"code": "FORBIDDEN_SCOPE"`——Key 有效，但没有 MCP 接受的平台、媒体或转写权限。
 - `307`——末尾的斜杠掉了。
 - `200` 且返回控制台的 HTML——你连的根本不是这个 API，或者中间的反向代理没有把 `/mcp/` 透传过去。
 
@@ -408,8 +449,8 @@ curl -sS -X POST http://127.0.0.1:8000/mcp/ \
 | 客户端报连接或认证错误，服务端日志里什么都没有 | 少了末尾斜杠；客户端在 307 之后没有重发 POST | 配置成 `/mcp/`，带上斜杠 |
 | 在服务器上能用，从笔记本上不行 | 客户端配置里写的是 `127.0.0.1`。默认 compose 只把 API 发布在回环地址上 | 给客户端一个它访问得到的地址，并且在此之前给实例挂上 TLS——见[安全](./15-security.md) |
 | 明明控制台已登录，却报 `401 UNAUTHENTICATED` | 这里不接受会话 Cookie | 创建一个 API Key，用请求头传 |
-| 连接时就报 `403 FORBIDDEN_SCOPE` | Key 没有 `douyin:read`、`tiktok:read` 或 `admin` | 重新签发一个带平台读权限的 Key |
-| 只有部分调用报 `FORBIDDEN_SCOPE` | Key 只有一个平台的权限，而代理要的是另一个 | 补上第二个权限范围，或者约束代理的行为 |
+| 连接时就报 `403 FORBIDDEN_SCOPE` | Key 没有 MCP 接受的平台、媒体或转写权限 | 按要使用的工具重新签发带对应权限的 Key |
+| 只有部分调用报 `FORBIDDEN_SCOPE` | Key 只有一个平台的权限，而代理要的是另一个 | 把那个平台的权限范围也补上，或者约束代理的行为 |
 | 30 秒左右客户端超时，服务端还在干活 | 客户端的 HTTP 超时低于 `api.mcp_tool_timeout` | 调高客户端超时，或调低 `api.mcp_tool_timeout` |
 | 代理在同一个失败调用上死循环 | 它没理会“重试没有用”那句话 | 在系统提示词里要求它先读错误文本再决定是否重试 |
 | 代理把返回 `pending` 的调用又跑了一遍 | 它把 `pending` 当成了失败 | 明确告诉它用 task id 去调 `get_task_result` |
@@ -420,7 +461,7 @@ curl -sS -X POST http://127.0.0.1:8000/mcp/ \
 
 ## 接下来读什么
 
-- [REST API 指南](./11-api.md)——完整接口，包括八个工具刻意不覆盖的部分。
+- [REST API 指南](./11-api.md)——MCP 聚焦工具集之外的完整接口。
 - [用户与 API 密钥](./09-users-and-api-keys.md)——代理所用 Key 的创建、授权、限流与撤销。
 - [核心概念](./04-concepts.md)——`pool_status` 所报告的身份池、调度器和熔断器。
 - [运维](./10-operations.md)——在请求日志里找到代理发起的调用，读懂接口健康看板。

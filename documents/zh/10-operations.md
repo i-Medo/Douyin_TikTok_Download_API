@@ -1,7 +1,7 @@
 # 运维
 
 > **[Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)** ——
-> 自部署的抖音 / TikTok 数据接口服务：REST、MCP 和 Web 控制台，身份池自维护。
+> 自部署的抖音 / TikTok / B 站数据接口服务：REST、MCP 和 Web 控制台，身份池自维护。
 > [文档首页](../README.zh-CN.md) · [English](../en/10-operations.md)
 
 这一页讲的是上线之后的日子：怎样让一个实例在几个月里不用人盯着也保持健康。读完之后你会知道后台循环在做什么、改一个设置多久才会生效、怎么做备份和恢复（以及怎么证明恢复真的有效）、告警是怎么接的、哪些数据会在什么时候被清理、该盯哪些指标，以及怎样升级才不会丢东西。
@@ -47,7 +47,9 @@ docker compose -p dtk -f docker/compose.yml ps
 
 ## 设置页，以及一次修改何时生效
 
-运行时配置存在数据库里，不在 `.env` 里。控制台页面是 `/settings`，按 key 前缀分组：signing、cache、snapshot、archive、media、watchlist、capacity、retention、api、security、notify、system，前缀不在列表里的归到 `other`。调度器和身份池相关的 key（`sched.*`、`pool.*`）刻意不在这里——它们在 `/scheduler` 页面，和它们作用的那个池放在一起。
+运行时配置存在数据库里，不在 `.env` 里。控制台页面是 `/settings`，按 key 前缀分组：signing、cache、snapshot、archive、media、watchlist、capacity、retention、demo、api、security、notify、system，前缀不在列表里的归到 `other`。调度器和身份池相关的 key（`sched.*`、`pool.*`）刻意不在这里——它们在 `/scheduler` 页面，和它们作用的那个池放在一起，每个平台的低水位和目标值在那里作为一张表格统一编辑。
+
+搜索框按 key 和说明文字筛选，**只看已覆盖的** 则只留下数据库覆盖的那些行。有几个 key 仍留在各自的分组里，但不在这里编辑，而是指向真正编辑它的地方：`demo.enabled` 指向本页顶部的演示模式卡片，`notify.*` 指向通知页，`api.public_endpoints` 指向接口访问控制页，`system.check_updates` 指向系统信息页。对这几个 key，通用的行编辑器不只是多余，而是会出错：用一个普通开关切换 `demo.enabled`，会把唯一一次带回演示账号密码和 Key 的响应扔掉；`notify.channels` 是一个对象列表，以前会显示成 `[object Object]`，保存时还会原样写回去，盖掉所有渠道。其他由对象组成的列表值一律只读显示。角色用不了的保存、取消和重置按钮根本不会画出来。
 
 每一行都会标明**来源**，这是这个页面上最有用的一件事：
 
@@ -305,11 +307,11 @@ rm drill.tar.gz
 
 只有真正送达了某个人的告警才会占住窗口。如果所有渠道都拒绝了这条告警，标记会被释放，下一次发生时会重新尝试——否则一次被拒的连接就能换来长达一天的沉默。
 
-**给渠道缩小事件范围有个尖锐的坑。** 默认情况下一个渠道接收所有事件，这是通过*不写*事件列表来表示的。控制台的勾选框只列出上表中的前七个事件，三个磁盘相关事件（`capacity_warning`、`capacity_paused`、`media_evicted`）不在其中。所以你只要取消勾选任意一项，这个渠道就会被存成一个显式列表，而这个列表里不可能包含那三个磁盘事件，于是它就再也收不到它们了。如果你要磁盘告警，请至少让一个渠道保持全部勾选。
+**给渠道缩小事件范围。** 默认情况下一个渠道接收所有事件，这是通过*不写*事件列表来表示的——所以以后版本新增的事件也会发给它。控制台的勾选框列出了上表全部十个事件。取消勾选一项，这个渠道就会被存成一个显式列表；把所有框重新勾上，它又回到「全部事件」。最后一个勾选的框取消不掉，因为空列表的意思是全部：想让它安静，就把这个渠道停用。控制台不认识的事件名会按原样保留，并显示在编辑框里。以前的控制台只列出前七个，而且保存任何一个渠道时都会把其余的事件名丢掉，于是一个只订阅了磁盘事件的渠道会悄悄变回接收全部——升级之后值得把缩小过范围的渠道检查一遍。
 
 ## 测试渠道
 
-`/notifications` 页头有**发送测试告警**（所有渠道），每一行还有一个**测试**按钮（该渠道）。需要 operator 及以上角色。
+`/notifications` 页头有**发送测试告警**（所有渠道），每一行还有一个**测试**按钮（该渠道）。需要 operator 及以上角色；`viewer` 看不到这些按钮，也看不到添加、编辑和删除渠道的按钮。
 
 测试完全不走去重窗口——既不占用也不读取——所以按两次就会发两次，而且用测试验证渠道不会消耗真实告警的抑制窗口。测试正文里会写明发到了哪个渠道，这样你拿着两部手机也能分清是哪一个。
 
@@ -370,10 +372,10 @@ rm drill.tar.gz
 | --- | --- | --- |
 | 存活 | `GET /healthz` | `200`，`{"status":"ok","uptime_seconds":…}`。刻意不碰任何依赖：一个会查数据库的存活探针，会把数据库的短暂抖动变成一场重启风暴。 |
 | 就绪 | `GET /readyz` | `200`，且 `postgres` 与 `redis` 均为 `ok`；否则 `503`。浏览器 RPC 被刻意排除在外——铸造不在请求路径上，没有它的实例是降级，不是未就绪。 |
-| 实例状态 | `GET /api/v1/system/status`、控制台 `/system` | 各组件可达且延迟正常；Chromium 主版本与 wreq profile 主版本一致；`settings_version` 与预期相符。 |
+| 实例状态 | `GET /api/v1/system/status`、控制台 `/system` | 各组件可达且延迟正常——启用了 profile 的话，下载器和转写服务也算在内；Chromium 主版本与 wreq profile 主版本一致；`settings_version` 与预期相符。 |
 | 接口健康 | `GET /api/v1/admin/endpoints/health`、控制台「总览」 | 所有接口 `circuit_open: false`；风控率远低于 `sched.circuit_risk_threshold`（0.6）。 |
 | 流量构成 | `GET /api/v1/admin/metrics/timeseries`、控制台「总览」 | 绝大多数是 `ok`；`risk_control` 很少见，且不集中在某一个接口上。 |
-| 池水位 | 控制台 `/identities`、`/system` | 你在用的每个平台，active 身份数不低于 `pool.min_size`（3）。 |
+| 池水位 | 控制台 `/scheduler`、`/identities`、总览 | 你在用的每个平台，身份数不低于该平台的低水位（`pool.min_size`，默认 3，平台单独设置过的以它为准）。看调度器页面上每个平台的「可调度」数：它是 active 数减去保留身份——保留身份只服务点名要它的请求，不算容量。 |
 | 磁盘 | 控制台 `/system`、`capacity_*` 告警 | 低于 `capacity.warn_percent`。 |
 | 后台循环 | `worker` 日志 | 每约 5 分钟一条 `worker.maintenance.done`；没有反复出现的 `worker.loop.failed`。 |
 | 备份 | 控制台 `/backup` | 存在一份在你的备份周期内的归档，且密钥校验显示 `当前密钥`。 |
@@ -386,9 +388,9 @@ curl -fsS http://127.0.0.1:8000/readyz
 docker compose -p dtk -f docker/compose.yml ps
 ```
 
-控制台的「日志」页面（`/logs`）有两个标签页：请求日志，可按 request id、接口、结果和时间范围检索；以及审计记录——谁改了什么，单独存表，这样它永远不会被普通流量淹没。设置变更、备份与恢复请求、告警测试和自检都会留下审计记录。
+控制台的「日志」页面（`/logs`）有两个标签页：请求日志，可按 request id、接口、身份、代理、结果和时间范围检索；以及审计记录——谁改了什么，单独存表，这样它永远不会被普通流量淹没。ID、接口和账号这几个筛选条件都保存在地址里（`/logs?tab=requests&proxy_id=…`、`/logs?tab=audit&user_id=…`），所以筛好的视图就是一个可以收藏、也可以发给别人的链接。设置变更、备份与恢复请求、告警测试和自检都会留下审计记录。
 
-想做一次覆盖出网、代理、签名和端到端请求的结构化自检，可以运行诊断——在控制台 `/diagnose`，或者：
+想做一次覆盖各组件（配置了的话，包括下载器和转写服务）、三个平台的出网、代理、签名和端到端请求的结构化自检，可以运行诊断——在控制台 `/diagnose`，端到端那一步可以选平台，默认用这个实例服务得最多的那个；或者：
 
 ```bash
 docker compose -p dtk -f docker/compose.yml exec api dtk diagnose
@@ -407,9 +409,16 @@ docker compose -p dtk -f docker/compose.yml exec api \
 docker compose -p dtk -f docker/compose.yml exec api \
   dtk backup list --dir /var/lib/dtk/backups
 
-# 2. 拉取、重建、重启。
+# 2. 升级。用脚本装的，这一步就是全部——它在迁移之前还会自己做一份备份：
+./dtkctl upgrade
+#    手工：更新代码，然后带上你在用的 --profile 参数拉取（已发布镜像）
+#    或构建（源码），再重启。
+#    脚本装的代码停在 Release 的 tag 上而不是某个分支上，那里要用：
+#    git fetch origin tag v5.1.7 && git checkout --detach v5.1.7
 git pull
-docker compose -p dtk -f docker/compose.yml build
+export COMPOSE_ENV_FILES=.env
+docker compose -p dtk -f docker/compose.yml pull api worker   # 或者：build
+docker compose -p dtk -f docker/compose.yml build browser-rpc # 开了 --profile browser 时
 docker compose -p dtk -f docker/compose.yml up -d --wait
 
 # 3. 确认。
@@ -422,9 +431,10 @@ docker compose -p dtk -f docker/compose.yml logs --tail 50 migrate
 升级之前值得知道的几点：
 
 - **不要改 `DTK_SECRET_KEY`。** 改了它，所有已存的 Cookie 罐和代理 URL 都无法解密，所有现有归档也都无法恢复。如果必须轮换，就退休受影响的身份，然后重新导入或重新铸造。
-- **回滚靠 tag，不靠数据库。** 迁移只向前走，本文不提供降级路径。如果某个版本有问题，检出上一个 tag、重建，然后用第 1 步的备份恢复——恢复到空数据库里，因为恢复是补齐而不是回退。
-- **`build` 和 `up` 只作用于当前激活 profile 里的服务。** 如果你的部署带了 `--profile browser` 或 `--profile downloader`，这两条命令都要把 profile 参数重复带上。compose 读的是文件而不是正在运行的栈，不带参数时没有任何东西会重建 `browser-rpc` 和 `downloader`：它们会继续跑旧镜像，而 `api` 和 `worker` 已经往前走了，并且不会有任何提示。完整的 profile 参数见[安装与部署](./02-installation.md)。
-- **浏览器镜像是刻意钉死的。** `CLOAKBROWSER_COMMIT` 是构建参数，和发布地址一样走 compose 插值：它从 `docker/.env` 或你的 shell 读取，而不是根目录的 `.env`。重建浏览器镜像时在命令行里传给它，或者用 `COMPOSE_ENV_FILES=.env` 让 compose 去读根目录那个文件。它精确指向某一个 revision；有好几个互不相关的仓库都发布着描述雷同的 "cloakbrowser" 项目，浮动 tag 并不能标识任何一份具体的软件。要改就有意识地改，改完重新验证签名。
+- **脚本装的实例，版本号不用你改。** `./dtkctl upgrade` 先把代码切到那个 Release 的 tag，等新镜像已经到本机、迁移也跑完了，才把 `DTK_IMAGE_TAG` 写进 `.env`，绝不提前。重启之前任何一步失败——或者按了 Ctrl-C——代码和 `.env` 都会放回原样，正在跑的版本照样在跑，它也会明说放回了。迁移之前，只要 API 跑着，它会用 `dtk backup create` 往备份卷里做一份备份；备份失败升级就停下，`./dtkctl upgrade 5.1.7 --no-backup` 可以跳过它。手工部署的，`DTK_IMAGE_TAG=latest` 不用改；钉了版本的，拉之前先在 `.env` 里改掉。
+- **回滚靠 tag，不靠数据库。** 迁移只向前走，本文不提供降级路径。如果某个版本有问题，回到上一个版本——`./dtkctl upgrade 5.1.5`，或者手工改回旧的 pin。这只在上一个版本认得数据库做过的每一次迁移时才行：`./dtkctl upgrade` 会先查，不认得的话在拉任何东西之前就拒绝。越过了这样一次迁移，回去的路就是新装一份上一个版本（`DTK_VERSION=5.1.5`），再把第 1 步那份在它运行时做的备份恢复进去——用同一个 `DTK_SECRET_KEY`，和[一次恢复演练](#一次恢复演练)里一样——因为恢复是补齐而不是回退。
+- **`build`、`pull` 和 `up` 只作用于当前激活 profile 里的服务。** 如果你的部署带了 `--profile browser`、`--profile downloader` 或 `--profile transcriber`，每条命令都要把 profile 参数重复带上，拉取时还要点名 `downloader` 和 `transcriber`。compose 读的是文件而不是正在运行的栈，不带参数时没有任何东西会更新 `browser-rpc`、`downloader` 和 `transcriber`：它们会继续跑旧镜像，而 `api` 和 `worker` 已经往前走了，并且不会有任何提示。完整的 profile 参数见[安装与部署](./02-installation.md)。
+- **浏览器镜像是刻意钉死的。** `CLOAKBROWSER_COMMIT` 是构建参数，`docker/compose.yml` 把它默认成这份代码的浏览器依赖验证时用的那个 revision，所以这个 pin 随 `git pull` 一起变；变了的话，重建浏览器镜像要下载新的 Chromium，得花上几分钟。它精确指向某一个 revision；有好几个互不相关的仓库都发布着描述雷同的 "cloakbrowser" 项目，浮动 tag 并不能标识任何一份具体的软件。要换别的就有意识地设，改完重新验证签名——它和发布地址一样走 compose 插值：从 `docker/.env` 或你的 shell 读取，而不是根目录的 `.env`，除非像上面那样用 `COMPOSE_ENV_FILES=.env` 让 compose 去读根目录那个文件。这样设的值不会跟着代码走：`./dtkctl upgrade` 会拿掉本项目自己写进 `.env` 的那种，对你自己选的给出警告；手工部署的，把从旧 `.env.example` 抄来的那一行删掉。镜像本身每次升级都要重建，因为它的代码来自这份代码目录。
 - **升级后留意版本漂移**：`/system` 上产出签名的 Chromium 主版本，和重放指纹的 wreq TLS profile 主版本必须一致。
 - **扩容靠加 worker，不靠改间隔**：`docker compose -p dtk -f docker/compose.yml up -d --scale worker=4`。
 
@@ -436,12 +446,15 @@ docker compose -p dtk -f docker/compose.yml logs --tail 50 migrate
 
 | 接口 | 突发 | 补充速率 | 每身份 |
 | --- | --- | --- | --- |
-| `*.content_detail` | 5 | 0.30/s | 18 次/分钟 |
-| `*.author_profile` | 4 | 0.20/s | 12 次/分钟 |
-| `*.comments`、`*.comment_replies`、`*.mix_posts` | 3 | 0.15/s | 9 次/分钟 |
-| `*.author_posts`、`*.author_likes`、`tiktok.author_followers`、`tiktok.author_following` | 3 | 0.12/s | 7.2 次/分钟 |
+| `*.content_detail`、`bilibili.content_streams` | 5 | 0.30/s | 18 次/分钟 |
+| `*.author_profile`、`*.related_posts`、`*.music_detail`、`*.hashtag_detail`、`*.live_room`、`*.live_room_by_id`、`*.live_status`、`*.trending`、`bilibili.live_streams` | 4 | 0.20/s | 12 次/分钟 |
+| `*.comments`、`*.comment_replies`、`*.mix_posts`、`*.author_mixes`、`*.music_posts`、`tiktok.hashtag_posts`、`douyin.live_ranking` | 3 | 0.15/s | 9 次/分钟 |
+| `douyin.author_posts`、`tiktok.author_posts`、`*.author_likes`、`tiktok.author_followers`、`tiktok.author_following` | 3 | 0.12/s | 7.2 次/分钟 |
+| `bilibili.author_posts`、`*.search_posts`、`*.search_authors` | 2 | 0.08/s | 4.8 次/分钟 |
 | `*.session_check` | 3 | 0.20/s | 12 次/分钟 |
 | 未注册的接口 | 3 | 0.15/s | 9 次/分钟 |
+
+表里那两行 B 站是有原因的。一次 B 站视频详情是两个上游请求——先是详情，再是 `bilibili.content_streams`，取详情里没有的那个可播放文件——所以它会从两个桶里各花一个令牌；第二个桶和详情同速，详情就不会被它拖住。`bilibili.author_posts` 也就是 UP 主投稿列表，是表里最慢的桶，因为它是 B 站守得最严的接口：同一个出口的一阵突发请求，会换来持续几分钟的 HTTP 412 页面——见[故障排查](./14-troubleshooting.md#b-站-up-主投稿列表返回-http-412)。
 
 于是：
 

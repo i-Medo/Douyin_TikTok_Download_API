@@ -1,8 +1,8 @@
 # FAQ and glossary
 
 > **[Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)** —
-> a self-hosted Douyin and TikTok data API: REST, MCP and a web console, with
-> an identity pool that maintains itself.
+> a self-hosted Douyin, TikTok and Bilibili data API: REST, MCP and a web
+> console, with an identity pool that maintains itself.
 > [All docs](../README.md) · [中文](../zh/17-faq.md)
 
 This page answers the questions people ask before and just after they deploy this
@@ -23,8 +23,8 @@ advice. What can be said precisely is what the software does and where the
 responsibility sits.
 
 This is a client. It runs on your machine, under your account, and makes requests
-to Douyin and TikTok as a browser would. It publishes nothing, it is not a
-service anyone else can use unless you open it, and it ships with every endpoint
+to Douyin, TikTok and Bilibili as a browser would. It publishes nothing, it is not
+a service anyone else can use unless you open it, and it ships with every endpoint
 requiring a credential (`api.public_endpoints` is empty by default). Nothing is
 uploaded anywhere.
 
@@ -32,7 +32,7 @@ That means the whole of the responsibility is yours. Concretely:
 
 | Your responsibility | What it means in practice |
 | --- | --- |
-| The platforms' terms of service | Douyin and TikTok each have their own. Automated collection is generally against them. Nobody in this project can waive that for you. |
+| The platforms' terms of service | Douyin, TikTok and Bilibili each have their own. Automated collection is generally against them. Nobody in this project can waive that for you. |
 | Local law | Data protection law where you are may apply to what you archive: an archived post carries another person's name, avatar, text and images. Some jurisdictions treat that as personal data regardless of it being public. |
 | Redistribution | Downloading a video does not make it yours. The archive and the media volume are for you; publishing what is in them is a separate act with separate consequences. |
 | Not using it against people | Following, snapshotting and re-collecting one person on a timer is a capability this software gives you. Whether that is research or harassment is decided by you, not by the tool. |
@@ -66,8 +66,8 @@ What the licence asks in return:
 Two things this licence does **not** do, and both matter here:
 
 - **It is not permission from the platforms.** Apache-2.0 is a grant from the
-  author over the author's code. It says nothing about Douyin's or TikTok's
-  terms, and it cannot.
+  author over the author's code. It says nothing about Douyin's, TikTok's or
+  Bilibili's terms, and it cannot.
 - **It is not a support contract.** Nobody owes you an answer; see "Getting
   help, reporting a bug and sponsoring" below for what does work.
 
@@ -86,24 +86,49 @@ No, and the default configuration never asks for one.
 The instance maintains its own pool of **guest identities**: a headless browser
 loads the platform through a proxy you configured, lets the platform issue its
 own cookies to that session, and records the fingerprint the browser actually
-presented. `ttwid` is the only cookie this build refuses to work without, and a
-platform hands it to any visitor. No login is involved anywhere in that path.
+presented. On Douyin and TikTok, `ttwid` is the only cookie this build refuses
+to work without, and the platform hands it to any visitor. Bilibili guests need
+no browser at all: one plain HTTP request to the site's `/x/frontend/finger/spi`,
+sent through the identity's proxy, hands out `buvid3` and `buvid4`, and `buvid3`
+is what a Bilibili jar needs. No login is involved anywhere in either path.
 
 There are exactly two situations where your own cookies come into it:
 
 - **You are running without the `browser` profile.** No browser container means
-  no minting, so the pool lives on jars you paste in. That jar can come from a
-  **signed-out** browser window and still work — it will carry `ttwid`, and
+  no Douyin or TikTok minting (Bilibili guests are still minted), so those pools
+  live on jars you paste in. That jar can come from a **signed-out** browser
+  window and still work — it will carry `ttwid`, and
   usually `s_v_web_id`, `odin_tt` and `msToken` too, which is a perfectly good
   guest identity. Import it from the console's Identities page or with
   `POST /api/v1/admin/identities/import`.
-- **You want content that is only visible to a logged-in account** — your own
-  private posts, a following list, anything the platform gates. Then you import
-  that account's jar, and every request that needs it has to be *pinned* to that
-  identity, because an answer served from a substitute session would not be the
-  answer you asked for.
+- **You want what a guest is not given.** That comes in two kinds:
+  - Endpoints that give a guest less: a Douyin author's posts (a guest's first
+    page lacks the newest few, and there is no second page for it), a Bilibili
+    video's comments beyond the three hottest, replies to a Bilibili comment
+    past their first page, and a Douyin author's likes, which a guest is never
+    shown even when they are public. Import a logged-in jar and the scheduler sends
+    those requests to it by itself - nothing has to name it, and with guests
+    first on (the default) every other request stays with the guests.
+  - What belongs to that one account: its bookmarks, its bookmark folders on
+    Douyin, its own private posts. Those requests have to be *pinned* to the
+    identity, because an answer served from a substitute session would not be
+    the answer you asked for.
 
 See [Identities and proxies](./06-identities-and-proxies.md) for both flows.
+
+### I imported a login. Why is it never used?
+
+Most likely because nothing asked for what only it can answer. **Guests first**
+(`pool.<platform>.guests_first`, on by default) sends a request that a guest
+answers as fully as a login to the guests, and reaches a login there only when
+every guest is busy; the login is spent on the endpoints that give a guest less. That
+is the point: a guest costs a mint, a login costs somebody's account.
+
+If those endpoints *are* being called and it still sits idle, it is probably
+reserved for requests that name it, limited to other endpoints, cooling, or
+signed out. [An imported login sits idle](./14-troubleshooting.md#an-imported-login-sits-idle)
+goes through them, and how to turn guests first off if you would rather the
+login shared everything.
 
 ### Will my account be banned?
 
@@ -123,6 +148,9 @@ project is explicit about it in the import dialog:
   `identity:manage` scope, and writes an audit line — but an administrator of
   your instance can use it.
 - **Use an account kept for this purpose, never your main one.**
+- **A ban is unlikely, not impossible.** Platforms rarely ban an account for
+  reading data with it, but it cannot be ruled out, and a login imported here
+  is used at your own risk.
 
 What the software does to keep any identity out of trouble, guest or not:
 
@@ -134,11 +162,11 @@ What the software does to keep any identity out of trouble, guest or not:
 | Never recombining the parts | A cookie jar is never moved to a different proxy or paired with a different User-Agent. Rotating cookies over one exit address is a louder signal than plain request frequency. |
 | Circuit breaker | When an endpoint is failing across several identities, requests to it stop rather than burning the rest of the pool. |
 
-None of that is a guarantee. Neither platform publishes its rules, both change
-them, and any tool claiming your account is safe is guessing. The honest summary:
-guest identities are cheap and designed to be burnt; a logged-in identity is
-not, so use a throwaway account, give it its own proxy, and watch the Identities
-page for cooldowns.
+None of that is a guarantee. None of the platforms publishes its rules, all of
+them change them, and any tool claiming your account is safe is guessing. The
+honest summary: guest identities are cheap and designed to be burnt; a logged-in
+identity is not, so use a throwaway account, give it its own proxy, and watch the
+Identities page for cooldowns.
 
 ### Somebody else has an account on my instance — can they use my imported jar?
 
@@ -183,45 +211,53 @@ The filler starts topping up when the usable count drops below the minimum and
 stops at the target, so a healthy pool sits between them rather than being
 re-triggered every minute.
 
-Each platform can have its own pair: `pool.douyin.min_size` / `target_size` and
-`pool.tiktok.min_size` / `target_size`, which follow the global ones while they
-are `-1`. If you only use one platform, set the other one's `min_size` to `0`
-(or turn its **Auto** switch off on the Identities page) and it will not be
-minted for or alerted on at all.
+Each platform can have its own pair: `pool.douyin.min_size` / `target_size`,
+`pool.tiktok.min_size` / `target_size` and `pool.bilibili.min_size` /
+`target_size`, which follow the global ones while they are `-1`. If you do not
+use a platform, set its `min_size` to `0` (or turn its **Auto** switch off on the
+Identities page) and it will not be minted for or alerted on at all.
 
 What an identity is actually worth is set by the token bucket, which is per
 (identity, endpoint):
 
 | Endpoint | Burst | Refill | Sustained, one identity | Sustained, 8 identities |
 | --- | --- | --- | --- | --- |
-| `*.content_detail` | 5 | 0.30/s | 1 per 3.3s | ~2.4/s |
-| `*.author_profile` | 4 | 0.20/s | 1 per 5s | ~1.6/s |
-| `*.comments`, `*.comment_replies`, `*.mix_posts` | 3 | 0.15/s | 1 per 6.7s | ~1.2/s |
-| `*.author_posts`, `*.author_likes` | 3 | 0.12/s | 1 per 8.3s | ~1/s |
+| `*.content_detail`, `bilibili.content_streams` | 5 | 0.30/s | 1 per 3.3s | ~2.4/s |
+| `*.author_profile`, `*.related_posts`, `*.music_detail`, `*.hashtag_detail`, `*.live_room`, `*.live_room_by_id`, `*.live_status`, `*.trending`, `bilibili.live_streams` | 4 | 0.20/s | 1 per 5s | ~1.6/s |
+| `*.comments`, `*.comment_replies`, `*.mix_posts`, `*.author_mixes`, `*.music_posts`, `tiktok.hashtag_posts`, `douyin.live_ranking` | 3 | 0.15/s | 1 per 6.7s | ~1.2/s |
+| `douyin.author_posts`, `tiktok.author_posts`, `*.author_likes` | 3 | 0.12/s | 1 per 8.3s | ~1/s |
 | `tiktok.author_followers`, `tiktok.author_following` | 3 | 0.12/s | 1 per 8.3s | ~1/s |
+| `bilibili.author_posts`, `*.search_posts`, `*.search_authors` | 2 | 0.08/s | 1 per 12.5s | ~0.6/s |
 | anything unregistered | 3 | 0.15/s | 1 per 6.7s | ~1.2/s |
 
 Those right-hand figures are ceilings under perfect spread, not promises: an
 identity also holds an exclusive lock for the duration of each request, so a slow
-upstream lowers them.
+upstream lowers them. A Bilibili video detail spends a token from both of the
+first row's buckets, because the playable file is a second request,
+`bilibili.content_streams`. Bilibili's uploader video list, `bilibili.author_posts`,
+has the slowest bucket of all on purpose: it is the endpoint Bilibili guards
+hardest (see
+[Troubleshooting](./14-troubleshooting.md#http-412-on-a-bilibili-uploaders-video-list)).
 
 Work backwards from what you actually need. If you parse a few dozen links a day,
 the defaults are already generous and you can drop `pool.target_size`. If you are
 walking an author's whole feed, `author_posts` at one request per 8.3 seconds per
-identity is your real constraint, and the only way to go faster is more
-identities — which means more proxies. Raising the bucket is not the knob; it is
-the thing protecting the identities you have.
+identity (slower still on Bilibili) is your real constraint, and the only way to
+go faster is more identities — which means more proxies. Raising the bucket is
+not the knob; it is the thing protecting the identities you have.
 
 ### Why is the pool taking so long to fill?
 
 By design. The filler mints **at most one identity per tick**, a tick is 60
 seconds, and that one mint is shared across platforms rather than granted to each
 of them: every tick picks the single neediest pool. A deployment starting from
-empty therefore needs roughly 16 ticks — about a quarter of an hour — before both
-pools sit at a target of 8, plus however long each mint takes. It holds a
+empty therefore needs roughly 8 ticks per pool — about 24 minutes before all three
+pools sit at a target of 8 — plus however long each mint takes. It holds a
 cross-process Redis lock while minting so `--scale worker=N` cannot turn one mint
 into N, and it backs off exponentially when minting keeps failing (60s doubling
-to a 3600s ceiling).
+to a 3600s ceiling), separately for each minting route — the browser for Douyin
+and TikTok, plain HTTP for Bilibili — so a browser container that is down does
+not stop Bilibili refilling.
 
 Five fresh visitors appearing from one deployment inside a second is itself a
 stronger signal than anything those identities would go on to do. Nothing waits
@@ -237,16 +273,33 @@ is burning the others.
 
 ### Does it support Bilibili, Xiaohongshu, Kuaishou or Weibo?
 
-No. v5 supports two platforms, `douyin` and `tiktok`, and that is the whole of
-the `Platform` enum in `src/dtk/core/types.py`.
+Bilibili, yes, since 5.1.6. The others, no. v5 supports three platforms,
+`douyin`, `tiktok` and `bilibili`, and that is the whole of the `Platform` enum
+in `src/dtk/core/types.py`.
 
-V4 did support Bilibili. v5 dropped it rather than
-carrying it forward, because a platform in v5 is a much larger commitment than a
-crawler file: it needs its own signature implementation, its own parameter
-builders, its own parser producing the shared normalized model, its own endpoint
-policies for the token bucket, and its own entries in the outcome classifier.
-Half a platform — one that fetches but whose failures are misclassified — would
-poison the health data every other platform depends on.
+On Bilibili the instance serves one video, its comments and their replies, an
+author's profile and uploaded videos, the author's public favourites folders, the
+videos in one folder, the parts of a video uploaded in several (each one
+downloadable on its own), and the site's popular boards - what is hot now, the
+weekly selection, the all-time picks and the top 100 - plus an author's seasons
+and the videos in one, the videos recommended beside one, video and uploader
+search, live rooms and the hot search; `POST /api/v1/parse` recognises Bilibili links,
+including `b23.tv` short links and live rooms. An author's likes, reposts, bookmarks, followers
+and following, a collection's detail (`collection`), sounds and hashtags are
+not served there, and answer `UNSUPPORTED_CONTENT` naming the platform and the
+capability. The international site `bilibili.tv` is a different service and is
+not supported. Ids, endpoints and what a guest identity gets are in the
+[REST API guide](./11-api.md#bilibili).
+
+V4 supported Bilibili too, but v5 shares no code with V4, so nothing was carried
+forward: Bilibili had to arrive as a v5 platform in its own right. That is a much
+larger commitment than a crawler file: a platform needs its own signature
+implementation, its own parameter builders, its own parser producing the shared
+normalized model, its own endpoint policies for the token bucket, and its own
+entries in the outcome classifier. Half a platform — one that fetches but whose
+failures are misclassified — would poison the health data every other platform
+depends on. The same reasoning is why Xiaohongshu, Kuaishou and Weibo are not
+here.
 
 If you want to add one, [Contributing](./16-contributing.md) describes what the
 work involves.
@@ -265,12 +318,32 @@ To be exact about what that means: nothing here removes a watermark. It selects
 the stream the platform already publishes without one. If a post has only a
 watermarked stream, that is what you get.
 
+### Does it get the video behind a live photo?
+
+Yes, on Douyin. A post of live photos is an image album whose slides each carry
+a few seconds of MP4, and the normalized answer puts that clip on the slide
+itself, as `media.images[i].video` - the same shape as `media.video`, with its
+mirrors in `urls`. A slide that is an ordinary still has `video: null`, and one
+album can mix the two. Before 5.1.6 the clips were only in the raw payload, so
+`include_raw` was the way to them.
+
+A download stores each clip beside its still under the same name
+(`image-01.webp` and `image-01.mp4`), and the drawer of the Downloads page's
+**Many posts** mode plays it in place of the still and offers it as its own
+download. On TikTok a photo post's slides are parsed as stills only.
+
 ### What can it actually fetch?
 
-A link, a share message with text around it, a short link, or a bare post id, for
-either platform — plus author profiles, an author's posts and likes, comments and
-their replies, mixes/collections, and on TikTok followers and following. The
-Playground page and the REST API expose the same set. See
+A link, a share message with text around it, a short link, or a bare post id, on
+any of the three platforms — plus author profiles, an author's posts, comments and
+their replies, and collections (on Bilibili, an author's public favourites
+folders). Douyin and TikTok add an author's likes, sounds and hashtags - Douyin
+shows likes only to a logged-in identity - and TikTok followers and following and
+the posts under a hashtag; Bilibili serves none of those, and adds instead a
+video's parts and the site's popular boards. All three serve an author's own
+series, the posts recommended beside one and live rooms; TikTok and Bilibili
+search, and Douyin and Bilibili serve a trending board. The Playground page and the REST
+API expose the same set. See
 [Playground and tools](./07-playground-and-tools.md) and the
 [REST API guide](./11-api.md) for the full list, and
 [Concepts](./04-concepts.md) for why some of them cost more identity budget than
@@ -310,6 +383,16 @@ When the downloader *is* enabled, files land on a Docker volume as
 `<platform>/<author>/<content id>/` with a `meta.json` beside them, and the API
 can hand one back to a browser from `GET /api/v1/downloads/{download_id}/files/{name}`
 with the `media:read` scope.
+
+### Why does a download show only "1/2 files" and no progress bar?
+
+Because the downloader is older than the API. The byte counts behind the bar,
+the speed and the time left come from the 5.1.6 downloader image; an older one
+reports a file's size only once it has finished. The same mismatch leaves
+Bilibili videos that a CDN edge cut short ending `partial`, which the 5.1.6
+downloader resumes instead. It is a separate image, so an upgrade has to pull or
+build `downloader` too - see
+[Progress counts only files, or a Bilibili video lands empty](./14-troubleshooting.md#progress-counts-only-files-or-a-bilibili-video-lands-empty).
 
 ### How much disk does it need?
 
@@ -356,9 +439,10 @@ it is capped at 4 GiB and 4 CPUs in the compose file and was measured warm at
 1 GB on `/profiles`), which is RAM rather than disk.
 
 So the realistic small-hardware deployment is: core stack only, no `browser`
-profile, identities imported by hand from a browser on your laptop. That is a
-supported mode, not a broken one — `DTK_BROWSER_RPC_URL` unset means the minting
-job is skipped entirely rather than logging an error every minute.
+profile, Douyin and TikTok identities imported by hand from a browser on your
+laptop. That is a supported mode, not a broken one — `DTK_BROWSER_RPC_URL` unset
+means browser minting is skipped rather than logging an error every minute, and
+Bilibili guests, which need no browser, are still minted on their own.
 
 On architecture: nothing in the code is x86-specific, and the one dependency that
 could have been a problem — `wreq`, which does the TLS emulation — publishes
@@ -387,7 +471,7 @@ What the software gives you to work with:
 - Identities are per platform, and each is bound to one egress. Nothing stops you
   from putting your Douyin identities behind exits in one region and your TikTok
   identities behind exits in another — that is the normal configuration for a
-  host that cannot reach both networks equally.
+  host that cannot reach every network equally.
 - A proxy's country and time zone are handed to the minting browser as a hint, so
   the identity's locale matches its exit. `browser-rpc` also probes
   `DTK_BROWSER_GEO_PROBE_URL` (`https://ipinfo.io/json` by default) *through the
@@ -403,11 +487,11 @@ which one fails.
 
 ### Does it phone home?
 
-No, and the places it could have are each an explicit opt-in:
+No. The server makes no such request on its own, and each place one could leave is either off by default or made by your browser:
 
 | Outbound request | Default | Notes |
 | --- | --- | --- |
-| Update check | `system.check_updates` is `false` | Documented as "outbound request; the user opts in rather than being opted in". The console's check runs from **your browser** to the GitHub releases API when you click it, never from the server |
+| Update check | `system.check_updates` is `true` | The console asks the GitHub releases API from **your browser**, once a day after sign-in and when you click "Check now", never from the server, so it carries nothing about the deployment. Turn it off on an air-gapped box |
 | Sponsor logo | Served from your own instance | A 16 KB local copy, so loading the console does not tell a third party that your deployment exists |
 | Geo probe | `ipinfo.io` through the identity's proxy, at mint time | Set `DTK_BROWSER_GEO_PROBE_URL` empty to disable it |
 | Task callbacks | `security.enable_task_webhook` is `false` | And when enabled, the URL must be `https` and must not resolve to a private or loopback address, because a caller-supplied callback URL is a request-forgery vector |
@@ -438,7 +522,7 @@ git clone https://github.com/Evil0ctal/Douyin_TikTok_Download_API.git
 
 | | V4 | v5 |
 | --- | --- | --- |
-| Platforms | Douyin, TikTok, Bilibili | Douyin, TikTok |
+| Platforms | Douyin, TikTok, Bilibili | Douyin, TikTok, Bilibili (since 5.1.6) |
 | Credentials | Cookies pasted into `crawlers/*/config.yaml`, updated by hand when they expired | A pool of identities the instance mints and maintains itself, stored encrypted |
 | Failure behaviour | An expired cookie or changed algorithm failed silently until a user reported it | Per-identity health, per-endpoint circuit breaker, one structured row per request, alerts |
 | Infrastructure | None required | Postgres (with TimescaleDB) and Redis |
@@ -538,14 +622,15 @@ precise definition elsewhere, the linked page has it.
 | Term | What it means |
 | --- | --- |
 | **Identity** | The unit this system schedules: a cookie jar, a browser fingerprint, a proxy binding and a failure history, bound together for the life of the row. Not a cookie — the four parts are never recombined. |
-| **Cookie jar** (or just *jar*) | The platform's own session cookies for one identity, stored encrypted with `DTK_SECRET_KEY`. `ttwid` is the only one this build refuses to work without. |
+| **Cookie jar** (or just *jar*) | The platform's own session cookies for one identity, stored encrypted with `DTK_SECRET_KEY`. On Douyin and TikTok `ttwid` is the only one this build refuses to work without; on Bilibili it is `buvid3`. |
 | **Fingerprint** | What the minting browser reported about itself: browser family and major version, User-Agent, `navigator.platform`, screen geometry, language, time zone, CPU and memory hints. It selects the TLS profile used on the wire and is fed into the signature. |
-| **Minting** | Producing a new identity by driving a real headless browser through the proxy it will be bound to, so the cookies, the fingerprint and the exit all agree. Done by `browser-rpc`, one identity per 60-second tick. |
+| **Minting** | Producing a new identity through the proxy it will be bound to, so the cookies, the fingerprint and the exit all agree. For Douyin and TikTok that means driving a real headless browser in `browser-rpc`; a Bilibili guest needs no browser — one plain HTTP request, made with the instance's own TLS-impersonating transport. One identity per 60-second tick. |
 | **Importing** | The other way to get an identity: paste a cookie jar from your own browser. Four formats are recognized — a `Cookie:` header, a cookie-editor JSON array, Netscape `cookies.txt`, and loose `key=value` lines. |
 | **Egress** | The address a request leaves from: a proxy, or the host's own connection. One identity is bound to one egress for life. |
 | **Guest identity** | An identity with no login on it. Cheap, disposable, and what the pool mints by default. |
-| **Logged-in jar** | An imported identity carrying a real session (`sessionid`, `sid_tt`, `sid_guard`, …). Equivalent to the account's password; use a throwaway account. |
-| **Identity state** | One of `minting`, `active`, `cooling`, `degraded`, `retired`. Only `active` is in normal rotation; `retired` has had its jar wiped and cannot be brought back. |
+| **Logged-in jar** | An imported identity carrying a real session (`sessionid`, `sid_tt`, `sid_guard`, … on Douyin and TikTok; `SESSDATA` on Bilibili). Equivalent to the account's password; use a throwaway account. |
+| **Identity state** | One of `minting`, `active`, `cooling`, `degraded`, `retired`. Rotation draws `active` identities, and `degraded` ones only when no active one is left; `retired` has had its jar wiped and cannot be brought back. |
+| **Guests first** | `pool.<platform>.guests_first`, on by default: on an endpoint that gives a guest the same answer as a login, guests are drawn before logins, and a login only when every guest is busy or out of quota. Endpoints that give a guest less prefer or require a login either way. |
 | **Cooldown** | The rest an identity takes after a risk-control answer: `sched.cooldown_base_seconds` doubled per consecutive failure and multiplied by the endpoint's risk weight, capped at `sched.cooldown_max_seconds`. |
 | **Health score** | `success_rate × (1 − risk_rate) × 0.5^consecutive_fails`, in `[0, 1]`. Multiplied rather than summed so any one factor collapsing drags the whole score down. |
 | **Pinning (an identity)** | Naming the identity a request must go out on. A pin is a pool of one — it never widens on a refusal, skips the response cache in both directions, and gets one transport attempt instead of three. Requires the `operator` role plus the `admin` or `identity:manage` scope (a console session is bounded by role alone). |
@@ -556,16 +641,17 @@ precise definition elsewhere, the linked page has it.
 | --- | --- |
 | **Signing** | Computing the extra query parameters and headers a platform requires before it will answer. Without them a request is refused, or worse, answered with an empty body. |
 | **Native signer** | The platform algorithms reimplemented in pure Python (`src/dtk/signing/native/`). Microseconds per signature, no browser involved. The default (`signing.mode` = `native`). |
-| **Browser signer (`rpc`)** | Signing by running the site's own JavaScript inside `browser-rpc`. Hundreds of milliseconds, but it follows the platform automatically when the algorithm changes. Where to go the day a port goes stale. |
+| **Browser signer (`rpc`)** | Signing by running the site's own JavaScript inside `browser-rpc` — Douyin and TikTok only; Bilibili is never signed this way. Hundreds of milliseconds, but it follows the platform automatically when the algorithm changes. Where to go the day a port goes stale. |
 | **`a_bogus`** | Douyin Web's current signature parameter, produced by its `bdms.js` bundle. It carries browser geometry inside the signed payload, which is why it must be computed with the same fingerprint the request is sent with. |
 | **`X-Bogus`** | The older Douyin/TikTok Web signature. TikTok Web still accepts it, and so do some Douyin endpoints. |
 | **`X-Gnarly`** | One of the four parameters TikTok Web's `webmssdk` appends to every API call — the per-request seal. It is an encrypted blob carrying its own key. |
 | **`X-Dynosaur`** | The companion parameter to `X-Gnarly`: TikTok's environment report about the browser making the call. |
 | **`x-secsdk-web-signature`** | The header Douyin requires on the subset of its API it sign-protects (14 paths, copied from Douyin's own web SDK). Computing it needs the identity's `uifid` cookie. Outside that path list, Douyin's own pages send requests unsigned. |
-| **`msToken`** | A session token both platforms set as a cookie and echo in the query string. TikTok's `X-Dynosaur` and `X-Gnarly` are computed from the identity's own `msToken`, so a jar without one cannot be signed natively. |
-| **`ttwid`** | The visitor id cookie. Required on both platforms; an identity without it is refused. |
+| **`msToken`** | A session token Douyin and TikTok both set as a cookie and echo in the query string. TikTok's `X-Dynosaur` and `X-Gnarly` are computed from the identity's own `msToken`, so a jar without one cannot be signed natively. |
+| **`ttwid`** | The visitor id cookie. Required on Douyin and TikTok; an identity without it is refused. |
 | **`s_v_web_id` / `verifyFp`** | The same value in two places: Douyin's `verifyFp` query parameter is the `s_v_web_id` cookie of whatever browser computed the signature. Sign in one session and send with another's cookies and the two name different visitors. |
 | **Sign-protected path** | A Douyin endpoint that the platform's own SDK signs. The list lives in `src/dtk/signing/protection.py`; everything outside it is sent unsigned by Douyin's own pages too. |
+| **WBI** | Bilibili's signature: `w_rid` plus a `wts` timestamp, computed natively from two public keys the site publishes on its `nav` endpoint. The keys are cached for an hour per process; if a refresh fails, keys up to a day old keep being used. |
 
 ### Scheduling and failure
 
@@ -578,7 +664,7 @@ precise definition elsewhere, the linked page has it.
 | **Circuit breaker** | Per-endpoint. It trips when the risk rate exceeds `sched.circuit_risk_threshold` (0.6) over at least `sched.circuit_min_samples` (20) observations spanning at least `sched.circuit_min_identities` (3) distinct identities in a rolling 300s window. Open for 300s, one probe per 60s. |
 | **Risk control** | The platform refusing *this identity* — a captcha interstitial, a verification envelope, a 429, or a 200 with the payload withheld. It increments the identity's failure streak, applies a cooldown, and counts toward the circuit breaker. Distinct from a business error on purpose: a deleted video must never be counted against a good cookie. |
 | **Outcome** | The classification of one upstream response: `ok`, `business_error`, `risk_control` or `network_error`. Every health number in the system hangs off this one decision. |
-| **Reject reason** | Why the scheduler refused a lease, recorded in `request_log`: `circuit_open`, `no_identity`, `no_token`, `all_inflight`, `pinned_unavailable`, `wait_timeout`. One more value, `queue_full`, is an API-layer refusal raised before a task exists, so it reaches you in the error envelope's `details.reject_reason` and never as a `request_log` row. |
+| **Reject reason** | Why the scheduler refused a lease, recorded in `request_log`: `circuit_open`, `no_identity`, `no_token`, `all_inflight`, `pinned_unavailable`, `no_login`, `wait_timeout`. One more value, `queue_full`, is an API-layer refusal raised before a task exists, so it reaches you in the error envelope's `details.reject_reason` and never as a `request_log` row. |
 | **Coalescing** | When several callers ask for the same thing at once, the first task claims the digest in Redis (90s TTL) and the rest attach to that task instead of queuing their own. A claim left by a task that already failed is dropped rather than joined. |
 | **Response cache** | Keyed on the normalized business parameters, not the raw URL, so two spellings of the same link hit the same entry. A hit costs no identity quota and is still logged. `?refresh=true` skips the read but still writes. |
 
@@ -590,7 +676,7 @@ precise definition elsewhere, the linked page has it.
 | **`request_id`** | The id in `meta.request_id`, also written to `request_log`. Quoting it is what turns a bug report into something someone can look up. |
 | **Task** | A queued unit of work. The data endpoints are asynchronous by default: they answer `202` with a `task_id`, and you poll `/api/v1/tasks/{id}`, pass `?wait=N`, or use a callback. State is `queued → running → done \| failed`. |
 | **`?wait=N`** | Asks the server to hold the connection until the task settles, up to `api.max_wait_seconds` (30). Not finished in time is `202` and the task id — not an error, and nothing was lost. |
-| **Cursor** | An opaque string for the next page of a list. The value underneath is a millisecond publish timestamp on some endpoints and a plain offset on others, on both platforms; the encoded string hides which, so callers never need to know. |
+| **Cursor** | An opaque string for the next page of a list. On Douyin and TikTok the value underneath is a millisecond publish timestamp on some endpoints and a plain offset on others; the encoded string hides which, so callers never need to know. A Bilibili folder's videos page by page number, so that cursor is simply `2`, `3` and so on. |
 | **`raw`** | The platform's untouched payload, kept on every parsed model so new fields can be back-computed later. Excluded from API responses unless asked for, and stored in the archive only when `archive.store_raw` is on. |
 | **Archive** | The record of every post this instance has parsed, as structured rows in Postgres — not files. It is what makes a post deleted upstream still readable here. |
 | **Snapshot** | One observation of a post's or author's counters at a moment in time (`content_snapshots`). A series of them is what turns "1.2M plays" into a growth curve. |
@@ -607,11 +693,11 @@ precise definition elsewhere, the linked page has it.
 | Term | What it means |
 | --- | --- |
 | **Role** | What a console account may do: `demo` < `viewer` < `operator` < `admin`, a ladder rather than a set. `demo` is created by demo mode and sits at the bottom. |
-| **Scope** | What an API key may do: `douyin:read`, `tiktok:read`, `archive:read`, `archive:export`, `media:read`, `media:write`, `identity:manage`, `admin`. A key is bounded by its scopes **even when it belongs to an administrator**. |
+| **Scope** | What an API key may do: `douyin:read`, `tiktok:read`, `bilibili:read`, `archive:read`, `archive:export`, `media:read`, `media:write`, `identity:manage`, `admin`. A key is bounded by its scopes **even when it belongs to an administrator**. |
 | **API key** | The credential a script or agent sends in `X-API-Key` or `Authorization: Bearer`. Shown once at creation; only a prefix and a SHA-256 digest are stored. May carry its own per-minute rate limit, otherwise `api.default_rate_limit_per_min` (120) applies. |
 | **Rate limit** | Abuse protection, never metering and never billing. Its only purpose is stopping one runaway script from draining the identity pool. |
 | **Setup token** | The one-time token printed in the API log on a fresh instance, used to create the first administrator. Lives 24 hours in Redis, survives four wrong attempts — the fifth deletes it — and `/setup` closes for good once an account exists. |
-| **MCP** | Model Context Protocol — how an AI client (Claude Code, Claude Desktop, Codex CLI, …) discovers and calls tools. This instance serves it at `/mcp/` from inside the API process, with 8 read-only tools and no tool that touches a credential. See [MCP and AI agents](./12-mcp.md). |
+| **MCP** | Model Context Protocol — how an AI client (Claude Code, Claude Desktop, Codex CLI, …) discovers and calls tools. This instance serves it at `/mcp/` from inside the API process, with 10 tools — two of them, `download_media` and `transcribe_video`, write to this instance and need write scopes — and no tool that touches a credential. See [MCP and AI agents](./12-mcp.md). |
 | **`explain`** | An option on a fetch that hands back the request exactly as it went out — signed URL, headers and jar. It returns a credential, so it needs the `operator` role plus the `admin` or `identity:manage` scope (a console session is bounded by role alone), and is audited. |
 | **Diagnose** | The six-step self check (components, egress, proxies, pool, signing, smoke) in the console and as `dtk diagnose`. Its report is redacted at the source, which is what makes it safe to paste into an issue. |
 
@@ -620,10 +706,14 @@ precise definition elsewhere, the linked page has it.
 | Term | What it means |
 | --- | --- |
 | **`aweme_id`** | Douyin's post id, a 19-digit number. Handled as a string everywhere, because it exceeds JavaScript's safe integer range and an int would silently lose precision in the UI. Douyin's comment-replies endpoint spells the same value `item_id`; its comment list still calls it `aweme_id`. |
-| **`content_id`** | This project's neutral name for a post id, on either platform. |
-| **`sec_user_id`** | Douyin's stable author key, stored as both the author's `uid` and its `sec_uid` - the duplication is deliberate, so that reading `sec_uid` works on either platform without first asking which one you are looking at. Douyin's own mutable `uid` is deliberately not used, and neither is the handle. |
+| **`content_id`** | This project's neutral name for a post id, on any platform. On Bilibili it is always the bvid. |
+| **`sec_user_id`** | Douyin's stable author key, stored as both the author's `uid` and its `sec_uid` - the duplication is deliberate, so that reading `sec_uid` works on every platform without first asking which one you are looking at. Douyin's own mutable `uid` is deliberately not used, and neither is the handle. |
 | **`secUid`** | TikTok's opaque author key, and the id every TikTok author endpoint takes. The normalized model stores TikTok's numeric id as the author's `uid` and this value as `sec_uid` - the two differ on TikTok and are the same on Douyin, so `sec_uid` is the field to read when you intend to pass it back. A URL-shaped lookup carries only the `@handle`, which `author_profile` accepts directly; for the post list, the likes list and the follow graph the handle is resolved to a `secUid` first, at the cost of one cached lookup. |
-| **`unique_id`** | The `@handle`. Never used as a key, because users edit it. |
+| **bvid** | Bilibili's video id, such as `BV1xx411c7mD`. Results always carry it as `content_id`; REST takes it in the same `aweme_id` parameter as the other platforms. |
+| **av number** | Bilibili's older numeric video id (`av170001`, or bare `170001`). Accepted wherever a bvid is, and converted to the bvid by arithmetic alone, with no request. |
+| **`mid`** | Bilibili's numeric author id, the number in a `space.bilibili.com/<mid>` link. Stored as both the author's `uid` and its `sec_uid`, as on Douyin, so `sec_uid` is again the id the author endpoints accept; REST takes it in `sec_user_id`. |
+| **Folder** | A Bilibili favourites folder, the id in a `space.bilibili.com/<mid>/favlist?fid=<id>` or `www.bilibili.com/list/ml<id>` link. REST takes it in `collection_id`. Not related to this project's own *collections* above. |
+| **`unique_id`** | The `@handle`. Never used as a key, because users edit it. Bilibili has no handles, so it is null there. |
 | **Content kind** | `video`, `image_album` or `live`. Only the detail response settles which — a URL shape is a hint, never authoritative. |
 
 ## Where to go next

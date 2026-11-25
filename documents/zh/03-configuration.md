@@ -1,10 +1,10 @@
 # 配置参考
 
 > **[Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)** ——
-> 自部署的抖音 / TikTok 数据接口服务：REST、MCP 和 Web 控制台，身份池自维护。
+> 自部署的抖音 / TikTok / B 站数据接口服务：REST、MCP 和 Web 控制台，身份池自维护。
 > [文档首页](../README.zh-CN.md) · [English](../en/03-configuration.md)
 
-读完本文，你会知道哪些配置需要重启、哪些不需要，如何从控制台、命令行或 API 三个入口读取和修改不需要重启的那些，以及全部 54 个运行时配置项各自的作用。
+读完本文，你会知道哪些配置需要重启、哪些不需要，如何从控制台、命令行或 API 三个入口读取和修改不需要重启的那些，以及配置表里全部 65 个配置项各自的作用。
 
 ## 两层配置
 
@@ -46,15 +46,21 @@
 | --- | --- | --- |
 | `DTK_SECRET_KEY` | 无——必填，至少 32 个字符 | 凭证加密的主密钥。镜像不提供任何默认值，缺少它时每个角色都拒绝启动。更换它会让已存储的 cookie 与代理凭证无法解密。 |
 | `DTK_DATABASE_URL` | `postgresql+asyncpg://dtk:dtk@postgres:5432/dtk` | Postgres 连接串，必须使用 asyncpg 驱动。 |
+| `DTK_DB_POOL_SIZE` | `5` | 每个进程（api、worker）常驻的数据库连接数。 |
+| `DTK_DB_MAX_OVERFLOW` | `5` | 高负载时每个进程最多再多开的连接数；超过之后请求会排队等连接，而不是直接失败。两个进程合计再加上留给 CLI 和 TimescaleDB 的 5 个，必须小于 Postgres 的 `max_connections`（`docker/compose.yml` 设为 100）；超出时 `dtk diagnose` 会给出警告。5.1.9 及以前连接池固定为 10 + 20，在 Postgres 自动调成 25 个连接的机器上，高负载时实例会报 "too many clients already"。 |
 | `DTK_REDIS_URL` | `redis://redis:6379/0` | Redis 地址。队列、缓存、令牌桶与控制台会话都在这里。 |
 | `DTK_BIND_HOST` | `127.0.0.1` | API 监听地址。容器内会覆盖为 `0.0.0.0`，真正限制暴露面的是发布出去的端口。 |
 | `DTK_BIND_PORT` | `8000` | API 监听端口。 |
 | `DTK_LOG_LEVEL` | `info` | 日志级别，透传给 uvicorn。 |
 | `DTK_LOG_JSON` | `true` | 结构化 JSON 日志。想在终端看人类可读的日志就设为 `false`。 |
-| `DTK_BROWSER_RPC_URL` | 空 | 无头浏览器服务的地址，例如 `http://browser-rpc:9000`。留空表示关闭自动铸造身份，身份池只能靠手工导入的 cookie——这是受支持的降级模式，不是错误。 |
+| `DTK_BROWSER_RPC_URL` | 空 | 无头浏览器服务的地址，例如 `http://browser-rpc:9000`。留空表示关闭抖音和 TikTok 的自动铸造，这两个身份池只能靠手工导入的 cookie——这是受支持的降级模式，不是错误。B 站访客身份的铸造不需要浏览器，所以无论如何这个池子都会继续补充。 |
 | `DTK_BACKUP_DIR` | `backups` | 备份归档的写入与列出目录。API 与 worker 必须一致：worker 写归档，API 负责列出和下载。容器镜像是只读的，所以 compose 把它指向一个共享卷。 |
 | `DTK_DOWNLOADER_URL` | 空 | Go 媒体下载器的地址，例如 `http://downloader:9100`。留空则完全关闭媒体下载，此时 `POST /api/v1/downloads` 返回 501 并给出可操作的提示，其他功能不受影响。 |
 | `DTK_DOWNLOADER_TOKEN` | 空 | 该 sidecar 的可选共享密钥。它所在的内部网络没有别的容器，所以这属于纵深防御而非边界本身；留空表示 sidecar 不做任何校验。 |
+| `DTK_TRANSCRIBER_URL` | 空 | 转写 sidecar 的地址，例如 `http://transcriber:9200`。留空则关闭转写，此时 `POST /api/v1/transcriptions` 返回 501 并说明怎么打开。 |
+| `DTK_TRANSCRIBER_TOKEN` | 空 | 该 sidecar 的共享密钥，以 `X-Transcriber-Token` 发送；留空表示 sidecar 不做任何校验。两侧必须一致。 |
+| `DTK_TRANSCRIBER_TIMEOUT_SECONDS` | `3600` | worker 等一次转写最多等多久。sidecar 也读这个变量作为解码时限，所以两边会一起放弃。 |
+| `DTK_TRANSCRIBER_NORMALIZATION_FAILURE_POLICY` | `fallback` | 数字规范化失败时怎么办：`fallback` 保留未规范化的文本，`fail` 让这次转写失败。两侧都读。 |
 
 以下由进程或容器 entrypoint 直接读取，不在上面那个类里：
 
@@ -65,7 +71,7 @@
 | `DTK_WORKER_COMMAND` | 未设置 | 覆盖 worker 的启动命令行。只有当 worker 模块不在常用名字下时才需要。 |
 | `DTK_COMMIT`、`DTK_GIT_COMMIT`、`GIT_COMMIT` | 未设置 | 系统状态接口上报的提交号，按此优先级读取。 |
 
-还有四个是 compose 自己读的，而不是应用读的：`DTK_IMAGE_TAG`（镜像标签，默认 `dev`）、`DTK_REDIS_MAXMEMORY`（Redis 内存上限，默认 `320mb`），以及 `CLOAKBROWSER_REPO` 与 `CLOAKBROWSER_COMMIT`——后两个是浏览器镜像的构建参数，而不是运行时会被读取的配置，见[安装与部署](./02-installation.md)。`DTK_BIND_HOST` 与 `DTK_BIND_PORT` 在这里身兼两职——它们同时决定对外发布的地址。这六个变量的插值，compose 读的都是 `docker/.env` 或 shell，绝不是根目录的 `.env`——把 `CLOAKBROWSER_COMMIT` 或 `DTK_IMAGE_TAG` 写进根目录 `.env` 不会有任何效果，原因就在这里。要发布到所有网卡：
+还有一些是 compose 自己读的，而不是应用读的：`DTK_IMAGE`、`DTK_DOWNLOADER_IMAGE`、`DTK_TRANSCRIBER_IMAGE` 和 `DTK_IMAGE_TAG`（跑哪些镜像，标签默认 `dev`）、`DTK_TRANSCRIBER_MODEL_PATH`（挂进 transcriber 当模型目录的宿主机路径）、`DTK_REDIS_MAXMEMORY`（Redis 内存上限，默认 `320mb`），以及 `CLOAKBROWSER_REPO` 与 `CLOAKBROWSER_COMMIT`——后两个是浏览器镜像的构建参数，而不是运行时会被读取的配置，见[安装与部署](./02-installation.md#compose-层面的变量)。`DTK_BIND_HOST` 与 `DTK_BIND_PORT` 在这里身兼两职——它们同时决定对外发布的地址。这些变量的插值，compose 读的都是 `docker/.env` 或 shell，而不是根目录的 `.env`——除非你带上 `COMPOSE_ENV_FILES=.env` 运行，引导式安装生成的 `dtkctl` 就是这么做的。所以在裸跑的 `docker compose` 下，把 `CLOAKBROWSER_COMMIT` 或 `DTK_IMAGE_TAG` 写进根目录 `.env` 不会有任何效果；把 `DTK_TRANSCRIBER_MODEL_PATH` 写在那里，transcriber 拿到的就是一个空的模型目录。要发布到所有网卡：
 
 ```bash
 DTK_BIND_HOST=0.0.0.0 docker compose -p dtk -f docker/compose.yml up -d
@@ -75,7 +81,7 @@ DTK_BIND_HOST=0.0.0.0 docker compose -p dtk -f docker/compose.yml up -d
 
 ## Sidecar 环境变量
 
-两个可选容器有各自的环境变量，同样在启动时读取一次。它们都不连数据库，compose 也把两者的 `DTK_SECRET_KEY` 置空。
+这几个可选容器有各自的环境变量，同样在启动时读取一次。它们都不连数据库，compose 也把三者的 `DTK_SECRET_KEY` 都置空。
 
 ### browser-rpc（`DTK_BROWSER_*`）
 
@@ -90,7 +96,7 @@ DTK_BIND_HOST=0.0.0.0 docker compose -p dtk -f docker/compose.yml up -d
 | `DTK_BROWSER_PROFILE_ROOT` | `/tmp/dtk-browser-profiles` | 浏览器 profile 的父目录。compose 固定为 `/profiles`，那是一块 tmpfs，因此一次性的铸造 profile 永远不落盘。 |
 | `DTK_BROWSER_WARM_CONTEXTS` | `1` | 每个平台常驻的热签名上下文数量。每个常驻上下文大约占容器 `/tmp` 的 300 MB，再乘以两个平台——这是内存预算，不是磁盘空间。 |
 | `DTK_BROWSER_WARM_REFRESH_SECONDS` | `1800` | 热上下文最多存活多久就重建。平台会不断更新自己的 JavaScript，页面放旧了就会用旧代码签名。 |
-| `DTK_BROWSER_PREWARM` | `true` | 启动时预热，让第一次签名不必承担冷启动。 |
+| `DTK_BROWSER_PREWARM` | `true` | 启动时预热，让第一次签名不必承担冷启动。预热在后台进行，设置了 `DTK_BROWSER_SIGN_PROXY_URL` 时经由它；某个平台的页面没能打开，会在 30 秒后重试，间隔逐次翻倍，最长 10 分钟——所以启动时签名代理不可用，等它恢复后也不需要重启。 |
 | `DTK_BROWSER_MAX_CONCURRENT_MINTS` | `2` | 最多同时铸造几个身份。 |
 | `DTK_BROWSER_MINT_TIMEOUT_SECONDS` | `75` | 单次铸造的服务端预算。 |
 | `DTK_BROWSER_SIGN_TIMEOUT_SECONDS` | `8` | 单次签名的服务端预算。 |
@@ -118,6 +124,23 @@ DTK_BIND_HOST=0.0.0.0 docker compose -p dtk -f docker/compose.yml up -d
 | `DTK_DOWNLOADER_HISTORY` | `500` | 记住多少条已完成任务。 |
 | `DTK_DOWNLOADER_MAX_REDIRECTS` | `5` | 单次传输的重定向上限。 |
 | `DTK_DOWNLOADER_TIMEOUT_SECONDS` | `900` | 单次传输的超时上限。 |
+
+### transcriber（`DTK_TRANSCRIBER_*`）
+
+来自 `docker/transcriber/app.py`。和下载器不同，不是数字的值会让它启动失败：sidecar 是 Python 进程，导入时就把这些解析一遍。
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `DTK_TRANSCRIBER_MODEL_DIR` | `/models/funasr` | 从哪读模型。compose 把它固定到只读的模型挂载点；宿主机那一侧是 `DTK_TRANSCRIBER_MODEL_PATH`。 |
+| `DTK_TRANSCRIBER_MEDIA_ROOT` | `/var/lib/dtk/media` | 从哪读已存的媒体。compose 固定为只读挂载的媒体卷。 |
+| `DTK_TRANSCRIBER_TOKEN` | 空 | sidecar 期望的共享密钥；需与应用侧的 `DTK_TRANSCRIBER_TOKEN` 配对。 |
+| `DTK_TRANSCRIBER_THREADS` | `2` | 每个任务的 ONNX Runtime 线程数。不要超过容器的 `cpus`。 |
+| `DTK_TRANSCRIBER_WORKERS` | `1` | 同时跑几个任务。每个任务都要一整套线程，外加它自己那份解码后的音频。 |
+| `DTK_TRANSCRIBER_QUEUE` | `8` | 排在后面等的任务数。超出后 sidecar 返回 429。 |
+| `DTK_TRANSCRIBER_JOB_HISTORY` | `64` | 保留多少个已结束的任务，好让重启后的 worker 还能取回结果。不会低于并发数加队列数。 |
+| `DTK_TRANSCRIBER_PROGRESS_LOG_SECONDS` | `30` | 运行中的任务多久打一次进度日志。最小 5。 |
+| `DTK_TRANSCRIBER_TIMEOUT_SECONDS` | `3600` | 单个文件 ffmpeg 解码的时间上限，最小 60。worker 也读这个变量。 |
+| `DTK_TRANSCRIBER_NORMALIZATION_FAILURE_POLICY` | `fallback` | `fallback` 或 `fail`。其他值会让 sidecar 保持 unhealthy，而不是去猜。 |
 
 ## 修改一个运行时配置
 
@@ -177,7 +200,7 @@ curl -X PUT http://127.0.0.1:8000/api/v1/admin/settings/cache.content_ttl \
 
 ## SENSITIVE 意味着什么
 
-有七个键被声明为 `SENSITIVE` 而不是 `RUNTIME`。这个作用域不是样式差异——它的含义是*放宽它就会扩大攻击面*，因此谁能改、改一次要付出什么代价，都随之改变。
+有八个键被声明为 `SENSITIVE` 而不是 `RUNTIME`。这个作用域不是样式差异——它的含义是*放宽它就会扩大攻击面*，因此谁能改、改一次要付出什么代价，都随之改变。
 
 | 键 | 放宽它会暴露什么 |
 | --- | --- |
@@ -188,8 +211,9 @@ curl -X PUT http://127.0.0.1:8000/api/v1/admin/settings/cache.content_ttl \
 | `security.webhook_secret` | 让这些回调可被验证的那个密钥。 |
 | `security.request_proxy` | 持有 API Key 的人能否指定本服务器的出口。 |
 | `api.public_endpoints` | 每一条都从某个接口上移除了凭证校验。 |
+| `demo.enabled` | 公开一个共享账号和一把 API Key，任何人都能用它消耗本实例的身份池。 |
 
-其中六个属于 `security.*`；第七个 `api.public_endpoints` 虽然在 `api` 分组里，却是同样的作用域，因为它的每一条都取消了一次凭证校验。
+其中六个属于 `security.*`。另外两个在各自的分组里，却是同样的作用域：`api.public_endpoints` 的每一条都取消了一次凭证校验，`demo.enabled` 则公开了一份凭证。
 
 一次敏感写入需要同时满足：
 
@@ -223,7 +247,7 @@ curl -X PUT http://127.0.0.1:8000/api/v1/admin/settings/cache.content_ttl \
 
 ## 运行时配置完整参考
 
-全部 54 个键，按前缀分组。默认值与代码声明完全一致。
+全部 65 个键，按前缀分组。默认值与代码声明完全一致。
 
 ### `sched` — 调度（7 项）
 
@@ -239,7 +263,7 @@ curl -X PUT http://127.0.0.1:8000/api/v1/admin/settings/cache.content_ttl \
 | `sched.circuit_min_samples` | `20` | 熔断前必须观察到的最少请求数，避免几次偶发失败就把接口熔断。 | 流量很大、20 次采样等于噪声时调大。 |
 | `sched.circuit_min_identities` | `3` | 熔断前必须有多少个不同身份同时失败。用于区分「接口坏了」和「某一个身份坏了」。 | 只在排查问题时才调到 `1`；那等于抹掉了这个配置存在的意义。 |
 
-### `pool` — 身份池（4 项）
+### `pool` — 身份池（13 项）
 
 同样在 **调度器** 页。参见[身份与代理](./06-identities-and-proxies.md)。
 
@@ -247,8 +271,11 @@ curl -X PUT http://127.0.0.1:8000/api/v1/admin/settings/cache.content_ttl \
 | --- | --- | --- | --- |
 | `pool.min_size` | `3` | 每个平台的身份数下限。低于此值会告警并触发铸造。 | 突发流量经常把池子打空时调大；不要超过 `target_size`。 |
 | `pool.target_size` | `8` | 身份池为每个平台维持的目标数量。 | 想要更高吞吐就调大，代价是更多铸造与更多代理。小于 `min_size` 的值会被忽略。 |
-| `pool.douyin.min_size` / `pool.tiktok.min_size` | `-1` | 单个平台自己的下限。`-1` 沿用 `pool.min_size`；`0` 关闭这个平台的自动铸造，同时不再发出它的 `pool_empty` / `pool_below_min` 告警。导入的和手动铸造的身份照常可用。 | 把不用的平台设成 `0`，比如服务器访问不到 TikTok 时的 TikTok。小于 `-1` 的值会被拒绝。 |
-| `pool.douyin.target_size` / `pool.tiktok.target_size` | `-1` | 单个平台自己的补充目标。`-1` 沿用 `pool.target_size`。低于该平台下限的值会被抬到下限。 | 某个平台承担了大部分流量、需要比另一个更大的池子时。 |
+| `pool.douyin.min_size` / `pool.tiktok.min_size` / `pool.bilibili.min_size` | `-1` | 单个平台自己的下限。`-1` 沿用 `pool.min_size`；`0` 关闭这个平台的自动铸造，同时不再发出它的 `pool_empty` / `pool_below_min` 告警。导入的和手动铸造的身份照常可用。 | 把不用的平台设成 `0`，比如服务器访问不到 TikTok 时的 TikTok。小于 `-1` 的值会被拒绝。 |
+| `pool.douyin.target_size` / `pool.tiktok.target_size` / `pool.bilibili.target_size` | `-1` | 单个平台自己的补充目标。`-1` 沿用 `pool.target_size`。低于该平台下限的值会被抬到下限。 | 某个平台承担了大部分流量、需要比其他平台更大的池子时。 |
+| `pool.douyin.guests_first` / `pool.tiktok.guests_first` / `pool.bilibili.guests_first` | `True` | 这个平台不需要登录的接口先用游客身份来答——可用的游客，没有可用的就用降级的——只有没有游客能接下这个请求时，才用登录身份：轮换里没有游客服务这个接口，或者游客全都在处理请求、配额用完。游客铸造一个不花什么；登录身份是某个人的账号，把它花在游客也能答得一模一样的请求上，只会让它在需要登录的接口上更早用坏。需要登录的接口照旧优先或只用登录身份。关掉后，登录身份和游客按最近使用时间平摊所有接口。worker 每个请求都会读取。它是调度器页面覆盖卡片上的开关，不在 `pool.*` 的编辑器里。 | 想让登录身份照样分担这类流量时关掉，比如池子里大多是登录身份。见[哪些内容需要登录身份](./06-identities-and-proxies.md#哪些内容需要登录身份)。 |
+| `pool.douyin.direct_egress` / `pool.tiktok.direct_egress` / `pool.bilibili.direct_egress` | `True` | 配了代理时，本机 IP 也算这个平台的一个出口：每个代理后面都已经有一个该平台的身份后，自动补充再在直连出口上铸造一个，和代理一样只放一个。没有配置任何代理时，本机 IP 本来就是唯一的出口，这个开关不起作用。它出现在调度器页的 `pool.*` 编辑器里。 | 这台机器直连不到该平台时关掉，比如国内服务器只给 TikTok 配了代理：在直连出口上铸造会一直失败，并让自动补充进入退避。见[身份与代理是怎么配对的](./06-identities-and-proxies.md#身份与代理是怎么配对的)。 |
+| `pool.retire_fail_streak` | `10` | 机器铸造的游客身份连续失败达到这个次数，就会被自动退休（每五分钟检查一次），前提是该平台还有连续失败次数低于 `pool.max_fail_streak` 的身份。导入的身份不会这样被退休。实际阈值不会低于 `pool.max_fail_streak`；设为 0 关闭。见[状态机](./06-identities-and-proxies.md#状态机)。 | 如果本来能恢复的游客身份被退休了，就调大；想让所有身份都留到你手动退休，就设为 0。 |
 | `pool.max_fail_streak` | `3` | 连续失败达到该次数后，这个身份不再计入池子水位，补充任务会去铸造替代品，而不是把一个什么都跑不通的会话继续算作有效。这里用连续失败次数而不是健康分数，是因为没有流量时健康分数为空——把刚铸出来的身份判为不可用，会让低水位变成不停铸造的死循环。 | 很少需要改。某个不稳定的代理导致反复重铸时可以调大。 |
 | `pool.health_prior` | `0.8` | 尚无历史记录的身份所假定的成功率，取值 0 到 1。它决定新身份被调度的积极程度。 | 新身份还没证明自己就被风控时调低。 |
 
@@ -256,7 +283,7 @@ curl -X PUT http://127.0.0.1:8000/api/v1/admin/settings/cache.content_ttl \
 
 | 键 | 默认值 | 作用 | 什么时候需要改 |
 | --- | --- | --- | --- |
-| `signing.mode` | `'native'` | 由谁生成签名。`native` 运行内置纯算法，完全不碰浏览器；`rpc` 每次都请求 browser-rpc；`auto` 以 native 起步，遇到平台自身 SDK 会签名的接口、或某接口的风控率显示 native 签名正在被拒时，切到浏览器。 | 平台上线新 SDK 而内置算法还没跟上时切到 `rpc`。没有 browser-rpc 容器时，唯一自洽的模式是 `native`。 |
+| `signing.mode` | `'native'` | 由谁生成签名。`native` 运行内置纯算法，完全不碰浏览器；`rpc` 每次都请求 browser-rpc；`auto` 以 native 起步，遇到平台自身 SDK 会签名的接口、或某接口的风控率显示 native 签名正在被拒时，切到浏览器。B 站的 WBI 签名始终在进程内计算：无论模式怎么设，browser-rpc 都不会给 B 站签名。 | 平台上线新 SDK 而内置算法还没跟上时切到 `rpc`。没有 browser-rpc 容器时，唯一自洽的模式是 `native`。 |
 | `signing.fallback_enabled` | `True` | 当前模式不偏好的那个签名器，在首选不可用时是否仍可使用。 | 关掉它，才能知道当前到底是谁在扛流量——开着回退时，坏掉的签名器会因为流量悄悄转移而看起来一切正常。在 `auto` 下，风控驱动的切换本身就是回退，所以关掉它等于把 `auto` 钉死在 native。 |
 | `signing.rpc_timeout_seconds` | `60` | 单次 browser-rpc 签名调用的超时上限。它必须覆盖冷启动：某个身份的第一次调用会启动浏览器，并经由该身份的代理加载平台页面——无代理实测约 4 秒——而同一身份的后续调用由常驻页面在毫秒级返回。 | 经由慢代理时容易超时就调大；如果问题出在冷启动，应该改为调大 `DTK_BROWSER_WARM_CONTEXTS`。 |
 
@@ -267,8 +294,8 @@ curl -X PUT http://127.0.0.1:8000/api/v1/admin/settings/cache.content_ttl \
 | 键 | 默认值 | 作用 | 什么时候需要改 |
 | --- | --- | --- | --- |
 | `cache.content_ttl` | `1800` | 解析后的视频详情可复用多久，超时后重新抓取。 | 需要新鲜的计数就调小；想少花身份池配额在重复查询上就调大。单条缓存实测 16–200 KB，TTL 越长越吃 Redis 内存。 |
-| `cache.author_ttl` | `900` | 解析后的用户主页信息可复用多久。 | 同样的取舍；主页比作品变化慢。 |
-| `cache.list_ttl` | `300` | 解析后的列表页（作者作品、评论、评论回复）可复用多久。 | 列表比单条内容变化更快，所以通常是三者中最短的。 |
+| `cache.author_ttl` | `900` | 解析后的用户主页、音乐或话题可复用多久。 | 同样的取舍；主页比作品变化慢。 |
+| `cache.list_ttl` | `300` | 解析后的列表页（作者作品、评论、评论回复、搜索结果、热榜）或直播间（连同它的观众榜和是否在播）可复用多久。 | 列表比单条内容变化更快，所以通常是三者中最短的。 |
 
 ### `snapshot` — 内容历史（1 项）
 
@@ -369,7 +396,16 @@ curl -X PUT http://127.0.0.1:8000/api/v1/admin/settings/cache.content_ttl \
 
 | 键 | 默认值 | 作用 | 什么时候需要改 |
 | --- | --- | --- | --- |
-| `system.check_updates` | `False` | 控制台是否提供版本更新检查。请求由你的浏览器发往 GitHub，服务端从不外联；之所以需要主动开启，是因为有些部署根本没有出网能力。 | 想知道有没有新版本时打开。 |
+| `system.check_updates` | `True` | 控制台是否检查新版本：登录后每个浏览器每天一次，另外可以在系统信息页手动检查。请求由你的浏览器发往 GitHub，服务端从不外联，所以它不携带任何关于这套部署的信息。 | 断网环境里关掉。 |
+
+### `demo` — 公开演示（2 项，其中一项敏感）
+
+在 **设置 → 演示模式** 里。演示账号能访问什么、不能访问什么，见[安全](./15-security.md#演示模式)。
+
+| 键 | 默认值 | 作用 | 什么时候需要改 |
+| --- | --- | --- | --- |
+| `demo.enabled` | `False` | 对外公开一个只读账号和一把 API Key，任何人都能拿它试用这台实例。打开时生成两者并只显示一次；关闭后所有 demo 会话立即失效、Key 也停止工作，但不删除任何东西。敏感配置。 | 在一台供人试用的公开实例上。 |
+| `demo.task_retention_minutes` | `30` | demo 账号发起的任务保留多久，之后由维护任务清理。单位是分钟不是天：这行记录的存在只是为了让调用方取回结果。 | 演示访客轮询得慢、回来时结果已经没了，就调大。 |
 
 ## 修改何时生效
 
