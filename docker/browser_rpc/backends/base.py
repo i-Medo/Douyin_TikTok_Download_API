@@ -35,6 +35,10 @@ class BackendInfo:
     version: str | None = None
     chromium_major: int | None = None
     pin: str | None = None
+    #: The ``navigator.userAgent`` this backend's pages run under, once a page
+    #: has said; None before. A property of the browser binary, not of a page:
+    #: three fingerprint seeds gave the same string (#832).
+    user_agent: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +99,12 @@ class SignPlan:
     params: Mapping[str, str]
     user_agent: str | None = None
     timeout_seconds: float = 8.0
+    #: The verb and, for a POST, the body and its Content-Type. All three reach
+    #: the page's fetch, because the SDK signs what it is handed and a_bogus
+    #: hashes the body.
+    method: str = "GET"
+    body: str | None = None
+    content_type: str | None = None
 
 
 @runtime_checkable
@@ -103,6 +113,25 @@ class SigningContext(Protocol):
 
     @property
     def platform(self) -> Platform: ...
+
+    @property
+    def user_agent(self) -> str | None:
+        """The ``navigator.userAgent`` this page runs under, read when it opened.
+
+        Whatever the request asks for, this is the User-Agent the page's SDK
+        hashes into the signature: nothing overrides it per request. None when
+        the page did not report one.
+        """
+
+    @property
+    def problem(self) -> str | None:
+        """Why this page can no longer sign, or None while it still can.
+
+        Cheap and side-effect free: the service asks before handing a warm page
+        out, so that a page already known to be dead - crashed, or carried off
+        the platform by a navigation that failed after it loaded - is rebuilt
+        instead of costing a caller an attempt to rediscover it (issue #830).
+        """
 
     async def sign(self, plan: SignPlan) -> dict[str, str]:
         """Return signature fields, e.g. {"a_bogus": ..., "ms_token": ...}.

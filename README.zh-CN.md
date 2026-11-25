@@ -7,9 +7,9 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-🚀 自部署的[抖音](https://www.douyin.com) / [TikTok](https://www.tiktok.com)数据接口服务。一条 `docker compose up`，自动维护身份池，对外提供 REST API、MCP 与 Web 控制台。
+🚀 自部署的[抖音](https://www.douyin.com) / [TikTok](https://www.tiktok.com) / [B 站（哔哩哔哩）](https://www.bilibili.com)数据接口服务。一条 `docker compose up`，自动维护身份池，对外提供 REST API、MCP 与 Web 控制台。
 
-开源、免费、跑在你自己的机器上 —— 不用注册、没有配额、链路上没有第三方。它能取作品、作者、评论和搜索，下载视频和图集时拿到的是**无水印**的流（它挑的是平台本来就提供的那条干净流，而不是「去掉」了什么），采集到的内容存在你自己的 PostgreSQL 里。
+开源、免费、跑在你自己的机器上 —— 不用注册、没有配额、链路上没有第三方。它能取作品、作者和评论，音乐、话题、直播间、热榜和搜索结果，下载视频和图集时拿到的是**无水印**的流（它挑的是平台本来就提供的那条干净流，而不是「去掉」了什么），采集到的内容存在你自己的 PostgreSQL 里。下载下来的视频可以在同一台机器上离线转成文字，AI agent 也能通过 MCP 直接调用这一切。
 
 [![GitHub license](https://img.shields.io/github/license/Evil0ctal/Douyin_TikTok_Download_API?style=flat-square)](LICENSE)
 [![Release Version](https://img.shields.io/github/v/release/Evil0ctal/Douyin_TikTok_Download_API?style=flat-square)](https://github.com/Evil0ctal/Douyin_TikTok_Download_API/releases/latest)
@@ -113,12 +113,13 @@ v4 最大的问题从来不是功能少，而是**接口会悄悄死掉，而你
 | 访问控制 | 没有，谁都能调 | API Key + 作用域 + 角色，控制台里管 |
 | 界面 | PyWebIO 单页 | React 控制台：身份池、调度器、资料库、下载、日志、诊断 |
 | 接入方式 | REST | REST + MCP + CLI，共用同一个 service 层 |
-| 签名 | X-Bogus、A_Bogus | a_bogus、X-Bogus、X-Gnarly、X-Dynosaur，纯 Python 实现，另有浏览器兜底 |
+| 签名 | X-Bogus、A_Bogus | a_bogus、X-Bogus、X-Gnarly、X-Dynosaur 和 B 站的 WBI，纯 Python 实现，另有浏览器兜底 |
 | 部署 | `pip install -r requirements.txt` + `python start.py` | `docker compose up`，三个镜像 |
-| 平台 | 抖音、TikTok、哔哩哔哩 | 抖音、TikTok |
+| 平台 | 抖音、TikTok、哔哩哔哩 | 抖音、TikTok、B 站 |
 
-哔哩哔哩是唯一退步的一项：v5 暂时没有。它和抖音 / TikTok 不共用签名和身份体系，
-重写时先放下了，之后再说。
+B 站曾经是 5.0 唯一退步的一项，因为它和抖音 / TikTok 不共用签名和身份体系。5.1.6
+把它加了回来，也补上了它自己需要的两样东西：纯 Python 的 WBI 签名，以及通过普通 HTTP
+铸造的游客身份——所以 B 站的身份池不需要浏览器容器。
 
 ### 还在用 v4？
 
@@ -171,7 +172,8 @@ docker rm -f dtk-v4   # 上面 docker run 起的那个占着同一个名字
 docker compose -p dtk-v4 up -d
 ```
 
-`main` 现在是 v5，`latest` 跟着 `main` 走，**想留在 v4 就固定 tag，别用 `latest`**。
+`main` 现在是 v5，`latest` 指向最新的 v5 发布版——它只在发版时移动，推送到 `main` 不会动它——
+所以**想留在 v4 就固定 tag，别用 `latest`**。
 `V4.1.2` 是 v4 最后一个发布版；之后 v4 分支又合了几个 PR（B 站下载、cookie 热更新），
 那份代码对应的镜像 tag 是 commit sha `5be4838`。
 
@@ -186,26 +188,90 @@ v4 没有一键脚本，下面「快速开始」里那个装的是 v5。v4 就�
 群里可以互相交流学习，**不允许发广告以及违法的东西**，纯粹交朋友和技术交流。
 
 
-## 📦 它能从抖音和 TikTok 取什么
+## 📦 它能取什么
 
-| 能力 | 抖音 | TikTok |
-|---|:---:|:---:|
-| 单条作品详情（视频 / 图集） | ✅ | ✅ |
-| 作者资料 | ✅ | ✅ |
-| 作者作品列表 | ✅ | ✅ |
-| 作者喜欢列表 | ✅ | ✅ |
-| 合集 / 播放列表 | ✅ | ✅ |
-| 评论 | ✅ | ✅ |
-| 评论回复 | ✅ | ✅ |
-| 粉丝列表 | ❌ | ✅ |
-| 关注列表 | ❌ | ✅ |
+| 能力 | 抖音 | TikTok | B 站 |
+|---|:---:|:---:|:---:|
+| 单条作品详情（视频 / 图集） | ✅ | ✅ | ✅ |
+| 作者资料 | ✅ | ✅ | ✅ |
+| 作者作品列表 | ✅ | ✅ | ✅ |
+| 作者喜欢列表 | ✅ | ✅ | ❌ |
+| 合集 / 播放列表 / B 站合集，以及作者的合集列表 | ✅ | ✅ | ✅ |
+| 评论 | ✅ | ✅ | ✅ |
+| 评论回复 | ✅ | ✅ | ✅ |
+| 公开收藏夹及其内容 | ❌ | ✅ | ✅ |
+| 多 P 视频的分 P 列表 | — | — | ✅ |
+| 站点热门榜：综合热门、每周必看、入站必刷、排行榜 Top 100 | ❌ | ❌ | ✅ |
+| 粉丝列表 | ❌ | ✅ | ❌ |
+| 关注列表 | ❌ | ✅ | ❌ |
+| 作品的相关推荐 | ✅ | ✅ | ✅ |
+| 音乐详情，以及使用它的作品 | ✅ | ✅ | — |
+| 话题详情 | ✅ | ✅ | — |
+| 话题下的作品 | ❌ | ✅ | — |
+| 关键词搜索：作品与账号 | ❌ | ✅ | ✅ |
+| 直播间：是否在播，以及拉流地址 | ✅ | ✅ | ✅ |
+| 按一场直播自己的 ID 查直播间，以及抖音 App 分享链接 | ✅ | ✅ | — |
+| 一次查询多个直播间是否在播 | ✅ | ✅ | ❌ |
+| 直播间观众榜 | ✅ | ❌ | ❌ |
+| 热榜 | ✅ | ❌ | ✅ |
 
 抖音的粉丝和关注列表只对已登录会话开放，游客身份拿不到，所以这两个接口干脆没注册：
-注册一个永远返回空页的接口没意义。导入你自己的登录 Cookie 之后，其余接口能看到的内容也会更多。
+注册一个永远返回空页的接口没意义。搜索和话题下的作品也是一样：抖音对游客两者都拒绝，
+已登录时的答复还没有实测过，所以抖音上这两样暂未提供。TikTok 的账号搜索游客也能用，作品搜索则直接
+拒绝游客（2026-11-02 实测），要靠导入的登录身份。导入你自己的登录 Cookie 之后，其余接口能看到的内容也会更多。
+这一点在 B 站的评论上最明显：游客只能看到最热的三条，导入登录身份之后才能看到完整评论。
+抖音的作者喜欢列表则完全取决于它：不管公开与否，游客一条都看不到，所以这个列表需要池子里有登录身份。
+导入的登录身份，后果和风险由你自行承担：各平台一般不会因为读取数据而封号，但不排除封号的可能
+（[导入之前要知道的事](documents/zh/06-identities-and-proxies.md#带登录态的-cookie-不等于访客身份)）。
+
+短横线不是缺功能：抖音和 TikTok 的一个作品永远只有一个视频，没有分 P 可列；B 站的直播间始终只有一个编号，不会每场直播换一个 ID。
 
 媒体下载、内容归档、计数快照、合集、定时监控都是内置的，不需要额外服务。
 
-## 🔗 它认得哪些抖音 / TikTok 链接
+## 🤖 让 AI agent 来用：MCP
+
+把 Claude Code、Claude Desktop、Codex CLI、Cherry Studio 或任何 MCP 客户端指向你自己实例上的
+`/mcp`，agent 就能读取作品、作者和评论，把作品的媒体存下来，再把视频转成文字。它和 REST API
+走同一个 service 层、同一个身份池和调度器，能做什么由 API Key 的权限范围决定。
+
+```bash
+claude mcp add --transport http dtk http://127.0.0.1:8000/mcp/ \
+  --header "Authorization: Bearer dtk_YOUR_API_KEY"
+```
+
+| 工具 | 做什么 |
+|---|---|
+| `parse_url` | 取一个链接指向的东西——作品、作者、短链、整段分享文案都行 |
+| `get_video` · `get_user` | 按 ID 取一个作品或一个作者主页 |
+| `list_user_posts` · `list_comments` | 作者的作品、作品的评论，按页取 |
+| `get_content_history` | 作品或作者在本地数据库里记录下来的计数历史 |
+| `pool_status` | 身份池和各接口的健康状况，让 agent 分得清"稍后再试"和"坏了" |
+| `download_media` | 把作品的媒体存到本实例 |
+| `transcribe_video` | 把已存的视频转成文字 |
+| `get_task_result` | 取回一次调用里没来得及完成的结果 |
+
+十个工具，刻意不多：每多一个工具，agent 选对工具的能力就会变差，所以新能力是作为已有工具的参数
+加进来的。各个客户端怎么配、每个工具返回什么，见 [MCP 与 AI agent](./documents/zh/12-mcp.md)。
+控制台里的 `/mcp-guide` 是同一份指南。
+
+## 🎙 语音转文字，在你自己的机器上
+
+下载下来的视频可以就地转成文字。FunASR 模型——Paraformer 识别语音、FSMN-VAD 找出哪里有人在
+说话、CT-Transformer 补标点——运行在一个没有任何网络出口的边车里，音频不会离开这台主机，也不调用
+任何外部接口。
+
+- **在哪用：** 控制台的 **视频转写** 页面、每个已完成下载上的 **转写视频** 按钮、
+  **资料库**（单个已存作品，或一次转写选中的一批）、`POST /api/v1/transcriptions`，
+  或者 MCP 工具 `transcribe_video`
+- **得到什么：** 每个视频一整段文字，数字写成阿拉伯数字，可以导出 `.txt`
+- **多快：** 一段 3 分 13 秒的视频，两个 CPU 核用了 3.7 秒；不需要 GPU
+- **擅长什么：** 普通话。模型是通用中文模型，其他语言效果差
+
+默认关闭。一键安装脚本会询问，然后下载约 500 MB 的模型，并逐个文件校验 SHA-256；手动安装见
+[准备 FunASR ONNX 模型](./documents/zh/18-funasr-models.md)和
+[把已存的视频转成文字](./documents/zh/08-downloads-and-library.md#把已存的视频转成文字)。
+
+## 🔗 它认得哪些链接
 
 粘贴什么都行——分享短链、作品页地址，或者 App 复制出来的一整段带文案的口令：
 
@@ -216,10 +282,15 @@ https://www.douyin.com/jingxuan?modal_id=7660875690212492466
 https://www.tiktok.com/@evil0ctal/video/7156033831819037994
 https://www.tiktok.com/t/ZTR9nkkmL/
 2.84 nqe:/ 骑白马的也可以是公主%%百万转场变身 https://v.douyin.com/L4FJNR3/ 复制此链接，打开Dou音搜索
+https://www.bilibili.com/video/BV1xx411c7mD
+https://www.bilibili.com/video/av170001
+https://b23.tv/<code>
+https://space.bilibili.com/2
 ```
 
 短链会自动跟随展开，文案里的链接会被提取出来。作品 ID 还会先按平台自己的编码规则校验一遍，
-一个不可能存在的 ID 在这里就被拒掉，不会浪费一次上游请求。
+一个不可能存在的 ID 在这里就被拒掉，不会浪费一次上游请求。B 站的 av 号会换算成对应的 BV 号，
+两种写法拿到的是同一个作品。
 
 ## ⚗️ 技术栈
 
@@ -229,9 +300,10 @@ https://www.tiktok.com/t/ZTR9nkkmL/
 | 传输 | wreq（浏览器 TLS 指纹模拟）· httpx |
 | 数据 | PostgreSQL + TimescaleDB · Redis |
 | 控制台 | React 19 · TypeScript · Vite · TanStack Query · wouter · i18next |
-| 签名 | a_bogus / X-Bogus / X-Gnarly / X-Dynosaur，纯 Python 实现 |
-| 身份铸造 | CloakBrowser 无头浏览器，单独一个容器，通过 HTTP 调用 |
+| 签名 | a_bogus / X-Bogus / X-Gnarly / X-Dynosaur / WBI，纯 Python 实现 |
+| 身份铸造 | CloakBrowser 无头浏览器，单独一个容器，通过 HTTP 调用；B 站游客身份直接走 HTTP，不需要浏览器 |
 | 下载器 | Go 1.23，只用标准库，静态编译进 scratch 镜像 |
+| 转写 | FunASR ONNX（Paraformer、FSMN-VAD、CT-Transformer），离线，跑在没有网络出口的容器里 |
 | 鉴权 | argon2id 口令哈希 · API Key + 作用域 |
 | 对外协议 | REST（OpenAPI）· MCP（streamable-http）· CLI |
 | 工程 | uv · ruff · mypy · pytest · Docker Compose |
@@ -245,7 +317,7 @@ CloakBrowser 的版本 pin 在一个指定的 commit 上。这是一项安全控
 ## 🗂 项目结构
 
 **先说一句 `dtk` 是什么。** 仓库全称 `Douyin_TikTok_Download_API` 念起来太长，所以代码里一律用
-**DTK**：**D**ouyin + **T**i**K**Tok，只取那两个平台，下载器和 API 那两截没进来。
+**DTK**：**D**ouyin + **T**i**K**Tok，只取那两个平台，下载器和 API 那两截没进来。B 站是后来加的，名字没改。
 
 它是 Python 包名（`src/dtk/`）、命令行（`dtk --help`）、每个环境变量的前缀（`DTK_SECRET_KEY` 这些）、
 compose 的项目名（`-p dtk`），也是控制台标题栏里那三个字母。看到 `dtk`，说的就是
@@ -255,8 +327,8 @@ compose 的项目名（`-p dtk`），也是控制台标题栏里那三个字母�
 Douyin_TikTok_Download_API/
 ├── src/dtk/                服务端，代码全在这
 │   ├── api/                FastAPI 路由、鉴权、OpenAPI 本地化
-│   ├── platforms/          抖音 / TikTok 适配器：接口定义、参数、解析
-│   ├── signing/            a_bogus / X-Bogus / X-Gnarly / X-Dynosaur
+│   ├── platforms/          抖音 / TikTok / B 站适配器：接口定义、参数、解析
+│   ├── signing/            a_bogus / X-Bogus / X-Gnarly / X-Dynosaur / WBI
 │   ├── transport/          出站请求、响应分类（正常 / 业务错误 / 风控 / 网络）
 │   ├── identity/           身份铸造与健康度
 │   ├── scheduler/          身份选取、令牌桶、熔断器
@@ -276,11 +348,12 @@ Douyin_TikTok_Download_API/
 │       ├── pages/          每个控制台页面一个文件
 │       ├── components/     设计系统与共用组件
 │       └── locales/        控制台中英文案
-├── docker/                 三个 Dockerfile、compose 与两个 sidecar
+├── docker/                 四个 Dockerfile、compose 与三个 sidecar
 │   ├── browser_rpc/        Python，包装 CloakBrowser
 │   ├── downloader/         Go，媒体下载 sidecar
+│   ├── transcriber/        Python，离线 FunASR 转写
 │   └── compose.yml
-├── documents/              用户文档，中英各 17 篇
+├── documents/              用户文档，中英各 18 篇
 ├── tests/                  unit / integration / contract / replay
 ├── scripts/                smoke.sh
 ├── .github/workflows/      CI 与 Docker 镜像发布
@@ -343,18 +416,31 @@ docker compose -p dtk -f docker/compose.yml logs api   # 打印首次初始化�
 
 打开 <http://127.0.0.1:8000>，用日志里的令牌创建第一个管理员账号。
 
+这样起来的栈不带浏览器容器。没有它（`--profile browser`，见
+[可选 profile](./documents/zh/02-installation.md#可选-profile)），抖音和 TikTok 的身份只能导入、
+不能铸造：这两个平台是在页面脚本里把 Cookie 发给访客的。B 站游客走普通 HTTP 铸造，有没有它都行。
+
 ### 镜像从哪来
 
 默认是本地构建：`up` 第一次会用仓库里的 Dockerfile 把应用镜像编出来，几分钟。
-如果你不想在自己机器上编译，把 compose 指向已发布的镜像即可：
+如果你不想在自己机器上编译，在同一个 `.env` 里把 compose 指向已发布的镜像即可：
 
 ```bash
-export DTK_IMAGE=evil0ctal/douyin_tiktok_download_api
-export DTK_IMAGE_TAG=latest
+cat >> .env <<'EOF'
+DTK_IMAGE=evil0ctal/douyin_tiktok_download_api
+DTK_IMAGE_TAG=latest
+EOF
+export COMPOSE_ENV_FILES=.env
 docker compose -p dtk -f docker/compose.yml pull
 docker compose -p dtk -f docker/compose.yml up -d
 ```
 
+这两个变量是 compose 自己读的，不是容器读的，而 compose 默认去 `docker/.env` 里找，
+除非 `COMPOSE_ENV_FILES` 另有所指。少了那行 export，它什么也找不到，退回本地镜像名，
+又悄悄从源码编了一遍——所以每个要敲 compose 的 shell 里都得有它。脚本生成的 `dtkctl`
+替你带着。
+
+`latest` 就是最新的 Release，只在发版时才会变，所以以后更新不用改这里的任何东西。
 `pull` 这一步不能省：compose 里这些服务同时写了 `image` 和 `build`，本机没有这个镜像时
 它会自己去编，而不是去拉。
 
@@ -378,7 +464,7 @@ docker compose -p dtk -f docker/compose.yml up -d
 | 想做的事 | 去哪看 |
 |---|---|
 | 改容器规格、算机器要多大 | [三档配置](./documents/zh/02-installation.md#三档配置) · [怎么改这些上限](./documents/zh/02-installation.md#怎么改这些上限) |
-| 开浏览器容器、下载器 sidecar | [两个可选 profile](./documents/zh/02-installation.md#两个可选-profile) |
+| 开浏览器容器、下载器或转写 sidecar | [可选 profile](./documents/zh/02-installation.md#可选-profile) |
 | 挂 TLS、放到反向代理后面 | [放在反向代理后面](./documents/zh/02-installation.md#放在反向代理后面) |
 | 环境变量到底怎么读的 | [环境变量](./documents/zh/02-installation.md#环境变量) |
 | 装完确认它真的好了 | [验证安装](./documents/zh/02-installation.md#验证安装) |
@@ -388,10 +474,10 @@ docker compose -p dtk -f docker/compose.yml up -d
 
 | 入口 | 地址 | 说明 |
 |---|---|---|
-| Web 控制台 | `/` | 身份池、调度器、资料库、下载、日志、诊断 |
+| Web 控制台 | `/` | 身份池、调度器、资料库、下载、转写、日志、诊断 |
 | 接口文档 | `/docs` | 控制台内的 Swagger UI，中英双语 |
 | 裸接口文档 | `/swagger`、`/redoc` | 无需登录 |
-| REST API | `/api/v1/...` | 93 个操作 |
+| REST API | `/api/v1/...` | 128 个操作 |
 | MCP | `/mcp` | 与 REST 共用同一个 service 层，配置方法见控制台 `/mcp-guide` |
 | CLI | `dtk --help` | 同上 |
 
@@ -400,6 +486,7 @@ docker compose -p dtk -f docker/compose.yml up -d
 - **解析**：链接、分享文案、短链、作品 ID 都吃
 - **归档**：解析过的内容自动入库，平台删了这里还在
 - **下载**：媒体存到自己磁盘，支持按作者批量、跳过已下载、去重
+- **转写**：把已存的视频离线转成文字
 - **关注列表**：定期重新收集某个作者或作品
 - **iOS 快捷指令**：`/api/v1/ios/shortcut`
 
@@ -409,39 +496,54 @@ docker compose -p dtk -f docker/compose.yml up -d
 每 24 小时最多一次。那个请求是**你的浏览器**发给 GitHub 的，服务器不会往外发任何东西
 ——所以它不会告诉任何人你这台实例存在。气人的话在设置里关掉。
 
-更新本身就是拉镜像加重启。用脚本装的话，再跑一次选「升级」就行：
+用脚本装的，在安装目录里一条命令：
 
 ```bash
-bash install.zh.sh --manage    # 选 2
+cd /opt/dtk           # 或 ~/dtk —— 你装在哪就是哪
+./dtkctl upgrade      # 升到最新的 Release；./dtkctl upgrade 5.1.6 升到指定版本
 ```
+
+它会把代码切到那个 Release 的 tag、拉新镜像（源码构建的安装则是重新构建）、重建浏览器镜像、
+做一份备份、跑迁移，这些都过了才把升到的版本号写进 `.env` 并重启。重启之前任何一步失败，代码和
+`.env` 都会放回原样，旧版本照样在跑。不需要手动改任何东西。5.1.6 之前装的实例还没有
+`upgrade`，那就在同一个目录里先跑一次 `git pull && bash install/install.zh.sh --upgrade`，
+之后就都是 `./dtkctl upgrade` 了。运行 `bash install.zh.sh --manage` 选 2，效果一样。
 
 手工版是这样：
 
 ```bash
 cd /opt/dtk && git pull
+export COMPOSE_ENV_FILES=.env
 
-# 用已发布镜像的（推荐）：把 .env 里的 DTK_IMAGE_TAG 改成新版本
-docker compose -p dtk -f docker/compose.yml pull api worker downloader
+# 用已发布镜像的（推荐）。写上你在跑的服务：开了下载器和转写的，
+# 加上 downloader 和 transcriber，--profile 参数也和启动时一样。
+docker compose -p dtk -f docker/compose.yml pull api worker
+docker compose -p dtk -f docker/compose.yml build browser-rpc   # 只在开了 --profile browser 时
 docker compose -p dtk -f docker/compose.yml run --rm migrate
 docker compose -p dtk -f docker/compose.yml up -d
 ```
 
-自己构建的话把 `pull` 换成 `build`。`migrate` 每次启动都会跑，Alembic 是幂等的，
-所以单独跑那一步只是想在切换容器之前先把库升上去。
+`DTK_IMAGE_TAG=latest` 的话不用先改任何东西。钉了版本号或 `sha-` 构建的，这就是钉住的
+代价：拉之前先在 `.env` 里把它改掉——脚本替你做的正是这一步。脚本装的代码停在 Release 的 tag
+上，那里的 `git pull` 没有分支可拉：改用 `git fetch origin tag v5.1.7 && git checkout --detach v5.1.7`。
+自己构建的话把 `pull` 换成 `build`。`migrate` 每次启动都会跑，Alembic 是幂等的，所以单独跑那一步只是想在切换容器
+之前先把库升上去。
 
 **你的数据不会动。** 命名卷（`postgres-data`、`redis-data`、`media-data`）不随容器
 重建而消失，身份池、归档、设置和 API Key 都在原地。
 
-浏览器镜像只有在 `docker/Dockerfile.browser` 或 CloakBrowser 的 pin 变了才需要重建，
-一般的版本更新不用管它。
+浏览器镜像从这份代码构建、从不拉取，所以每次更新都要重建：tag 不变的话——`latest`，
+或者本地构建的 `dev`——跑着的还是旧代码。有缓存，很快。
 
-想回退就把 `DTK_IMAGE_TAG` 改回上一个 `sha-` 或版本号再 `up -d`。
-迁移不提供自动降级——升级前备份数据库，这是唯一稳妥的回退路径。
+想回退，用脚本装的就 `./dtkctl upgrade 5.1.5`，手工的就把 `DTK_IMAGE_TAG` 改回上一个
+版本号或 `sha-` 再 `up -d`。迁移不提供自动降级，所以缺了数据库最新那次迁移的 Release，脚本在拉任何东西
+之前就会拒绝；越过了那样一次迁移，回去的路是新装一份旧版本，再把在它上面做的备份恢复进去。升级前备份
+数据库——脚本会替你做——这是唯一稳妥的回退路径。
 
 
 ## 📖 文档
 
-**在线阅读：[douyin.wtf](https://douyin.wtf)** —— 同样的 17 篇，渲染好、可搜索、中英双语。
+**在线阅读：[douyin.wtf](https://douyin.wtf)** —— 同样的 18 篇，渲染好、可搜索、中英双语。
 markdown 源文件在 [`documents/`](./documents/README.zh-CN.md)，站点就是拿它构建的，
 所以两边永远不会对不上。
 

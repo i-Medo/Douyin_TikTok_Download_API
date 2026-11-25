@@ -39,6 +39,9 @@ func (s jobState) terminal() bool {
 }
 
 // item is one file inside a job.
+//
+// State goes queued, running, then done or failed. While it is running, Bytes
+// is what has been written so far rather than the size of the stored file.
 type item struct {
 	Name        string   `json:"name"`
 	Kind        string   `json:"kind"`
@@ -50,25 +53,33 @@ type item struct {
 	SHA256      string   `json:"sha256,omitempty"`
 	ContentType string   `json:"content_type,omitempty"`
 	Error       string   `json:"error,omitempty"`
+	// The Content-Length of the mirror being read, or 0 when it sent none.
+	BytesExpected int64 `json:"bytes_expected,omitempty"`
+	// Filled in by snapshot, and only for a running item.
+	BytesPerSecond int64 `json:"bytes_per_second,omitempty"`
+
+	meter meter
 }
 
 // job is one content key's media, as submitted by the main service.
 type job struct {
-	ID         string     `json:"id"`
-	Platform   string     `json:"platform"`
-	AuthorUID  string     `json:"author_uid"`
-	ContentID  string     `json:"content_id"`
-	Directory  string     `json:"directory"`
-	State      jobState   `json:"state"`
-	Items      []*item    `json:"items"`
-	Domains    []string   `json:"-"`
-	UserAgent  string     `json:"-"`
-	Referer    string     `json:"-"`
-	BytesTotal int64      `json:"bytes_total"`
-	Error      string     `json:"error,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
-	StartedAt  *time.Time `json:"started_at,omitempty"`
-	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	ID        string   `json:"id"`
+	Platform  string   `json:"platform"`
+	AuthorUID string   `json:"author_uid"`
+	ContentID string   `json:"content_id"`
+	Directory string   `json:"directory"`
+	State     jobState `json:"state"`
+	Items     []*item  `json:"items"`
+	Domains   []string `json:"-"`
+	UserAgent string   `json:"-"`
+	Referer   string   `json:"-"`
+	// Never serialized: a job listing is not a place a cookie may appear.
+	Cookies    []cookieSpec `json:"-"`
+	BytesTotal int64        `json:"bytes_total"`
+	Error      string       `json:"error,omitempty"`
+	CreatedAt  time.Time    `json:"created_at"`
+	StartedAt  *time.Time   `json:"started_at,omitempty"`
+	FinishedAt *time.Time   `json:"finished_at,omitempty"`
 
 	cancel context.CancelFunc
 }
@@ -79,11 +90,15 @@ type job struct {
 // results into it, which is the kind of bug that shows up as a corrupt
 // response once a week and never in a test.
 func (j *job) snapshot() *job {
+	now := time.Now()
 	clone := *j
 	clone.cancel = nil
 	clone.Items = make([]*item, 0, len(j.Items))
 	for _, source := range j.Items {
 		copied := *source
+		if copied.State == "running" {
+			copied.BytesPerSecond = source.meter.rate(now, source.Bytes)
+		}
 		clone.Items = append(clone.Items, &copied)
 	}
 	return &clone
@@ -284,6 +299,7 @@ func (m *manager) run(parent context.Context, current *job) {
 	domains := current.Domains
 	userAgent := current.UserAgent
 	referer := current.Referer
+	cookies := current.Cookies
 	m.mu.Unlock()
 
 	directory, err := safeJoin(m.root, current.Platform, current.AuthorUID, current.ContentID)
@@ -300,7 +316,7 @@ func (m *manager) run(parent context.Context, current *job) {
 			defer group.Done()
 			slots <- struct{}{}
 			defer func() { <-slots }()
-			m.fetchItem(ctx, current, directory, domains, userAgent, referer)
+			m.fetchItem(ctx, current, directory, domains, userAgent, referer, cookies)
 		}(target)
 	}
 	group.Wait()
@@ -312,7 +328,7 @@ func (m *manager) run(parent context.Context, current *job) {
 	m.settle(current)
 }
 
-func (m *manager) fetchItem(ctx context.Context, target *item, directory string, domains []string, userAgent, referer string) {
+func (m *manager) fetchItem(ctx context.Context, target *item, directory string, domains []string, userAgent, referer string, cookies []cookieSpec) {
 	destination, err := safeJoin(directory, target.Name)
 	if err != nil {
 		m.recordItem(target, "failed", 0, "", "", err.Error())
@@ -326,6 +342,8 @@ func (m *manager) fetchItem(ctx context.Context, target *item, directory string,
 		Dest:      destination,
 		UserAgent: userAgent,
 		Referer:   referer,
+		Cookies:   cookies,
+		Progress:  itemProgress{manager: m, target: target},
 	})
 	if err != nil {
 		m.log.Warn("item failed",
@@ -336,7 +354,7 @@ func (m *manager) fetchItem(ctx context.Context, target *item, directory string,
 	}
 	m.log.Info("item stored",
 		"name", target.Name, "kind", target.Kind,
-		"host", result.Host, "bytes", result.Bytes)
+		"host", result.Host, "bytes", result.Bytes, "resumes", result.Resumes)
 	m.recordItem(target, "done", result.Bytes, result.SHA256, result.ContentType, "")
 }
 

@@ -1,11 +1,11 @@
 # Configuration reference
 
 > **[Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)** —
-> a self-hosted Douyin and TikTok data API: REST, MCP and a web console, with
-> an identity pool that maintains itself.
+> a self-hosted Douyin, TikTok and Bilibili data API: REST, MCP and a web
+> console, with an identity pool that maintains itself.
 > [All docs](../README.md) · [中文](../zh/03-configuration.md)
 
-After reading this you will know which settings need a restart and which do not, how to read and change the ones that do not from the console, the CLI or the API, and what every one of the 54 runtime settings does.
+After reading this you will know which settings need a restart and which do not, how to read and change the ones that do not from the console, the CLI or the API, and what every one of the 65 settings in the settings table does.
 
 ## The two layers
 
@@ -47,15 +47,21 @@ Read once at process start by `BootstrapSettings` in `src/dtk/core/config.py`. A
 | --- | --- | --- |
 | `DTK_SECRET_KEY` | none — required, minimum 32 characters | Master key for credential encryption. The image ships no default, and every role refuses to start without it. Changing it makes already-stored cookies and proxy credentials undecryptable. |
 | `DTK_DATABASE_URL` | `postgresql+asyncpg://dtk:dtk@postgres:5432/dtk` | Postgres DSN. Must be the asyncpg driver. |
+| `DTK_DB_POOL_SIZE` | `5` | Database connections each process - the api, the worker - keeps open. |
+| `DTK_DB_MAX_OVERFLOW` | `5` | How many more each process may open under load; past that a request waits for a connection instead of failing. The two processes together, plus five for the CLI and TimescaleDB, must fit under Postgres' `max_connections`, which `docker/compose.yml` sets to 100; `dtk diagnose` warns when they do not. Until 5.1.9 the pools were a fixed 10 + 20, and on a host whose Postgres had tuned itself to 25 connections the instance answered "too many clients already" under load. |
 | `DTK_REDIS_URL` | `redis://redis:6379/0` | Redis URL. Queue, cache, token buckets and console sessions live here. |
 | `DTK_BIND_HOST` | `127.0.0.1` | Address the API binds to. The container overrides this to `0.0.0.0`; what limits exposure there is the published port. |
 | `DTK_BIND_PORT` | `8000` | Port the API binds to. |
 | `DTK_LOG_LEVEL` | `info` | Log level, passed through to uvicorn. |
 | `DTK_LOG_JSON` | `true` | Structured JSON logs. Set to `false` for human-readable lines in a terminal. |
-| `DTK_BROWSER_RPC_URL` | empty | Where the headless browser service listens, e.g. `http://browser-rpc:9000`. Empty disables automatic identity minting; the pool then depends on manually imported cookies, which is a supported degraded mode, not an error. |
+| `DTK_BROWSER_RPC_URL` | empty | Where the headless browser service listens, e.g. `http://browser-rpc:9000`. Empty disables automatic minting for Douyin and TikTok; those pools then depend on manually imported cookies, which is a supported degraded mode, not an error. Bilibili guests are minted without a browser, so that pool keeps refilling either way. |
 | `DTK_BACKUP_DIR` | `backups` | Where backup archives are written and listed from. The API and worker must agree: the worker writes an archive and the API serves it. The container image is read-only, so compose points this at a shared volume. |
 | `DTK_DOWNLOADER_URL` | empty | Where the Go media downloader listens, e.g. `http://downloader:9100`. Empty disables media downloads entirely; `POST /api/v1/downloads` then answers 501 with an actionable message and nothing else is affected. |
 | `DTK_DOWNLOADER_TOKEN` | empty | Optional shared secret for that sidecar. It listens on an internal network no other container is on, so this is defence in depth; empty means the sidecar checks nothing. |
+| `DTK_TRANSCRIBER_URL` | empty | Where the transcription sidecar listens, e.g. `http://transcriber:9200`. Empty disables transcription; `POST /api/v1/transcriptions` then answers 501 and says how to turn it on. |
+| `DTK_TRANSCRIBER_TOKEN` | empty | Shared secret for that sidecar, sent as `X-Transcriber-Token`; empty means the sidecar checks nothing. It must match on both sides. |
+| `DTK_TRANSCRIBER_TIMEOUT_SECONDS` | `3600` | How long the worker waits for one transcription. The sidecar reads the same variable as its decode limit, so the two give up together. |
+| `DTK_TRANSCRIBER_NORMALIZATION_FAILURE_POLICY` | `fallback` | What happens when number normalization fails: `fallback` keeps the unnormalized text, `fail` fails the transcription. Read by both sides. |
 
 Read directly by the process or by the container entrypoint, outside that class:
 
@@ -66,7 +72,7 @@ Read directly by the process or by the container entrypoint, outside that class:
 | `DTK_WORKER_COMMAND` | unset | Overrides the worker command line. Only needed if the worker module is not importable under its usual name. |
 | `DTK_COMMIT`, `DTK_GIT_COMMIT`, `GIT_COMMIT` | unset | Commit stamp reported by the system status endpoint, in that order of preference. |
 
-Four more are read by compose itself rather than by the application: `DTK_IMAGE_TAG` (image tag, default `dev`), `DTK_REDIS_MAXMEMORY` (Redis ceiling, default `320mb`), and `CLOAKBROWSER_REPO` / `CLOAKBROWSER_COMMIT`, which are build arguments for the browser image rather than settings anything reads at runtime — see [Installation and deployment](./02-installation.md). `DTK_BIND_HOST` and `DTK_BIND_PORT` do double duty there — they also decide the published address. Compose interpolation reads `docker/.env` or the shell for all six of these, never the root `.env`, which is why a `CLOAKBROWSER_COMMIT` or a `DTK_IMAGE_TAG` written into the root file does nothing. To publish on all interfaces:
+More are read by compose itself rather than by the application: `DTK_IMAGE`, `DTK_DOWNLOADER_IMAGE`, `DTK_TRANSCRIBER_IMAGE` and `DTK_IMAGE_TAG` (which images run; the tag defaults to `dev`), `DTK_TRANSCRIBER_MODEL_PATH` (the host directory mounted as the transcriber's models), `DTK_REDIS_MAXMEMORY` (Redis ceiling, default `320mb`), and `CLOAKBROWSER_REPO` / `CLOAKBROWSER_COMMIT`, which are build arguments for the browser image rather than settings anything reads at runtime — see [Installation and deployment](./02-installation.md#compose-level-variables). `DTK_BIND_HOST` and `DTK_BIND_PORT` do double duty there — they also decide the published address. Compose interpolation reads `docker/.env` or the shell for all of these, not the root `.env` — unless you run it with `COMPOSE_ENV_FILES=.env`, as the guided install's `dtkctl` does. That is why a `CLOAKBROWSER_COMMIT` or a `DTK_IMAGE_TAG` written into the root file does nothing on a bare `docker compose`, and why a `DTK_TRANSCRIBER_MODEL_PATH` there leaves the transcriber with an empty model directory. To publish on all interfaces:
 
 ```bash
 DTK_BIND_HOST=0.0.0.0 docker compose -p dtk -f docker/compose.yml up -d
@@ -76,7 +82,7 @@ See [Installation and deployment](./02-installation.md) for what to put in front
 
 ## Sidecar environment
 
-The two optional containers have their own environment, read once at start. Neither talks to the database, and compose blanks `DTK_SECRET_KEY` for both.
+The optional containers have their own environment, read once at start. None of them talks to the database, and compose blanks `DTK_SECRET_KEY` for all three.
 
 ### browser-rpc (`DTK_BROWSER_*`)
 
@@ -91,7 +97,7 @@ From `docker/browser_rpc/settings.py`. Set these in the root `.env`; compose pin
 | `DTK_BROWSER_PROFILE_ROOT` | `/tmp/dtk-browser-profiles` | Parent directory for browser profiles. Compose pins `/profiles`, which is a tmpfs, so a single-use mint profile never touches a disk. |
 | `DTK_BROWSER_WARM_CONTEXTS` | `1` | Warm signing contexts kept per platform. Each resident context costs roughly 300 MB of the container's `/tmp`, times two platforms — this is a RAM budget, not free space. |
 | `DTK_BROWSER_WARM_REFRESH_SECONDS` | `1800` | How old a warm context may get before it is rebuilt. The platforms ship new JavaScript regularly and a stale page signs with stale code. |
-| `DTK_BROWSER_PREWARM` | `true` | Prewarm at startup so the first signature does not pay for a cold page. |
+| `DTK_BROWSER_PREWARM` | `true` | Prewarm at startup so the first signature does not pay for a cold page. It runs in the background, through `DTK_BROWSER_SIGN_PROXY_URL` when that is set, and a platform whose page could not open is tried again after 30 seconds, doubling up to 10 minutes - so a signing proxy that was down at start needs no restart once it is back. |
 | `DTK_BROWSER_MAX_CONCURRENT_MINTS` | `2` | How many identities may be minted at once. |
 | `DTK_BROWSER_MINT_TIMEOUT_SECONDS` | `75` | Service-side budget for one mint. |
 | `DTK_BROWSER_SIGN_TIMEOUT_SECONDS` | `8` | Service-side budget for one signature. |
@@ -119,6 +125,23 @@ From `docker/downloader/main.go`. A value that is empty, unparseable or not posi
 | `DTK_DOWNLOADER_HISTORY` | `500` | How many finished jobs it remembers. |
 | `DTK_DOWNLOADER_MAX_REDIRECTS` | `5` | Redirect ceiling per transfer. |
 | `DTK_DOWNLOADER_TIMEOUT_SECONDS` | `900` | Ceiling for one transfer. |
+
+### transcriber (`DTK_TRANSCRIBER_*`)
+
+From `docker/transcriber/app.py`. Unlike the downloader, a value that is not a number fails the start: the sidecar is a Python process that parses these once at import.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `DTK_TRANSCRIBER_MODEL_DIR` | `/models/funasr` | Where the models are read from. Compose pins it to the read-only model mount; the host side is `DTK_TRANSCRIBER_MODEL_PATH`. |
+| `DTK_TRANSCRIBER_MEDIA_ROOT` | `/var/lib/dtk/media` | Where stored media is read from. Compose pins it to the media volume, mounted read-only. |
+| `DTK_TRANSCRIBER_TOKEN` | empty | Shared secret the sidecar expects; pair it with `DTK_TRANSCRIBER_TOKEN` on the app side. |
+| `DTK_TRANSCRIBER_THREADS` | `2` | ONNX Runtime threads per job. Keep it at or under the container's `cpus`. |
+| `DTK_TRANSCRIBER_WORKERS` | `1` | Jobs at once. Each one is a full set of threads and its own copy of the decoded audio. |
+| `DTK_TRANSCRIBER_QUEUE` | `8` | Jobs waiting behind those. Past it the sidecar answers 429. |
+| `DTK_TRANSCRIBER_JOB_HISTORY` | `64` | Finished jobs kept so a restarted worker can still collect their results. Never below workers plus queue. |
+| `DTK_TRANSCRIBER_PROGRESS_LOG_SECONDS` | `30` | How often a running job logs its progress. At least 5. |
+| `DTK_TRANSCRIBER_TIMEOUT_SECONDS` | `3600` | ffmpeg decode limit for one file, at least 60. The worker reads the same variable. |
+| `DTK_TRANSCRIBER_NORMALIZATION_FAILURE_POLICY` | `fallback` | `fallback` or `fail`. Any other value keeps the sidecar unhealthy rather than guessing. |
 
 ## Changing a runtime setting
 
@@ -178,7 +201,7 @@ Every write leaves an audit row (`settings.updated`, or `settings.updated_sensit
 
 ## What SENSITIVE means
 
-Seven keys are declared `SENSITIVE` rather than `RUNTIME`. The scope is not a styling variation — it means *widening this enlarges the attack surface*, and it changes who may write it and what it costs to do so.
+Eight keys are declared `SENSITIVE` rather than `RUNTIME`. The scope is not a styling variation — it means *widening this enlarges the attack surface*, and it changes who may write it and what it costs to do so.
 
 | Key | What widening it exposes |
 | --- | --- |
@@ -189,8 +212,9 @@ Seven keys are declared `SENSITIVE` rather than `RUNTIME`. The scope is not a st
 | `security.webhook_secret` | The secret that makes those callbacks verifiable. |
 | `security.request_proxy` | Whether an API key holder may pick this server's egress. |
 | `api.public_endpoints` | Every entry removes a credential check from one endpoint. |
+| `demo.enabled` | A shared account and API key, published, that anyone can spend this instance's identity pool with. |
 
-Six of them are `security.*`; the seventh, `api.public_endpoints`, sits in the `api` group but carries the same scope, because every entry in it removes a credential check.
+Six of them are `security.*`. The other two sit in their own groups and carry the same scope: every entry in `api.public_endpoints` removes a credential check, and `demo.enabled` publishes a credential.
 
 A sensitive write requires all of:
 
@@ -224,7 +248,7 @@ Six keys carry extra validation beyond their type, under four rules:
 
 ## The complete runtime reference
 
-All 54 keys, grouped by prefix. Defaults are exactly what the code declares.
+All 65 keys, grouped by prefix. Defaults are exactly what the code declares.
 
 ### `sched` — scheduler (7)
 
@@ -240,7 +264,7 @@ Edited on the **Scheduler** page in the console. See [Concepts](./04-concepts.md
 | `sched.circuit_min_samples` | `20` | Minimum requests observed before an endpoint may trip, so a short burst of failures cannot open the circuit. | Raise it on a busy instance where 20 samples is noise. |
 | `sched.circuit_min_identities` | `3` | How many distinct identities must be failing before an endpoint trips. Separates a broken endpoint from one broken identity. | Lower it to `1` only while debugging; it removes the distinction the setting exists to make. |
 
-### `pool` — identity pool (4)
+### `pool` — identity pool (13)
 
 Also on the **Scheduler** page. See [Identities and proxies](./06-identities-and-proxies.md).
 
@@ -248,8 +272,11 @@ Also on the **Scheduler** page. See [Identities and proxies](./06-identities-and
 | --- | --- | --- | --- |
 | `pool.min_size` | `3` | Low-water mark per platform. Dropping below it raises an alert and triggers minting. | Raise it if bursts routinely exhaust the pool; keep it at or below `target_size`. |
 | `pool.target_size` | `8` | How many identities the pool tries to keep per platform. | Raise it for more throughput, at the cost of more minting and more proxies. Values below `min_size` are ignored. |
-| `pool.douyin.min_size` / `pool.tiktok.min_size` | `-1` | One platform's own low-water mark. `-1` follows `pool.min_size`; `0` turns automatic minting off for that platform, together with its `pool_empty` / `pool_below_min` alerts. Imported and hand-minted identities still work. | Set the platform you do not use to `0`, for example TikTok on a server with no route to it. Anything below `-1` is refused. |
-| `pool.douyin.target_size` / `pool.tiktok.target_size` | `-1` | One platform's own top-up target. `-1` follows `pool.target_size`. Values below that platform's mark are raised to it. | When one platform carries most of the traffic and needs a bigger pool than the other. |
+| `pool.douyin.min_size` / `pool.tiktok.min_size` / `pool.bilibili.min_size` | `-1` | One platform's own low-water mark. `-1` follows `pool.min_size`; `0` turns automatic minting off for that platform, together with its `pool_empty` / `pool_below_min` alerts. Imported and hand-minted identities still work. | Set the platform you do not use to `0`, for example TikTok on a server with no route to it. Anything below `-1` is refused. |
+| `pool.douyin.target_size` / `pool.tiktok.target_size` / `pool.bilibili.target_size` | `-1` | One platform's own top-up target. `-1` follows `pool.target_size`. Values below that platform's mark are raised to it. | When one platform carries most of the traffic and needs a bigger pool than the others. |
+| `pool.douyin.guests_first` / `pool.tiktok.guests_first` / `pool.bilibili.guests_first` | `True` | Answer that platform's endpoints that need no login from guest identities first - the active guests, or the degraded ones when none is active - and from a login only when no guest can take the request: none is in rotation for the endpoint, or every one is mid-request or out of quota. A guest is minted for nothing; a login is somebody's account, and a request a guest answers identically only wears it out for the endpoints that need it. Endpoints that need a login still prefer or require one. Off, logins and guests share every endpoint by recency. Read by the worker on every request. It is the switch on the Scheduler page's coverage card, not a row among the `pool.*` editors. | Off when the logins should share that traffic anyway, for instance a pool that is mostly logins. See [What needs a logged-in identity](./06-identities-and-proxies.md#what-needs-a-logged-in-identity). |
+| `pool.douyin.direct_egress` / `pool.tiktok.direct_egress` / `pool.bilibili.direct_egress` | `True` | With proxies configured, this machine's own IP counts as one more exit for that platform: once every proxy carries one of its identities, automatic refill mints one more on the direct egress, and like a proxy it carries only one. With no proxies at all the machine's IP is the only exit anyway and this switch has no effect. It is in the `pool.*` editor on the Scheduler page. | Turn it off where this machine cannot reach the platform directly, such as a server in mainland China with a proxy only for TikTok: minting on the direct egress would keep failing and put automatic refill into backoff. See [How identities and proxies are paired](./06-identities-and-proxies.md#how-identities-and-proxies-are-paired). |
+| `pool.retire_fail_streak` | `10` | Consecutive failures after which a minted guest identity is retired automatically, every five minutes, while its platform still has an identity under `pool.max_fail_streak`. Imported identities are never retired this way. Never below `pool.max_fail_streak`; 0 turns it off. See [the state machine](./06-identities-and-proxies.md#the-state-machine). | Raise it if guests that would have recovered are being retired; 0 to keep every identity until you retire it. |
 | `pool.max_fail_streak` | `3` | Consecutive failures after which an identity stops counting towards the pool level, so the filler mints a replacement instead of counting a session that serves nothing. The streak is used rather than the health score because the score is empty until there is traffic, and scoring a fresh identity as unusable would turn the low-water mark into a minting loop. | Rarely. Raise it if a flaky proxy is causing needless re-minting. |
 | `pool.health_prior` | `0.8` | Assumed success rate for an identity with no history, 0–1. Decides how eagerly a freshly minted identity is scheduled. | Lower it if new identities are getting risk-controlled before they prove themselves. |
 
@@ -257,7 +284,7 @@ Also on the **Scheduler** page. See [Identities and proxies](./06-identities-and
 
 | Key | Default | What it does | When you would change it |
 | --- | --- | --- | --- |
-| `signing.mode` | `'native'` | Which signer produces the signature. `native` runs the in-process algorithms and never reaches for a browser. `rpc` always asks browser-rpc. `auto` starts native and crosses to the browser for endpoints the platform's own SDK signs, or once an endpoint's risk rate suggests the native signature is being rejected. | Switch to `rpc` the day a platform ships a new SDK and the in-process port has not caught up. `native` is the only coherent mode with no browser-rpc container. |
+| `signing.mode` | `'native'` | Which signer produces the signature. `native` runs the in-process algorithms and never reaches for a browser. `rpc` always asks browser-rpc. `auto` starts native and crosses to the browser for endpoints the platform's own SDK signs, or once an endpoint's risk rate suggests the native signature is being rejected. Bilibili's WBI signature is always computed natively: browser-rpc never signs Bilibili, whatever the mode. | Switch to `rpc` the day a platform ships a new SDK and the in-process port has not caught up. `native` is the only coherent mode with no browser-rpc container. |
 | `signing.fallback_enabled` | `True` | Whether the mode's non-preferred signer may be used when the preferred one is unavailable. | Turn it off to find out which signer is actually carrying traffic — with fallback on, a broken signer looks healthy because its traffic quietly moves to the other one. In `auto` the risk-driven switch *is* the fallback, so turning it off pins `auto` to native. |
 | `signing.rpc_timeout_seconds` | `60` | Ceiling for one browser-rpc signing call. It has to cover a cold one: the first call for an identity launches a browser and loads the platform through that identity's proxy — measured at about 4s without a proxy — while later calls for the same identity are answered by the resident page in milliseconds. | Raise it if minting through slow proxies times out; raise `DTK_BROWSER_WARM_CONTEXTS` instead if the problem is cold starts. |
 
@@ -268,8 +295,8 @@ Cached responses live in Redis, keyed per distinct request.
 | Key | Default | What it does | When you would change it |
 | --- | --- | --- | --- |
 | `cache.content_ttl` | `1800` | How long a parsed video detail stays reusable before it is fetched again. | Lower it if you need fresh counters; raise it to spend fewer identities on repeat lookups. Entries run 16–200 KB, so a long TTL costs Redis memory. |
-| `cache.author_ttl` | `900` | How long a parsed user profile stays reusable. | Same trade-off; profiles move slower than posts. |
-| `cache.list_ttl` | `300` | How long a parsed list page (author posts, comments, replies) stays reusable. | Lists change more often than a single item, so this is usually the shortest of the three. |
+| `cache.author_ttl` | `900` | How long a parsed user profile, sound or hashtag stays reusable. | Same trade-off; profiles move slower than posts. |
+| `cache.list_ttl` | `300` | How long a parsed list page (author posts, comments, replies, search results, trending boards) or live room - with its audience ranking and on-air check - stays reusable. | Lists change more often than a single item, so this is usually the shortest of the three. |
 
 ### `snapshot` — content history (1)
 
@@ -370,7 +397,16 @@ Easiest to edit on the **Notifications** page, which validates a channel as you 
 
 | Key | Default | What it does | When you would change it |
 | --- | --- | --- | --- |
-| `system.check_updates` | `False` | Whether the console offers its update check. The request goes from your browser to GitHub, never from the server, and it is opt-in because some deployments have no egress at all. | Turn it on if you want to be told about releases. |
+| `system.check_updates` | `True` | Whether the console checks for a newer release: once a day per browser after sign-in, and on demand from the System page. The request goes from your browser to GitHub, never from the server, so it carries nothing about the deployment. | Turn it off on an air-gapped box. |
+
+### `demo` — the public demo (2, one sensitive)
+
+On **Settings → Demo mode**. See [Security](./15-security.md#demo-mode) for what a demo account can and cannot reach.
+
+| Key | Default | What it does | When you would change it |
+| --- | --- | --- | --- |
+| `demo.enabled` | `False` | Publishes a shared read-only account and API key so anyone can try this instance. Turning it on mints both and shows them once; turning it off ends every demo session and stops the key working, without deleting anything. Sensitive. | On a public instance put up for people to try. |
+| `demo.task_retention_minutes` | `30` | How long a task started by the demo account is kept before the maintenance sweep removes it. Minutes, not days: the row exists so the caller can collect their answer. | Raise it if demo visitors poll slowly and find their results gone. |
 
 ## When a change takes effect
 

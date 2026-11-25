@@ -80,6 +80,11 @@ class SignRequest(BaseModel):
     url: str
     method: str = "GET"
     query: str | None = None
+    #: A POST's body, exactly as it will be sent, and its Content-Type. The
+    #: platform's a_bogus hashes the body, so signing without it signs a
+    #: different request than the one that goes out.
+    body: str | None = None
+    content_type: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
     user_agent: str | None = None
     #: The identity's jar. Empty asks for an anonymous context, which is only
@@ -100,13 +105,21 @@ class SignResponse(BaseModel):
     enough for the API to return an 18-byte empty body, and changing it back
     restores the data. So the caller must send the request under exactly the UA
     the signature was computed with, and returning it here is what lets the
-    caller check rather than assume.
+    caller check rather than assume. It is the signing page's own; a TikTok
+    request naming another is refused with 409 ``user_agent_mismatch`` instead
+    (#832), and so is a Douyin one naming another operating system. Douyin
+    accepts the page's signature under any other browser or version, so it is
+    signed under the page's, and this says which.
     """
 
     model_config = ConfigDict(extra="ignore")
 
     params: dict[str, str]
     user_agent: str
+    #: True when a body was supplied and handed to the page's own fetch. The
+    #: caller checks it: a service from before bodies would ignore the field
+    #: and sign an empty one, and nothing else in the answer would say so.
+    body_signed: bool = False
 
 
 class HealthResponse(BaseModel):
@@ -116,13 +129,15 @@ class HealthResponse(BaseModel):
     treats zero warm contexts as unhealthy. `BrowserRpcClient.health` reads
     `warm_contexts`, `chromium_major` and `backend_version`; the console shows
     `chromium_major` beside the wreq profile version so the version drift from
-    doc 04 stays visible.
+    doc 04 stays visible. `user_agent` is the string every signature from this
+    browser carries, None until a page has reported it.
     """
 
     status: str
     backend: str
     backend_version: str
     chromium_major: int | None = None
+    user_agent: str | None = None
     warm_contexts: int = 0
     uptime: float = 0.0
     backend_pin: str | None = None

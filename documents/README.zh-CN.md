@@ -29,7 +29,8 @@
   - 用 Docker（推荐）：[首次安装](./zh/02-installation.md#首次安装)
   - 手动装依赖：[开发方式](./zh/02-installation.md#不用-docker-运行) · [裸机生产部署](./zh/02-installation.md#在裸机上做生产部署)
   - 机器在中国大陆：[中国大陆的网络准备](./zh/02-installation.md#中国大陆的网络准备) —— 先换源，不然多半卡在拉镜像
-- [配置参考](./zh/03-configuration.md) —— 两层配置的区别，以及全部 54 项运行时配置的默认值和该在什么时候改
+- [配置参考](./zh/03-configuration.md) —— 两层配置的区别，以及全部 62 项配置的默认值和该在什么时候改
+- [FunASR ONNX 模型准备](./zh/18-funasr-models.md) —— 下载、校验并离线加载转写所需的 ASR、VAD 与标点模型，手工或交给安装脚本
 - [安全](./zh/15-security.md) —— 软件已经替你做了什么、什么是你自己的责任，以及哪些操作会交出凭据
 
 **使用控制台**
@@ -37,7 +38,7 @@
 - [控制台总览](./zh/05-console-overview.md) —— 外壳、总览、系统信息、日志、诊断
 - [身份与代理](./zh/06-identities-and-proxies.md) —— 身份池及其状态机、铸造、导入 Cookie、代理、调度器页面与接口访问控制页面、熔断器
 - [调试台与工具](./zh/07-playground-and-tools.md) —— 在浏览器里直接调任意接口、计算签名、反解签名、解析链接、按需铸造身份
-- [下载、资料库与关注列表](./zh/08-downloads-and-library.md) —— 把媒体存到自己的硬盘上、几个月后还能找回来、定时采集某个目标
+- [下载、资料库与关注列表](./zh/08-downloads-and-library.md) —— 把媒体存到自己的硬盘上、几个月后还能找回来、把已存的视频转成文字、定时采集某个目标
 - [用户与 API 密钥](./zh/09-users-and-api-keys.md) —— 角色、权限范围、密钥，以及谁能做什么
 
 侧边栏里的每一行都由上面某一篇负责，[控制台总览](./zh/05-console-overview.md#每个页面由哪篇文档负责)里就是那张对照表：调度器（`/scheduler`）和接口访问控制（`/endpoint-access`）在《身份与代理》里讲，备份（`/backup`）、通知（`/notifications`）和设置（`/settings`）在《运维》里讲。
@@ -64,7 +65,7 @@
 |---|---|---|
 | 01 | [快速开始](./zh/01-quickstart.md) | 从零到第一次成功请求 |
 | 02 | [安装与部署](./zh/02-installation.md) | 两种部署方式、compose、环境变量、profile、升级 |
-| 03 | [配置参考](./zh/03-configuration.md) | 全部 54 项运行时配置 |
+| 03 | [配置参考](./zh/03-configuration.md) | 全部 62 项配置 |
 | 04 | [核心概念](./zh/04-concepts.md) | 心智模型 |
 | 05 | [控制台总览](./zh/05-console-overview.md) | 外壳、总览、系统信息、日志、诊断 |
 | 06 | [身份与代理](./zh/06-identities-and-proxies.md) | 身份池与调度器 |
@@ -79,6 +80,7 @@
 | 15 | [安全](./zh/15-security.md) | 威胁模型与责任划分 |
 | 16 | [参与开发](./zh/16-contributing.md) | 动代码 |
 | 17 | [常见问题与术语表](./zh/17-faq.md) | 问题与术语 |
+| 18 | [FunASR ONNX 模型准备](./zh/18-funasr-models.md) | 离线转写模型下载、校验与接入 |
 
 ## 这里没有什么
 

@@ -1,8 +1,8 @@
 # Downloads, library and watchlist
 
 > **[Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)** —
-> a self-hosted Douyin and TikTok data API: REST, MCP and a web console, with
-> an identity pool that maintains itself.
+> a self-hosted Douyin, TikTok and Bilibili data API: REST, MCP and a web
+> console, with an identity pool that maintains itself.
 > [All docs](../README.md) · [中文](../zh/08-downloads-and-library.md)
 
 This page is about keeping things rather than just reading them: putting video and images on your own disk, finding them again months later, and collecting the same target on a timer. After reading it you will know what each of the three pages costs, where the bytes actually go, what the size ceiling will take away from you, and how to stop it taking the one post you meant to keep.
@@ -17,7 +17,9 @@ The console splits "what I have seen" from "what I am holding" from "what I keep
 | Downloads | `/downloads` | The download index: one row per request to store a post's media, plus what landed on disk | Disk, and one identity-backed request per post that has to be fetched first |
 | Watchlist | `/watchlist` | Standing instructions: collect this author or this post every N hours, forever | The identity pool, on a schedule, for as long as the entry exists |
 
-All three live in the **Tools** group in the sidebar. A post can be in the archive without its media being on disk (the usual case), and a download can outlive its archive row — the downloads table still describes a real directory on the volume even if the post was later deleted from the library.
+A fourth page, **Transcriptions** (`/transcriptions`), holds the text made from stored videos when the optional transcriber is on; it costs CPU on this machine and nothing upstream. See [Turning a stored video into text](#turning-a-stored-video-into-text).
+
+All of them live in the **Content** group in the sidebar. A post can be in the archive without its media being on disk (the usual case), and a download can outlive its archive row — the downloads table still describes a real directory on the volume even if the post was later deleted from the library.
 
 ## The media downloader is optional
 
@@ -32,7 +34,7 @@ docker compose -p dtk -f docker/compose.yml --profile downloader up -d --build
 
 Without `DTK_DOWNLOADER_URL`, `POST /api/v1/downloads` answers `501` with `NOT_CONFIGURED` and the message *"this instance has no media downloader; start the downloader compose profile and set DTK_DOWNLOADER_URL"*. The Downloads page shows the same thing as a card at the top and keeps working as a read-only index of whatever was stored earlier.
 
-The sidecar is the container that dials arbitrary CDN hosts, so it is deliberately the emptiest one in the stack: a `scratch` image holding one static Go binary, no shell, no package manager, a read-only root filesystem, all capabilities dropped, `no-new-privileges`, and exactly one writable path. It is on the `edge` network only — it has no route to Postgres or Redis — and Compose blanks `DTK_SECRET_KEY`, `DTK_DATABASE_URL` and `DTK_REDIS_URL` for it even though the shared env file carries them. It is never handed a cookie, a proxy, an API key or a database address; it receives a list of mirrors, the host allowlist for that one platform, and a byte ceiling.
+The sidecar is the container that dials arbitrary CDN hosts, so it is deliberately the emptiest one in the stack: a `scratch` image holding one static Go binary, no shell, no package manager, a read-only root filesystem, all capabilities dropped, `no-new-privileges`, and exactly one writable path. It is on the `edge` network only — it has no route to Postgres or Redis — and Compose blanks `DTK_SECRET_KEY`, `DTK_DATABASE_URL` and `DTK_REDIS_URL` for it even though the shared env file carries them. It is never handed a login, a proxy, an API key or a database address; it receives a list of mirrors, the host allowlist for that one platform, and a byte ceiling. For TikTok it also receives one cookie, `tt_chain_token`: TikTok's CDN serves a video link only to the session that fetched it, so a TikTok download always fetches the post again and hands over that identity's token and nothing else from its jar. The token is anonymous, goes only to `tiktok.com` hosts, and is never written, listed or logged.
 
 Its own limits, all read from `.env`:
 
@@ -62,6 +64,7 @@ The layout is one directory per post:
 ├── video.mp4        # or .mov, .webm, .m4v
 ├── cover.jpg        # one, never two
 ├── image-01.jpg     # image posts: one file per slide
+├── image-01.mp4     # a live photo's clip, beside its still
 ├── image-02.jpg
 └── meta.json
 ```
@@ -70,10 +73,11 @@ The layout is one directory per post:
 
 What the planner decides before anything is fetched:
 
-- **One video per post.** Every bitrate the platform offers is treated as a mirror of the same file — the first that lands wins. Storing four copies of one clip is not a feature. The parser's order is kept, and it puts the watermark-free stream first.
+- **One video per post.** Every bitrate the platform offers is treated as a mirror of the same file — the first that lands wins. Storing four copies of one clip is not a feature. The parser's order is kept, and it puts the watermark-free stream first. A Bilibili video is one progressive MP4 rather than separate audio and video tracks, so it is one file too; a video in several parts is one post, and the file is the first part unless you ask for another (see [One part of a multi-part video](#one-part-of-a-multi-part-video)). Measured with a guest identity, that file is up to 1080p on older uploads and 720p on a current one.
+- **A live photo keeps its clip.** A Douyin slide that is a live photo carries a few seconds of MP4 of its own, and it is stored right after its still under the same name — `image-01.mp4` beside `image-01.webp`. An album can mix them with ordinary stills, which have no clip. The clip is not the post's video: the library does not play it as the post and the transcriber does not read it. An album archived before 5.1.6 has no clips in its stored manifest, so its first download after the upgrade re-parses the post first, however fresh its links are.
 - **One cover**, added last, and only if the post has not already hit the item cap.
-- **At most 64 files** per post. A Douyin image album tops out around 35 slides; the cap guards against a malformed payload becoming a thousand-item job.
-- **Images are capped at 32 MiB** each, or `media.max_file_bytes` if that is lower. A 500 MB "image" is a sign something is wrong.
+- **At most 128 files** per post. A Douyin image album tops out around 35 slides, and with every one a live photo that is 71 files with the cover; the cap guards against a malformed payload becoming a thousand-item job.
+- **Images are capped at 32 MiB** each, or `media.max_file_bytes` if that is lower. A 500 MB "image" is a sign something is wrong. A live photo's clip is held to the same cap: it measured about 0.6 MB at 720p.
 - **Extensions are taken from the URL only when recognised** — `mp4`, `mov`, `webm`, `m4v` for video and `jpg`, `jpeg`, `png`, `webp`, `heic`, `gif` for images — otherwise the kind's default is used. A query string ending in `.php` cannot name a file on your disk.
 - **Every mirror is checked against the media host allowlist** before a job exists, and anything dropped is reported back as a `skipped` reason.
 
@@ -94,7 +98,7 @@ The **Skip what is already downloaded** checkbox is shared by every mode that ca
 
 ### One post
 
-Paste a link or a post id. Digits are treated as an id, anything else as a link. The platform menu beside the box is only consulted for a bare id and is disabled while a link is in the box, because the link says which platform it is — and if you send both and they disagree, the API refuses rather than guessing.
+Paste a link or a post id. Digits, and a Bilibili `BV…` or `av…` id, are treated as an id; anything else as a link. The platform menu beside the box is only consulted for bare digits and is disabled while a link is in the box, because the link says which platform it is — and if you send both and they disagree, the API refuses rather than guessing. A `BV…` or `av…` id names its own platform, so it goes to Bilibili and the menu shows that; plain digits with Bilibili picked are read as an av number and converted to the bvid.
 
 Three things can happen, and the toast tells you which:
 
@@ -102,9 +106,19 @@ Three things can happen, and the toast tells you which:
 - **Fetching the post first.** This instance has never seen the post. The worker fetches it through the same pool, scheduler and request log as any other read, then downloads what comes back. Slower first response; you do not have to parse it yourself first.
 - **Already downloading / already downloaded.** The request was answered with an existing download (`reused: "in_flight"` or `"already_stored"`, HTTP `200`). Joining an in-flight download is **never optional**, whatever `skip_existing` says: two downloads of one post write into the same directory and the loser of that race renames a file the winner has already moved, and comes back `partial` with a file missing.
 
-Short links (`v.douyin.com/...`, `vm.tiktok.com/...`) are refused here, by design: resolving one means following it, and this endpoint makes no network calls. Send them to `POST /api/v1/parse` — which expands them in the background — and the post is archived by the time you come back. The **Many posts** mode accepts short links directly, because it goes through the parse pipeline.
+Short links (`v.douyin.com/...`, `vm.tiktok.com/...`, `b23.tv/...`) are refused here, by design: resolving one means following it, and this endpoint makes no network calls. Send them to `POST /api/v1/parse` — which expands them in the background — and the post is archived by the time you come back. The **Many posts** mode accepts short links directly, because it goes through the parse pipeline.
 
 If the post is archived and has nothing downloadable, you get a `400` with the reasons now, rather than a task that fails a minute later.
+
+### One part of a multi-part video
+
+A Bilibili upload can come in several parts (分P). A plain download stores the first part, the one the post's link plays. To store another, pass `part` (counted from 1) to `POST /api/v1/downloads`, or paste the link a player is on — `?p=3` in a Bilibili link means part 3 and is read the same way. `part: 1` is the post's own download, whichever way it is spelt. Asking for a part past the last one fails with the number of parts the video has. Douyin and TikTok posts have no parts, and `part` there is a `400`.
+
+On the Downloads page, a Bilibili post in the **A post** mode gets a **Part** menu under the box. It starts on the first part, or on the one a pasted link's `?p=` names, and **List the parts** fills it with the rest, by title and length — on request rather than as you type, because listing costs a real request through the pool and most videos have one part. A part's row and drawer are marked `P3`.
+
+Each part is its own download, with its own `download_id`, stored in a directory beside the post's: `bilibili/<mid>/<bvid>-p3/`. Beside, not inside, because removing a download removes its directory, and a part nested in the post's own would go whenever the first part's files did. Two parts of one post can download at the same time; a second request for the same part joins the one in flight, as for any post. Saved to your computer, a part's files are named for it (`dtk-bilibili-<bvid>-p3-video.mp4`), so parts saved to one folder do not overwrite each other.
+
+The Library shows what the post's link plays, so it counts the first part's download as the post's stored media and not a later part's. A transcription follows the download, so transcribing part 3 is transcribing part 3's download. `GET /api/v1/bilibili/video/parts` lists the parts with their numbers, titles and lengths ([API](./11-api.md#a-videos-parts)).
 
 ### Many posts (batch parse and download)
 
@@ -116,17 +130,17 @@ Each line comes back as one of:
 
 | Kind | Submittable | Meaning |
 | --- | --- | --- |
-| `link` | yes | A recognised Douyin or TikTok URL |
+| `link` | yes | A recognised Douyin, TikTok or Bilibili URL |
 | `short_link` | yes | A share link that needs following; the parse pipeline expands it |
-| `content_id` | no | A bare post id with no platform attached to it |
-| `bad_id` | no | Looks like a post id but cannot be one — both platforms mint ids whose high bits are the second they were issued |
-| `unknown` | no | No Douyin or TikTok link in this line |
+| `content_id` | no | A bare post id with no platform attached to it — or a bare Bilibili bvid, which names its platform but is still not a link; this mode submits links only |
+| `bad_id` | no | Looks like a post id but cannot be one — Douyin and TikTok mint ids whose high bits are the second they were issued |
+| `unknown` | no | No Douyin, TikTok or Bilibili link in this line |
 
 The rejected kinds are answered locally, without spending a task, and appear in the table as failed rows with a reason.
 
 Submission is one request per chunk; **tracking is per row**. Each row then lives its own life — its own state, its own error, its own retry — because a synchronous bulk endpoint would smear one dead link into a single error for the whole paste. Rows are polled every 1.5 seconds, 8 at a time, round-robin so the tail of a long paste is not starved.
 
-The results table columns are: state, link, title, author, platform, kind, content id, plays, likes, and the error code. Comments, shares and published time are available but hidden by default — use the table's column chooser. Clicking a finished row opens a drawer with the video player, the images, the counters, per-file download buttons and the raw result payload.
+The results table columns are: state, link, title, author, platform, kind, content id, plays, likes, and the error code. Comments, shares and published time are available but hidden by default — use the table's column chooser. Clicking a finished row opens a drawer with the video player, the images, the counters, per-file download buttons and the raw result payload. A live photo plays its clip in place of the still, and gets a download button of its own for it.
 
 The toolbar:
 
@@ -140,17 +154,21 @@ The drawer's own download buttons are a **different thing** from "Save to this i
 
 ### An author's recent posts
 
-Paste a profile link, or the bare `sec_user_id` the library and playground hand you (both platforms spell it the same way: it starts `MS4wLjABAAAA`). The **How many posts** menu offers the newest 20, 50, 100, 200, or everything the feed will give up. It is a menu rather than a number field on purpose: every post is a download, every page of the feed is a read through the identity pool, and a free-text depth invites "99999" typed without a thought.
+Paste a profile link, or a bare author id: the `sec_user_id` the library and playground hand you on Douyin, the `secUid` on TikTok (both start `MS4wLjABAAAA`), or the numeric `mid` on Bilibili. A TikTok profile link names the `@handle`, which the post list does not take, so the page reads the profile once to get the `secUid`. The **How many posts** menu offers the newest 20, 50, 100, 200, or everything the feed will give up. It is a menu rather than a number field on purpose: every post is a download, every page of the feed is a read through the identity pool, and a free-text depth invites "99999" typed without a thought. Choosing everything asks first.
 
-The page walks the feed 20 posts at a time until it has enough, stopping at 40 pages, then queues one download per post. Failures on individual posts do not abandon the rest, and the toast reports queued / total / already here.
+The page walks the feed 20 posts at a time until it has enough, stopping at 40 pages, then queues one download per post, and reports both under the form as it goes: the page it is reading, then how many are queued, already here and failed, with the first failure's reason. **Stop** ends the run between any two requests. Failures on individual posts do not abandon the rest.
 
-One trap worth knowing: the platform menu is **disabled** in this mode, because a profile link carries the platform. If you paste a bare author id instead, it is looked up on whichever platform the menu was left showing — so for a bare TikTok `secUid`, paste the profile link instead.
+Douyin pages an author's posts past the first only for a signed-in identity: without one, page 2 answers `IDENTITY_LOGIN_REQUIRED`. The run keeps what the earlier pages gave, queues those, and says that later pages need a signed-in identity, with a link to the signed-in identities of that platform. A first page a guest answered may also leave out the author's newest posts; the report says so when that happened.
+
+One trap worth knowing: a bare author id does not say which platform it belongs to — `MS4wLjABAAAA…` looks the same on Douyin and TikTok, and a `mid` is plain digits — so it is looked up on whichever platform the menu shows. The menu is enabled for exactly that case and disabled while a profile link is in the box, because the link carries the platform.
 
 For deeper history than the feed will hand over in one pass, use **Archive their history** in the library's post drawer, which is a different job with a different cost.
 
 ### A post's comments
 
-Reads up to **5 pages of 50** comments through the ordinary read endpoint and hands your browser a JSON file named `comments-<platform>-<id>.json`. Each page is a real request through the identity pool. Comments are data rather than media, so nothing is written to the server's volume and the downloader is not involved.
+Reads up to **5 pages** of comments, 50 to a page where the platform allows it (35 on TikTok; Bilibili sets its own page size), through the ordinary read endpoint and hands your browser a JSON file named `comments-<platform>-<id>.json`. Each page is a real request through the identity pool. Comments are data rather than media, so nothing is written to the server's volume and the downloader is not involved.
+
+Bilibili shows a guest only the three hottest comments and no second page. When a guest answered, or a later page needed a signed-in identity, the comments read so far are still saved, and the page says why there are not more.
 
 ## The downloads table
 
@@ -158,26 +176,43 @@ Reads up to **5 pages of 50** comments through the ordinary read endpoint and ha
 | --- | --- |
 | Post | The stored cover as a thumbnail, the archive's title, and the author and platform beneath. Falls back to the content id when the archive knows nothing about the post |
 | State | `queued`, `running`, `done`, `partial`, `failed` or `cancelled`, plus a live progress bar while it is running |
-| Platform | `douyin` or `tiktok` |
+| Platform | `douyin`, `tiktok` or `bilibili` |
 | Files | How many files completed |
-| Size | Bytes on disk, or **Cleaned up** for a row whose files were evicted |
+| Size | Bytes on disk, or **Cleaned up** for a row whose files were removed — by hand or by the ceiling |
 | Finished | When it settled |
 | Keep | The pin toggle |
 | Retry | Present only on a settled row that is worth retrying |
 
 `partial` is its own state rather than a success or a failure: a post whose video landed and whose third image 404'd is neither, and calling it `done` would hide the gap while calling it `failed` would hide a video that is on the disk.
 
-**Filtering** by state and by platform happens on the server, so "the most recent TikTok downloads" means the most recent of all of them and not the most recent of whatever page happened to load. **Sorting**, by contrast, is done in the browser over the rows already loaded — the default is Finished, newest first. The list returns 100 rows per request (`GET /api/v1/downloads` defaults to 100, maximum 500) and the console does not paginate it, so on a large instance the table is a window on the newest hundred.
+**Filtering** by state and by platform happens on the server, so "the most recent TikTok downloads" means the most recent of all of them and not the most recent of whatever page happened to load. **Sorting**, by contrast, is done in the browser over the rows already loaded — the default is Finished, newest first. The table shows 100 rows a page, with Previous and Next and where the page sits in the whole (`101-200 of 340`), and the search box above it matches the post's title or author as the archive holds them, or its id (`q` on `GET /api/v1/downloads`). The filters, the search and the open drawer are kept in the address, so `/downloads?id=<download id>` opens one download from anywhere.
 
-The table polls every 5 seconds while anything is in flight and every 10 seconds otherwise. The progress bar is read live from the sidecar for at most 8 in-flight rows at a time, and it counts **files, not bytes**: the platform declares a size and the sidecar does not trust it — the ceiling is enforced on bytes actually written — so there is no denominator to divide by. The bytes transferred so far are shown beside it as the number that keeps moving.
+The table polls every 2 seconds while anything is in flight and every 10 seconds otherwise. The progress bar is read live from the sidecar for at most 8 in-flight rows at a time. It shows the bytes written so far against the download's size, the percentage, the speed over the last few seconds and the time left — for example `38.2 MB / 96.7 MB · 39%` over `1.4 MB/s · 42 s left`. The size is what each file's server declared in `Content-Length`. The sidecar never trusts that number for the ceiling, which is enforced on bytes actually written, but it is good enough to draw a bar against. A file that has not started yet has declared nothing, so until every file of a download has begun — the later images of an album, say — the bar counts **files** instead, with the bytes so far beside it.
 
-Clicking a row opens a drawer with the player, the per-file list, each file's SHA-256, and a save link per completed file.
+Clicking a row opens a drawer, titled by the post, with the player, the per-file list, each file's SHA-256, and a save link per completed file. It links to the post in the Library when the archive has it, and when the video already has a transcript, **Transcribe video** becomes **Open the transcript**. The drawer follows the row as the table refreshes: opened on a running download, it shows each file's own progress and speed, and the stored files once it lands.
 
-## Retrying, and why there is no resume
+### The `progress` object
+
+Over the API the bar is `progress`, on every row of `GET /api/v1/downloads` and on `GET /api/v1/downloads/{download_id}`. It is read live from the sidecar and never stored, so it is `null` on a settled row, while the downloader is not configured or not answering, for a job the sidecar has forgotten (it keeps a bounded history and loses it on a restart), and on in-flight rows past the first 8 of a page. A `null` is "no bar", never "no progress".
+
+| Field | Type | What it is |
+| --- | --- | --- |
+| `bytes` | integer | Bytes written so far, summed over the files |
+| `bytes_expected` | integer or `null` | What the whole download will weigh: a finished file's real size, a running file's declared `Content-Length`, nothing for a failed file. `null` while any file has not started or its server declared no length — count files then, as the console does |
+| `bytes_per_second` | integer | Speed over the last few seconds, summed over the files that are running |
+| `files_done`, `files_total` | integer | Files finished, and files in the job |
+| `state` | string | The sidecar's own state for the job: `queued`, `running`, `done`, `partial`, `failed` or `cancelled`. It can settle a moment before the row does |
+| `items` | array | One entry per file, in the job's order: `name`, `kind` (`video`, `image` or `cover`), `state` (`queued`, `running`, `done` or `failed`), `bytes`, `bytes_expected` (`null` when the server declared none) and `bytes_per_second` (`0` unless it is running) |
+
+`bytes_expected` is for display only: the size ceiling is enforced in the sidecar on bytes actually written, never on what a server declared.
+
+## Retrying, and why there is no resume across attempts
 
 Retry is offered on `failed`, `partial` and `cancelled` rows. It calls `POST /api/v1/downloads/retry` with the `download_id` and starts the same post over from scratch, re-parsing the post first if the stored mirrors have gone stale (older than `media.mirror_max_age_seconds`, 600 seconds by default).
 
-There is no resume, and there could not usefully be one. The sidecar writes to `<name>.part` and truncates it on every attempt, because media URLs are signed and expire: bytes fetched an hour ago cannot be continued against a link that now answers `403`. Asking again is what works.
+There is no resume across attempts, and there could not usefully be one. The sidecar writes to `<name>.part` and truncates it on every attempt, because media URLs are signed and expire: bytes fetched an hour ago cannot be continued against a link that now answers `403`. Asking again is what works.
+
+**Within** one transfer it is different. Some CDN edges end a transfer early: measured on Bilibili in October 2026, an Akamai edge serving a video it had not cached yet stopped after exactly 2 MiB with "unexpected EOF", every time, while the same request a minute later came back whole. So when a mirror stops short of the length it declared, the sidecar asks the same mirror for the rest — a `Range` request from the byte it stopped at — up to three times, seconds later, against the same link. It only accepts a `206` covering exactly the rest of the same file (`If-Range` carries the first answer's validator), so a file replaced in between is refused rather than spliced on. An edge that answers the request for the rest with a server error — measured, a `504` while it was still pulling the file from its origin — is asked again after one, two and four seconds. The downloader log's `item stored` line says how many times a transfer had to be resumed.
 
 Retry is refused while a download is still running — a second attempt would race the first into the same directory. A download that gets stuck is failed by the maintenance pass **two hours** after it was created (the pass runs every five minutes), after which the row is retryable. Nothing on disk is touched by that: files that did land stay where they are.
 
@@ -204,17 +239,20 @@ The four tiles at the top of the page report: bytes stored (against the ceiling,
 
 **Duplicate downloads.** Re-downloading a post is normal — the first attempt failed, the mirrors went stale, the file was evicted — and each attempt leaves a row. The successful ones leave a second complete copy. The *Duplicate downloads* card runs a dry run first and shows the count in a confirmation dialog, because the count is the whole decision. Confirming keeps the newest copy of each post that still has its files and removes the rest. A directory is only deleted when no surviving row still uses it, so in the ordinary case where two attempts wrote to the same place, the records go and the file stays — which is correct, since there was only ever one copy on disk. It requires the downloader to be reachable if any directory has to be removed; otherwise it refuses rather than leaving bytes nothing points at.
 
-**Cancelling.** `DELETE /api/v1/downloads/{id}` stops a transfer that has not finished: it tells the sidecar to cancel and marks the row `cancelled`. It does **not** delete anything. Files that already completed stay where they are, and a download that has already settled is returned unchanged. The Downloads page's bulk **Delete** button calls this endpoint once per selected row that still has files on disk (rows already cleaned up are skipped), so on rows that have already finished it does not free any bytes, despite the wording of its confirmation dialog.
+**Cancelling.** `DELETE /api/v1/downloads/{id}` stops a transfer that has not finished: it tells the sidecar to cancel and marks the row `cancelled`. It does **not** delete anything. Files that already completed stay where they are, and a download that has already settled is returned unchanged.
 
-**What actually removes stored files**, then, is one of three things:
+**Deleting a download's files.** The Downloads page's bulk **Delete** calls `DELETE /api/v1/downloads/{id}/files` once per selected row that still has files on disk. It removes the files and keeps the record, which then shows **Cleaned up** and counts in that tile — exactly as when the ceiling evicts it, and asking for the download again brings the files back. The downloads of one post share a directory, so the directory goes and every record in it is marked. A download that is pinned, or still running, is left out of the selection and refused by the endpoint: a pin is the promise that the files stay, and a running download is still writing them. Before this endpoint existed the button called the cancel above, which reported every finished row deleted while removing nothing.
 
-1. **Deleting the post from the Library** (its bulk Delete), which removes the archive row, its collection memberships, the download records and the directories on disk.
-2. **The size-ceiling sweep**, for anything not pinned. Unpinning a download and letting the ceiling reach it is a legitimate way to reclaim space.
-3. **The duplicate removal** above, for redundant copies.
+**What removes stored files**, then, is one of four things:
+
+1. **Delete on the Downloads page**, above: the files go, the records stay and read as cleaned up.
+2. **Deleting the post from the Library** (its bulk Delete), which removes the archive row, its collection memberships, the download records and the directories on disk. Because the records go too, these do not appear under **Cleaned up** — there is nothing left to count.
+3. **The size-ceiling sweep**, for anything not pinned.
+4. **The duplicate removal** above, for redundant copies.
 
 ## Saving a stored file to your own computer
 
-A stored file can be handed to your browser. In the downloads drawer each completed file has a **Save this file** link; in the library drawer, **Export the video file** and one link per stored image or cover.
+A stored file can be handed to your browser. In the downloads drawer each completed file has a **Save this file** link; in the library drawer, **Export the video file** and one link per stored image (and live photo clip) or cover.
 
 This goes through `GET /api/v1/downloads/{download_id}/files/{name}` and requires the `media:read` scope. The endpoint fetches nothing: it rebuilds the path from the stored row — the download's own directory plus a name that has to appear in that row's file list — resolves it, and checks the result still lands inside the media root. A name that is not in the record is a `404` whether or not something of that name exists on disk. A download whose files were evicted answers `404` with `reason: "evicted"` rather than going back to the platform; ask for the download again to restore it.
 
@@ -227,6 +265,38 @@ dtk-<platform>-<content_id>-<stored name>
 for example `dtk-douyin-7408915107113127220-video.mp4`. On the volume every post owns a directory, so files can be called `video.mp4` and never collide. Your downloads folder has no such directory — fifty saved posts would be fifty files called `video.mp4`, the second of them `video (1).mp4`, with nothing in either name saying which post it came from. Characters outside `A-Za-z0-9._-` become hyphens and each part is capped at 64 characters. The name is produced by the server, so `curl`, the console and any other client all get the same one.
 
 Note what this is not: the server does not proxy media on demand. Saving a file serves a copy that is already on the disk, behind an authenticated scope. "Store on this instance" and "save this file to my computer" are two different destinations, which is why the console labels them differently.
+
+## Turning a stored video into text
+
+A finished download's video can be transcribed on this machine. The `transcriber` sidecar runs FunASR models — Paraformer to recognise the speech, FSMN-VAD to find where someone is speaking, CT-Transformer to put the punctuation back — and it sits on a network with no route out, so the audio never leaves the host. It is optional and off by default: [the transcriber profile](./02-installation.md#the-optional-profiles) turns it on, and [Preparing the FunASR ONNX models](./18-funasr-models.md) gets the ~500 MB of models it needs. The guided installer does both if you say yes to transcription.
+
+Know what it is for before you queue a hundred: the models are the general **Mandarin** ones, so Chinese speech comes out well and other languages poorly. The result is **one whole text per video** — no timestamps, no speaker labels. A Bilibili download is transcribed exactly like a Douyin or TikTok one; for a video in several parts, it is the part that download stored — the first, unless you downloaded another.
+
+### Starting one
+
+| From | How |
+| --- | --- |
+| Console | **Downloads** → open a finished download → **Transcribe video**; or **Library** → open a saved video post → **Transcribe video** |
+| REST | `POST /api/v1/transcriptions` with `{"download_id": "<uuid>"}`; add `?wait=30` to hold the connection until it finishes |
+| MCP | `transcribe_video(download_id)` — from a link, the chain is `parse_url → download_media → transcribe_video` |
+
+The download has to be finished and its video still on disk. One the size ceiling evicted is refused with a message saying so: download it again, then transcribe.
+
+Asking twice is cheap. A finished transcription of the same file is handed back (`200`, with `reused` saying so), and one already running is joined (`202`) rather than started again. `refresh: true` forces a new one. `normalize` (on by default) rewrites spoken numbers as digits; if that last step fails, `DTK_TRANSCRIBER_NORMALIZATION_FAILURE_POLICY` decides whether you get the text without it (`fallback`, the default) or a failed transcription (`fail`).
+
+### The Transcriptions page
+
+`/transcriptions`, in the same **Content** group, lists every transcription newest first with its state, a preview of the text, the video's duration, the model and whether numbers were normalised. A running one shows its stage — Decoding audio, Finding speech, Recognising speech, Adding punctuation, Writing numbers as digits — and its details drawer shows the text recognised so far, marked provisional until punctuation and numbers are applied at the end. A finished one can be exported as a `.txt`.
+
+The list pages 100 at a time and searches the text, the post's title and its id; its filters and the open drawer are kept in the address (`/transcriptions?id=<transcription id>`). A transcript's drawer links to the download it was made from and to the post in the Library. While the transcriber is off — the default — the Transcribe buttons are disabled and say how to turn it on, and so does this page when it is empty.
+
+**Cancel** stops queued or running work. **Delete** removes settled records — the text and its metadata — and never the video they came from.
+
+### What it costs
+
+CPU, and only while a job runs: the models stay loaded at about 750 MiB, and a job keeps two cores busy. Measured on 2026-10-16, a 3 min 13 s clip took 3.7 seconds on two cores to itself. Sharing those cores with the browser container while it mints identities is slower — see [When transcription and the browser share a host](./02-installation.md#when-transcription-and-the-browser-share-a-host).
+
+The sidecar runs one job at a time (`DTK_TRANSCRIBER_WORKERS`) with eight waiting (`DTK_TRANSCRIBER_QUEUE`); past that a transcription is marked failed with the reason, and starting it again later is the fix. Transcriptions also count against the worker queue's ceiling like downloads do, so a bulk run can answer `QUEUE_FULL` before it reaches the sidecar.
 
 ## The Library page
 
@@ -241,21 +311,23 @@ Two views:
 
 Paging is by cursor, never by page number, because the table is written to while you walk it and an offset silently skips and repeats rows. Previous walks back through the cursors you have already visited. A page is 50 posts.
 
-Selection is by post key and **survives a page turn** — selecting a few here, a few there, then acting on all of them is the intended workflow. A bulk bar appears at the bottom of the viewport while anything is selected.
+Selection is by post key and **survives a page turn** — selecting a few here, a few there, then acting on all of them is the intended workflow. A bulk bar appears at the bottom of the viewport while anything is selected. Besides collections and **Delete**, it can **Save media** (one download per post; what is already stored is counted, not fetched again), **Transcribe** (each selected video whose media is stored here; image posts and unsaved posts are skipped and counted) and **Export selected** (the selected posts as NDJSON, through `POST /api/v1/archive/export`). Save and Transcribe go one post at a time with a running count and a Stop, and report what was done, skipped and failed.
 
 ## Filters, search and views
 
 | Filter | Values | Applies |
 | --- | --- | --- |
 | Search | Substring of the title or description | On submit |
-| Platform | `douyin`, `tiktok` | On change |
+| Platform | `douyin`, `tiktok`, `bilibili` | On change |
 | Kind | Video, image album | On change |
 | Length | Under a minute (< 60 s), under three minutes (< 180 s), long (≥ 180 s), unknown | On change |
 | Availability | Live, deleted, private, unknown | On change |
 | Collection | Any of your collections | On change |
 | On this disk | Downloaded or not / downloaded only / not downloaded | On change |
+| Author | Click an author's name on a card, in the table or in a post's drawer | At once, shown as a removable chip |
+| Tag | Click a `#tag` in a post's drawer | At once, shown as a removable chip |
 
-Filters combine. The menus apply the moment they change, because picking "douyin" from a closed list *is* the decision; the text box waits for the button, because typing is not a decision until you stop and firing a query per keystroke would page the archive on the way to a word.
+Filters combine, and every one of them — with the open post — is kept in the address: `/library?author=<uid>`, `/library?tag=<tag>` and `/library?platform=<p>&content_id=<id>`, the links the other pages use, work from anywhere. The menus apply the moment they change, because picking "douyin" from a closed list *is* the decision; the text box waits for the button, because typing is not a decision until you stop and firing a query per keystroke would page the archive on the way to a word.
 
 Search is **substring matching, not word matching**, and that is a deliberate trade-off rather than an oversight: Postgres' full-text search does not segment Chinese, so a word search would silently match nothing on the primary platform. The cost is that a search for a short string can match more than you meant.
 
@@ -277,9 +349,11 @@ Open a post to get its drawer. The footer carries three actions:
 
 - **Archive their history** — a backfill: walks this author's posts past the first page and archives every one. Deliberately separate from the watchlist, because a watchlist entry is for what is new and runs forever, while a backfill is a one-off with a very different cost. The console asks for the server default of 5 pages; the API accepts 1–20 and the worker caps it at 20 pages of 20 posts. It stops at the first empty page, at the ceiling, or when the platform says there is no more history. It costs one upstream request per page and needs that platform's read scope.
 - **Store on this instance** — starts a download for this post. If the media is already stored the button reads **Saved · fetch again** and its tooltip says how large the stored copy is; using it fetches a fresh copy and replaces what is there. (This button does not set `skip_existing`, which is why it re-fetches rather than doing nothing.) Downloading is a queued task, so the row is not stored the instant the toast appears — the page re-checks a few seconds later, and the download itself appears immediately on the Downloads page.
-- **Export the video file** — hands your browser the stored video, when there is one. Image posts have no video, so this button does not appear for them; their slides get one link each in the drawer body instead, because a browser will not start thirty downloads from a single click and pretending otherwise would silently save one file out of thirty.
+- **Export the video file** — hands your browser the stored video, when there is one. Image posts have no video, so this button does not appear for them; their slides — and a live photo's clip, next to its still — get one link each in the drawer body instead, because a browser will not start thirty downloads from a single click and pretending otherwise would silently save one file out of thirty.
 
 The drawer also plays the stored video inline, from this instance's disk rather than from the platform: no CDN link to expire, no hotlink check to fail, and nobody outside this machine is told what is being watched. It preloads metadata only, so a 240 MB video does not start transferring because a drawer opened.
+
+Under the player, a video post has **Transcribe video**, the same action as in the downloads drawer — **Open the transcript** when it already has one. It reads the stored file, never the platform's, so on a post not saved yet it is disabled and says to store it first. A saved post also links to its download. See [Turning a stored video into text](#turning-a-stored-video-into-text).
 
 ## Exporting the archive
 
@@ -290,7 +364,7 @@ It is streamed a page at a time rather than assembled server-side, so the size o
 Two things to know before relying on it:
 
 - It needs the `archive:export` scope, which ordinary read keys do not carry. This is the one call that turns a read key into a copy of the database, so it is scoped separately on purpose. A console session carries every scope, so the button works for any signed-in user.
-- The export applies the platform, kind, length, availability and search filters, but **not** the collection filter or the "on this disk" filter — those are not parameters of the export endpoint and are ignored. Exporting while a collection filter is active gives you the whole archive, not the collection.
+- The export applies every filter on the page, the collection and "on this disk" included. It used to ignore those two, so exporting a collection exported the whole archive. To export a hand-picked set instead, select the posts and use **Export selected**.
 
 For a copy of the whole instance, including identities and settings, see the backup tooling in [Operations](./10-operations.md); this export is the archive only.
 
@@ -304,7 +378,9 @@ A deleted post answers the platform's own not-found, and **that is the finding, 
 
 The worker queues a recheck by itself roughly every six hours, so the button is for when you want the answer now. Setting `archive.recheck_after_days` to 0 turns rechecking off entirely.
 
-Because it spends the identity pool, this endpoint requires a *platform* read scope (`douyin:read` or `tiktok:read`) rather than `archive:read` — reading the archive is promised to cost nothing, and a recheck is a platform read wearing an archive name.
+Because it spends the identity pool, this endpoint requires a *platform* read scope (`douyin:read`, `tiktok:read` or `bilibili:read`) rather than `archive:read` — reading the archive is promised to cost nothing, and a recheck is a platform read wearing an archive name.
+
+For the same reason the recheck and the author backfill queue like reads. Once the worker queue is at `sched.queue_max` (500) they answer `503` with `QUEUE_FULL` and a `Retry-After` of `sched.max_wait_seconds` (10): wait that long and ask again. Asking while an identical one is still queued joins it rather than queueing a second. The worker's own scheduled recheck is submitted directly and never meets that ceiling.
 
 ## Deleting posts and their media
 
@@ -328,26 +404,26 @@ Nothing on this page fetches. When an entry comes due, the worker submits it as 
 
 | Column | Meaning |
 | --- | --- |
-| Target | The label (filled in from the first successful run) or the raw id, with the kind and platform beneath |
+| Target | The name, or the id, with the kind and platform beneath; linked to what it has collected in the Library (not for a TikTok author, whom the archive keys by the numeric id rather than the `secUid` that is watched) |
 | Interval | How often it runs |
 | Next run | Relative time, or **Paused** |
 | Runs | Observations collected since it was added |
 | Last run | Relative time, or a red "N failures in a row" carrying the last error as a tooltip |
 | Running | The enable/pause switch |
-| *(unnamed)* | Remove |
+| *(unnamed)* | **Edit** (name and interval) and **Remove**, which asks first |
 
 The three tiles show how many targets exist and how many are running, total runs, and how many are currently failing.
 
 ## Adding a target
 
-Four fields: platform, what to watch, the target id, and the interval.
+Five fields: platform, what to watch, the target, an optional name, and the interval. The target is a profile or post link — its platform wins over the menu — or the bare id. A name given here, or later under **Edit**, is kept; left empty, the first successful run fills in the author's nickname, and clearing it under Edit hands it back to the platform.
 
 | Kind | Target id | What one run collects |
 | --- | --- | --- |
-| An author | The stable author id — `sec_user_id` on Douyin, `secUid` on TikTok. Both start `MS4wLjAB` | One page of their posts (the newest 20). That page carries the author record on every item, so a single request answers both "what is new" and "how many followers now" |
+| An author | The stable author id — `sec_user_id` on Douyin, `secUid` on TikTok (both start `MS4wLjAB`), the numeric `mid` on Bilibili | One page of their posts (the newest 20). That page carries the author record on every item, so a single request answers both "what is new" and "how many followers now" |
 | A post | The post id, as the archive holds it | That post's detail, which is how its counters move over time |
 
-An `@handle` will not work for an author entry. Nothing checks the shape of the id when you add it, so the entry is created — but every run then fails, because the post-list endpoint has no parameter that takes a handle and refuses it by name rather than sending it somewhere it cannot work. Look the author up in the playground or the library first and use the id from the result. Watching the same platform + kind + target twice *is* refused, as a duplicate.
+A TikTok profile link names the `@handle`, which the post-list endpoint refuses, so the page reads the profile once and stores the `secUid`. A bare `@handle` typed into the box still will not work: nothing checks the shape of an id when you add it, so the entry is created — and every run then fails, because the post list has no parameter that takes a handle and refuses it by name rather than sending it somewhere it cannot work. Watching the same platform + kind + target twice *is* refused, as a duplicate.
 
 The first run is **due immediately**. Somebody who just added an author wants to see it collect, and holding the first run back by the interval would only make the feature look broken for six hours.
 
@@ -355,9 +431,9 @@ What an entry collects is not configurable from this page, and that is deliberat
 
 ## Intervals, the floor, and a failing entry
 
-The console offers 15 minutes, 1 hour, 6 hours, 12 hours and 24 hours, hiding anything below the server's floor. New entries default to `watchlist.default_interval_seconds` (**6 hours**).
+The console offers 15 minutes, 1 hour, 6 hours, 12 hours and 24 hours, hiding anything below the server's floor. New entries default to `watchlist.default_interval_seconds` (**6 hours**), and the menu always lists the value the form will send.
 
-The floor is `watchlist.min_interval_seconds`, **900 seconds** by default, and it cannot be set below 60 whatever you do. An interval under the floor is **refused** rather than silently raised to a number you did not ask for. The reason is not politeness: a target collected every few seconds does not produce a better time series, it burns the whole identity pool on one author and starves everything else. Nothing on either platform moves fast enough to need more than 15 minutes.
+The floor is `watchlist.min_interval_seconds`, **900 seconds** by default, and it cannot be set below 60 whatever you do. An interval under the floor is **refused** rather than silently raised to a number you did not ask for. The reason is not politeness: a target collected every few seconds does not produce a better time series, it burns the whole identity pool on one author and starves everything else. Nothing on any of the platforms moves fast enough to need more than 15 minutes.
 
 Cost, so you can budget: one entry at 6 hours is 4 requests a day. A hundred watched authors at 6 hours is 400 requests a day, one page each. Shortening an interval takes effect immediately rather than after the old one elapses.
 
@@ -414,8 +490,10 @@ The API surfaces behind these three pages are scoped separately on purpose: seei
 | `archive:read` | Search the archive, read its stats, read one post |
 | `archive:export` | The bulk NDJSON export, and only that |
 | `media:read` | List downloads, read storage usage, fetch a stored file |
-| `media:write` | Start, retry, pin and cancel a download; deduplicate; create and change collections; delete archived posts |
-| `douyin:read` / `tiktok:read` | The availability recheck and the author backfill, because both spend the identity pool |
+| `media:write` | Start, retry, pin and cancel a download; delete a download's files; deduplicate; create and change collections; delete archived posts |
+| `douyin:read` / `tiktok:read` / `bilibili:read` | The availability recheck and the author backfill, because both spend the identity pool |
+| `transcription:write` | Start, refresh, cancel and delete transcriptions |
+| `transcription:read` | List transcriptions and read their text |
 | `identity:manage` | The watchlist endpoints (`/api/v1/admin/watchlist/*`); operator role or above for anything that writes |
 | `admin` | Everything, the watchlist endpoints included |
 

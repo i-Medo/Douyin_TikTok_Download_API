@@ -32,7 +32,8 @@ half an hour and leave you with a working instance you understand.
   - With Docker (recommended): [First install](./en/02-installation.md#first-install)
   - By hand: [for development](./en/02-installation.md#running-without-docker) · [on bare metal](./en/02-installation.md#a-production-install-without-docker)
   - Installing from mainland China: [Network preparation](./en/02-installation.md#network-preparation-in-mainland-china) — switch mirrors first, or the image pull will time out
-- [Configuration reference](./en/03-configuration.md) — the two configuration layers, and all 54 runtime settings with defaults and when to change them
+- [Configuration reference](./en/03-configuration.md) — the two configuration layers, and all 62 settings with defaults and when to change them
+- [Preparing the FunASR ONNX models](./en/18-funasr-models.md) — download, verify and load the ASR, VAD and punctuation models used for offline transcription, by hand or through the install script
 - [Security](./en/15-security.md) — what the software protects, what you are responsible for, and which operations hand out a credential
 
 **Use the console**
@@ -40,7 +41,7 @@ half an hour and leave you with a working instance you understand.
 - [Console overview](./en/05-console-overview.md) — the shell, Overview, System, Logs, Diagnose
 - [Identities and proxies](./en/06-identities-and-proxies.md) — the pool, its state machine, minting, importing cookies, proxies, the Scheduler and Endpoint access pages, and the circuit breakers
 - [Playground and tools](./en/07-playground-and-tools.md) — driving any endpoint from the browser, signing, decoding a signature, parsing links, minting on demand
-- [Downloads, library and watchlist](./en/08-downloads-and-library.md) — putting media on your own disk, finding it again, and collecting a target on a timer
+- [Downloads, library and watchlist](./en/08-downloads-and-library.md) — putting media on your own disk, finding it again, turning a stored video into text, and collecting a target on a timer
 - [Users and API keys](./en/09-users-and-api-keys.md) — roles, scopes, keys, and who can do what
 
 Every entry in the sidebar is covered by one of these pages, and
@@ -72,7 +73,7 @@ in Operations.
 |---|---|---|
 | 01 | [Quick start](./en/01-quickstart.md) | From nothing to a first successful request |
 | 02 | [Installation and deployment](./en/02-installation.md) | Two ways to install, compose, environment, profiles, upgrades |
-| 03 | [Configuration reference](./en/03-configuration.md) | All 54 runtime settings |
+| 03 | [Configuration reference](./en/03-configuration.md) | All 62 settings |
 | 04 | [Concepts](./en/04-concepts.md) | The mental model |
 | 05 | [Console overview](./en/05-console-overview.md) | Shell, Overview, System, Logs, Diagnose |
 | 06 | [Identities and proxies](./en/06-identities-and-proxies.md) | The pool and the scheduler |
@@ -87,6 +88,7 @@ in Operations.
 | 15 | [Security](./en/15-security.md) | Threat model and responsibilities |
 | 16 | [Contributing](./en/16-contributing.md) | Working on the code |
 | 17 | [FAQ and glossary](./en/17-faq.md) | Questions and terms |
+| 18 | [Preparing the FunASR ONNX models](./en/18-funasr-models.md) | Downloading, verifying and connecting the offline transcription models |
 
 ## What is not here
 

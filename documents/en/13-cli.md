@@ -1,8 +1,8 @@
 # CLI reference
 
 > **[Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)** —
-> a self-hosted Douyin and TikTok data API: REST, MCP and a web console, with
-> an identity pool that maintains itself.
+> a self-hosted Douyin, TikTok and Bilibili data API: REST, MCP and a web
+> console, with an identity pool that maintains itself.
 > [All docs](../README.md) · [中文](../zh/13-cli.md)
 
 `dtk` is the operations and rescue command line that ships inside the application image. After reading this you will know how to reach it on a running deployment, what every command and option does, and which commands are safe to fire at a live instance versus which ones you only reach for during an incident.
@@ -106,7 +106,9 @@ hint: export DTK_SECRET_KEY, or run the CLI inside the container that has it
 | `DTK_SECRET_KEY` | none — required, at least 32 characters | Everything except `dtk --version`, `dtk migrate --show` and `dtk backup list` |
 | `DTK_DATABASE_URL` | `postgresql+asyncpg://dtk:dtk@postgres:5432/dtk` | Every command that touches state |
 | `DTK_REDIS_URL` | `redis://redis:6379/0` | `dtk config set`, `dtk identity retire`, `dtk diagnose`, `dtk worker` |
-| `DTK_BROWSER_RPC_URL` | empty (disabled) | `dtk identity mint` requires it; `dtk fetch`, `dtk identity test` and step 5 of `dtk diagnose` use it as the signing fallback when it is set |
+| `DTK_BROWSER_RPC_URL` | empty (disabled) | `dtk identity mint` requires it for Douyin and TikTok; `dtk fetch`, `dtk identity test` and step 5 of `dtk diagnose` use it as the signing fallback when it is set |
+| `DTK_DOWNLOADER_URL`, `DTK_DOWNLOADER_TOKEN` | empty (no media downloads) | `dtk worker`, which stores media through the sidecar; the app `dtk serve` starts, for the download routes; step 1 of `dtk diagnose`, which reports the downloader only where this is set. The token is the sidecar's shared secret and has to match it |
+| `DTK_TRANSCRIBER_URL`, `DTK_TRANSCRIBER_TOKEN` | empty (no transcription) | The same three, for the transcription sidecar |
 | `DTK_BIND_HOST` | `127.0.0.1` | `dtk serve`, when `--host` is not given |
 | `DTK_BIND_PORT` | `8000` | `dtk serve`, when `--port` is not given |
 | `DTK_LOG_LEVEL` | `info` | `dtk serve` (handed to uvicorn, and read again by the API app it starts) and `dtk worker`, which configures the logging stack from it. It does **not** change the log output of the other commands — `fetch`, `diagnose`, `config`, `identity`, `proxy`, `user`, `backup`, `migrate` |
@@ -156,7 +158,7 @@ That parses. Commands that make no network calls — `dtk config get`, `dtk migr
 | Command | What it does | Touches |
 |---|---|---|
 | `dtk fetch` | Resolve one link and print the normalized result | DB, platform |
-| `dtk diagnose` | Six-step self-check, printed as a report | DB, Redis, proxies, browser-rpc, platform |
+| `dtk diagnose` | Six-step self-check, printed as a report | DB, Redis, proxies, browser-rpc, downloader, transcriber, platform |
 | `dtk worker` | Run the task worker in the foreground | DB, Redis |
 | `dtk migrate` | Apply database migrations | DB |
 | `dtk serve` | Run the API server | — |
@@ -178,7 +180,7 @@ dtk fetch [OPTIONS] {url}
 
 | Argument / option | Type | Default | Meaning |
 |---|---|---|---|
-| `url` | string, required | — | A Douyin or TikTok link, or pasted share text |
+| `url` | string, required | — | A Douyin, TikTok or Bilibili link, or pasted share text |
 | `--raw` | flag | off | Include the platform's own payload in the output |
 | `--json` | flag | off | Print only the JSON result, for piping |
 | `--identity` | string | next identity | Use this identity. **Must be the full UUID**, not the 8-character prefix the tables print |
@@ -239,7 +241,7 @@ dtk diagnose [OPTIONS]
 | `--json` | flag | off | Print the report as JSON instead of a table |
 | `--output`, `-o` | path | none | Also write the text report to a file |
 | `--skip-smoke` | flag | off | Do not make the end-to-end request |
-| `--platform` | `douyin` \| `tiktok` | `douyin` | Platform for the smoke test |
+| `--platform` | `douyin` \| `tiktok` \| `bilibili` | automatic | Platform for the smoke test. Automatic is the platform with the most identities in rotation; with none, Douyin when a browser is configured and Bilibili when not |
 | `--smoke-url` | string | the built-in link for that platform | Link to use for the smoke test |
 | `--probe-url` | string | `https://api.ipify.org?format=json` | Service that reports a proxy's exit address. Note that this is **not** the default `dtk proxy test` uses, which is `https://ipinfo.io/json` |
 
@@ -247,11 +249,11 @@ The six steps, in order:
 
 | # | Step | What it checks |
 |---|---|---|
-| 1 | `components` | Postgres, Redis and browser-rpc are reachable |
-| 2 | `egress` | This machine can reach the platform domains directly |
+| 1 | `components` | Postgres, Redis and browser-rpc are reachable, and so are the downloader and the transcriber where this deployment configures them |
+| 2 | `egress` | This machine can reach Douyin's, TikTok's and Bilibili's domains directly |
 | 3 | `proxies` | Each proxy: reachability and exit IP. The country it shows is the one already stored on the proxy row, not a fresh GeoIP lookup |
 | 4 | `pool` | How many usable identities there are, and how stale the oldest is |
-| 5 | `signing` | The pure-Python signature against browser-rpc's, per platform — the same shadow comparison the registry runs in production |
+| 5 | `signing` | The pure-Python signature against browser-rpc's, for Douyin and TikTok — the same shadow comparison the registry runs in production. Bilibili is not compared, because browser-rpc never signs it |
 | 6 | `smoke` | One fixed public link through the whole pipeline |
 
 ```bash
@@ -574,7 +576,7 @@ Archive schema versions 1 and 2 can both be read; anything newer is refused rath
 
 Runtime configuration stored in the database.
 
-The `settings` table is authoritative once an instance is initialized, so a misconfigured value **cannot** be fixed by editing `.env` and restarting — a fact that surprises everybody exactly once. These commands are how it gets fixed without the console. There are 54 runtime settings; the full catalogue with meanings and defaults is in [Configuration reference](./03-configuration.md).
+The `settings` table is authoritative once an instance is initialized, so a misconfigured value **cannot** be fixed by editing `.env` and restarting — a fact that surprises everybody exactly once. These commands are how it gets fixed without the console. There are 65 settings in the table; the full catalogue with meanings and defaults is in [Configuration reference](./03-configuration.md).
 
 ### `dtk config list`
 
@@ -598,7 +600,7 @@ no settings match that filter
 settings version 112
 ```
 
-Two things about the scopes. Of the 54 settings, 47 are `runtime` and 7 are `sensitive`; `--scope bootstrap` and `--scope env_only` are accepted but always match nothing, because those settings live in the environment and never in this table.
+Two things about the scopes. Of the 65 settings, 57 are `runtime` and 8 are `sensitive`; `--scope bootstrap` and `--scope env_only` are accepted but always match nothing, because those settings live in the environment and never in this table.
 
 And **a `sensitive` setting whose value is a plain string is masked.** That is by declaration, not by shape: the registry says which settings are sensitive, and every surface — this table, the admin API, the audit row a write leaves behind — masks them the same way. The mask keeps the first four characters and replaces the rest with `***`; a value of four characters or fewer is masked whole, because showing three of four characters is not a mask. So `security.webhook_secret` set to `s3cr3t-value-abcdef` reads `s3cr***`, and `security.request_proxy` reads `***` at its default `deny` but `allo***` or `publ***` once it is set to one of its other choices. It applies to genuinely secret values and also to a sensitive setting that is not itself a secret, such as `security.request_proxy`. Lists, booleans and numbers are shown as they are, and an empty string is shown as empty, because "not set" is worth being able to see.
 
@@ -624,13 +626,14 @@ docker compose -p dtk -f docker/compose.yml exec api dtk config get cache.conten
 ### `dtk config set`
 
 ```text
-dtk config set [OPTIONS] {key} {value}
+dtk config set [OPTIONS] {key} [value]
 ```
 
 | Argument / option | Type | Default | Meaning |
 |---|---|---|---|
 | `key` | string, required | — | Setting key |
-| `value` | string, required | — | New value; lists are comma separated |
+| `value` | string | — | New value; lists are comma separated. Required unless `--stdin` is given |
+| `--stdin` | flag | off | Read the value from one line of stdin instead |
 | `--yes`, `-y` | flag | off | Do not ask before changing a sensitive setting |
 
 The value is coerced to the declared type and validated *before* anything is written; a type mismatch is an invocation error, exit 2. The write then bumps the settings version and announces it on the Redis channel the API and workers listen on, so a running deployment picks the change up without a restart. This is the one `config` subcommand that needs Redis.
@@ -644,11 +647,18 @@ docker compose -p dtk -f docker/compose.yml exec api \
 ok  cache.content_ttl = 900
 ```
 
-Sensitive settings widen the attack surface — the URL allowlist, the CORS origins, the caller-supplied request proxy — so they ask for confirmation first. In a script, `-y` skips the prompt; do not reach for it habitually.
+Sensitive settings widen the attack surface — the URL allowlist, the CORS origins, the caller-supplied request proxy — so they ask for confirmation first. The question shows the new value masked the way `dtk config list` masks it. In a script, `-y` skips the prompt; do not reach for it habitually.
 
 ```bash
 docker compose -p dtk -f docker/compose.yml exec api \
   dtk config set security.url_allowlist "example.com,cdn.example.com" -y
+```
+
+For a credential — `security.webhook_secret`, a token inside `notify.channels` — pass `--stdin` and pipe the value in. An argument is visible to every process on the host for as long as the command runs, in `ps` and, through `docker exec`, in the host's process list as well. It reads one line and strips a trailing `CR` as well as the `LF`, as `dtk user passwd --stdin` does. Give the value as an argument or on stdin: both, or neither, is an invocation error, exit 2, and an empty line on stdin is refused. On a sensitive key the confirmation would read the next line of that same stdin, so add `-y` in a pipe:
+
+```bash
+printf '%s\n' "$WEBHOOK_SECRET" | docker compose -p dtk -f docker/compose.yml \
+  exec -T api dtk config set security.webhook_secret --stdin -y
 ```
 
 There is no `dtk config reset`. To return a setting to its default, set it explicitly to the default value shown by `dtk config list`, or clear the override from the console.
@@ -669,7 +679,7 @@ dtk identity list [OPTIONS]
 
 | Option | Type | Default | Meaning |
 |---|---|---|---|
-| `--platform` | `douyin` \| `tiktok` | all | Only this platform |
+| `--platform` | `douyin` \| `tiktok` \| `bilibili` | all | Only this platform |
 | `--state` | `minting` \| `active` \| `cooling` \| `degraded` \| `retired` | all | Only identities in this state |
 | `--limit` | int, 1–500 | `50` | Rows to show |
 
@@ -694,11 +704,13 @@ dtk identity mint [OPTIONS]
 
 | Option | Type | Default | Meaning |
 |---|---|---|---|
-| `--platform` | `douyin` \| `tiktok`, **required** | — | Platform to mint for |
+| `--platform` | `douyin` \| `tiktok` \| `bilibili`, **required** | — | Platform to mint for |
 | `--count` | int, 1–20 | `1` | How many to mint |
 | `--proxy` | string (full UUID) | a free proxy | Use this proxy instead of picking a free one |
 
-Requires `DTK_BROWSER_RPC_URL`. Without it the command fails with exit 1 and tells you to set it or import cookies instead:
+Douyin and TikTok are minted through browser-rpc. Bilibili is minted the way the pool filler mints it: one plain HTTP request to Bilibili, through the chosen proxy, with no browser involved; see [Identities and proxies](./06-identities-and-proxies.md#bilibili-identities). Before 5.1.6 this command only knew browser-rpc and refused Bilibili.
+
+For Douyin and TikTok it requires `DTK_BROWSER_RPC_URL`. Without it the command fails with exit 1 and tells you to set it or import cookies instead:
 
 ```text
 error browser-rpc is not configured
@@ -714,7 +726,7 @@ Output columns: `id` (full), `proxy`, `exit ip`, `cookies` (names only).
 
 Each identity is bound to one proxy for life. When `--proxy` is not given, a proxy with no identity on that platform yet is chosen, because two identities sharing an exit address on the same platform is exactly the correlation the pool exists to avoid. If there are no proxies at all, the identity is minted `direct` — usable, and a correlation risk once the pool is busy.
 
-Cost: minting drives a real headless browser. The `browser-rpc` container is the heaviest thing in the stack (measured at 2.57 GiB resident and six cores' worth of CPU while warm), and `--count 20` is twenty page loads. This is not a command to run in a loop.
+Cost, for Douyin and TikTok: minting drives a real headless browser. The `browser-rpc` container is the heaviest thing in the stack (measured at 2.57 GiB resident and six cores' worth of CPU while warm), and `--count 20` is twenty page loads. This is not a command to run in a loop. A Bilibili mint is one small request, but it is still a request to Bilibili from that proxy's address.
 
 ### `dtk identity retire`
 
@@ -897,7 +909,7 @@ These are fine on a live instance; know what you are spending.
 
 | Command | What it costs |
 |---|---|
-| `dtk diagnose` | Real outbound requests: up to the 20 oldest proxies are probed (`MAX_PROXIES_PROBED`, so a larger pool is only partly covered), browser-rpc signs once per platform for the shadow comparison, and the smoke step spends one identity's request. Writes nothing. `--skip-smoke` removes the platform request |
+| `dtk diagnose` | Real outbound requests: up to the 20 oldest proxies are probed (`MAX_PROXIES_PROBED`, so a larger pool is only partly covered), browser-rpc signs once each for Douyin and TikTok for the shadow comparison, and the smoke step spends one identity's request. Writes nothing. `--skip-smoke` removes the platform request |
 | `dtk identity test` | One real platform request outside the scheduler. Records nothing |
 | `dtk fetch` | One real platform request outside the scheduler, plus an archive row when `archive.enabled` is on |
 | `dtk proxy test` | One outbound request; writes health and geo back unless `--no-write` |

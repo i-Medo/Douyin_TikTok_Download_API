@@ -1,8 +1,8 @@
 # Concepts
 
 > **[Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)** —
-> a self-hosted Douyin and TikTok data API: REST, MCP and a web console, with
-> an identity pool that maintains itself.
+> a self-hosted Douyin, TikTok and Bilibili data API: REST, MCP and a web
+> console, with an identity pool that maintains itself.
 > [All docs](../README.md) · [中文](../zh/04-concepts.md)
 
 This page is the mental model behind the whole system. After reading it you should be able to predict what the instance will do with a request before you send it, and to tell apart the three kinds of failure that look identical from the outside: a bug, a platform change, and the system working exactly as designed.
@@ -55,7 +55,7 @@ An **identity** is the atom this system schedules. It is not a cookie. It is fou
 
 | Part | What it is | Where it lives |
 | --- | --- | --- |
-| Cookie jar | The platform's own session cookies — `ttwid` at minimum, ideally `odin_tt`, `s_v_web_id`, `msToken`, `uifid` | `identities.cookies_encrypted`, AES-256-GCM, the row id bound in as additional authenticated data |
+| Cookie jar | The platform's own session cookies — on Douyin and TikTok `ttwid` at minimum, ideally `odin_tt`, `s_v_web_id`, `msToken`, `uifid`; on Bilibili `buvid3` | `identities.cookies_encrypted`, AES-256-GCM, the row id bound in as additional authenticated data |
 | Fingerprint | Browser family and major version, User-Agent, `navigator.platform`, screen geometry, language, timezone, `hardwareConcurrency`, `deviceMemory` | `identities.fingerprint` (JSONB) |
 | Proxy binding | The egress this jar was minted behind, or none for the direct connection | `identities.proxy_id` |
 | History | Consecutive failure streak, cooldown, state, last use | `identities.state`, `consecutive_fails`, `cooldown_until`, `last_used_at` |
@@ -94,7 +94,7 @@ stateDiagram-v2
 
 | State | Meaning | Scheduled? |
 | --- | --- | --- |
-| `minting` | A browser is producing it right now | No |
+| `minting` | It is being minted right now | No |
 | `active` | Normal rotation | Yes |
 | `cooling` | Backing off after a risk-control response | Only when a caller pins it by name |
 | `degraded` | The backoff hit its ceiling; last resort | Only when the active pool is empty |
@@ -112,15 +112,19 @@ A browser is involved because there is no other way to get the same three things
 
 The browser lives in a separate long-running service (`browser-rpc`, reached over `DTK_BROWSER_RPC_URL`), not launched per call: a cold browser start costs seconds.
 
+Bilibili is the exception. Its guest session — `buvid3` and `buvid4` — is handed out by one plain HTTP request, the site's `/x/frontend/finger/spi`, so a Bilibili guest is minted without a browser. That one request goes out through the instance's own TLS-impersonating transport and behind the proxy the identity will be bound to, so the session is still created from the exit that will later spend it — and an install with no browser container still keeps a Bilibili pool.
+
 ### The pace is part of the correctness
 
-The pool filler (`src/dtk/worker/pool_filler.py`) mints **exactly one identity per tick**, holds a cross-process Redis lock while doing it so `--scale worker=N` cannot turn one mint into N, and backs off exponentially when minting keeps failing (60s doubling to a 3600s ceiling). Refilling from the low-water mark to the target therefore takes minutes. That is intended: five fresh visitors appearing from one deployment inside a second is itself a stronger signal than anything those identities would go on to do. Nothing waits on minting — it is off the request path entirely.
+The pool filler (`src/dtk/worker/pool_filler.py`) mints **exactly one identity per tick**, holds a cross-process Redis lock while doing it so `--scale worker=N` cannot turn one mint into N, and backs off exponentially when minting keeps failing (60s doubling to a 3600s ceiling). The backoff is kept per minting route — the browser, and Bilibili's plain HTTP — so a browser container that is down does not stop the Bilibili pool refilling. Refilling from the low-water mark to the target therefore takes minutes. That is intended: five fresh visitors appearing from one deployment inside a second is itself a stronger signal than anything those identities would go on to do. Nothing waits on minting — it is off the request path entirely.
 
 | Setting | Default | What it decides |
 | --- | --- | --- |
 | `pool.min_size` | 3 | Low-water mark per platform; below it the filler starts topping up |
 | `pool.target_size` | 8 | It keeps going until the usable count reaches this |
 | `pool.max_fail_streak` | 3 | Above this streak an identity stops counting toward the pool level, so the filler replaces it instead of counting it |
+
+Each platform can override the first two with its own marks — `pool.douyin.*`, `pool.tiktok.*` and `pool.bilibili.*` — described in [Configuration](./03-configuration.md).
 
 The level the filler reads is the **usable** count — live identities whose failure streak is still under `pool.max_fail_streak` — not the row count. An identity that fails every request stays live (it cools, its backoff elapses, it is promoted, it fails again), so counting rows lets a pool sit permanently at target while serving nothing.
 
@@ -132,19 +136,21 @@ The filler picks an egress no live identity of that platform is already using. T
 
 ### Without a browser
 
-`DTK_BROWSER_RPC_URL` unset means no minting at all, and the whole job is skipped rather than logging an error every minute. That deployment lives on **imported** cookies: you paste a jar from your own browser and the instance parses it. Four formats are recognized automatically — a `Cookie:` header, a JSON array from a cookie-editor extension, Netscape `cookies.txt`, and loose `key=value` lines — and the parse is shown to you before anything is stored, including which cookies were found, whether the jar carries a logged-in session (`sessionid`, `sid_tt`, `sid_guard`, …), and the browser it was inferred to be. See [Identities and proxies](./06-identities-and-proxies.md).
+`DTK_BROWSER_RPC_URL` unset means no Douyin or TikTok minting: those pools are left alone rather than logging an error every minute, and only Bilibili, minted over plain HTTP, still refills by itself. For the other two that deployment lives on **imported** cookies: you paste a jar from your own browser and the instance parses it. Four formats are recognized automatically — a `Cookie:` header, a JSON array from a cookie-editor extension, Netscape `cookies.txt`, and loose `key=value` lines — and the parse is shown to you before anything is stored, including which cookies were found, whether the jar carries a logged-in session (`sessionid`, `sid_tt`, `sid_guard`, …, or Bilibili's `SESSDATA`), and the browser it was inferred to be. See [Identities and proxies](./06-identities-and-proxies.md).
 
 An imported logged-in jar is far more valuable than a guest identity and far more damaging to leak. It is also the reason the *pin* exists, described under the scheduler below.
 
 ## Request signing
 
-Both platforms require query parameters and headers computed by their own JavaScript. This project reimplements those algorithms in pure Python (`src/dtk/signing/native/`), which costs microseconds and has no external dependency, and keeps the browser as a fallback that runs the site's real code (`src/dtk/signing/rpc.py`).
+Douyin and TikTok require query parameters and headers computed by their own JavaScript. This project reimplements those algorithms in pure Python (`src/dtk/signing/native/`), which costs microseconds and has no external dependency, and keeps the browser as a fallback that runs the site's real code (`src/dtk/signing/rpc.py`).
+
+Bilibili's signature, WBI (`w_rid` + `wts`), is computed natively from two public keys the site publishes. They are fetched from Bilibili's `nav` endpoint and cached for an hour per process; if a refresh fails, keys up to a day old keep being used. There is nothing for a browser to add, so browser-rpc never signs Bilibili whatever `signing.mode` says — the modes below choose a signer for Douyin and TikTok.
 
 `signing.mode` decides which is preferred. It ships as `native`.
 
 | Mode | Behaviour |
 | --- | --- |
-| `native` | Sign everything in-process. The browser is what mints identities, not what signs their requests. |
+| `native` | Sign everything in-process. The browser is what mints Douyin and TikTok identities, not what signs their requests. |
 | `rpc` | Prefer `browser-rpc` for every signature. Where to go the day a platform ships a new SDK and the port goes stale. |
 | `auto` | Native, except on the endpoints the platform's own SDK sign-protects, and except when an endpoint's risk rate suggests the signature is being rejected. |
 
@@ -162,7 +168,7 @@ TikTok enforces this directly: the same signed bytes replayed over a Firefox TLS
 
 Measured against a live page on 2026-09-08: Douyin's `verifyFp` query parameter **is** the `s_v_web_id` cookie of whatever browser computed the signature. Sign in one session and send the request with another session's cookies and the two name different visitors.
 
-Neither platform answers that with a clean rejection. They withhold the payload — HTTP 200, an intact envelope, and nothing in it. That reads exactly like rate limiting, which is why this is worth understanding before you debug one.
+Neither Douyin nor TikTok answers that with a clean rejection. They withhold the payload — HTTP 200, an intact envelope, and nothing in it. That reads exactly like rate limiting, which is why this is worth understanding before you debug one.
 
 The same coupling shows up in the native signer:
 
@@ -178,6 +184,24 @@ If you ever reproduce a request by hand, this is the trap. The `explain` option 
 ## The scheduler
 
 The scheduler answers exactly one question — *which identity may send this request right now?* — or refuses with a reason that can be shown to the caller and recorded in `request_log`.
+
+### Who may be drawn: rotation and login tiers
+
+Before anything is ranked, the scheduler decides which identities this request may be handed at all, and in what order of tiers (`_rotation_pool` in `src/dtk/scheduler/scheduler.py`). Ranking, below, only ever orders the identities inside one tier.
+
+- **Rotation comes first.** An identity reserved for the requests that name it is never drawn, and one limited to a list of endpoints is drawn only for those. See [Keeping an identity out of rotation](./06-identities-and-proxies.md#keeping-an-identity-out-of-rotation).
+- **Then what the endpoint gives a guest.** Each endpoint declares it for its first page (`login`) and for every later page (`paging_login`): nothing lost, a login preferred, or a login required. The capability table reports both.
+
+| What a guest gets | Tiers, in order | With no login in rotation |
+| --- | --- | --- |
+| The same answer as a login, `pool.<platform>.guests_first` on (the default) | Guests, then logins | Guests alone |
+| The same answer as a login, the setting off | Guests and logins together, by recency | Guests alone |
+| Less - a login preferred (Douyin's author posts and Bilibili's comments, first page) | Logins only | A guest answers, flagged `meta.guest_fallback` and not cached |
+| Nothing - a login required (the same two past their first page, Bilibili's comment replies past theirs, and Douyin's author likes on every page) | Logins only | `no_login`, at once |
+
+Within each tier the active identities are drawn, and the degraded ones only when no active one is left in it; cooling identities are never drawn. A later tier is reached when every identity in the ones before it is busy or out of quota: a busy guest gives way to an idle login, so guests first decides who goes first and never turns away a request a free login could serve. The reverse is deliberate for a login an endpoint prefers — that one is waited for, not swapped for a guest, or on a busy instance most first pages would go to guests.
+
+`guests_first` is a runtime setting per platform, read on every request, and is the switch on the Scheduler page's coverage card. The reasoning, and the measurements behind each row, are in [What needs a logged-in identity](./06-identities-and-proxies.md#what-needs-a-logged-in-identity).
 
 ### Health ranking
 
@@ -213,13 +237,19 @@ Each identity holds a separate budget for each endpoint. The quota is keyed on t
 | --- | --- | --- | --- |
 | `*.content_detail` | 5 | 0.30 | 1.0 |
 | `*.author_profile` | 4 | 0.20 | 1.2 |
+| `*.related_posts`, `*.live_room`, `*.live_room_by_id` | 4 | 0.20 | 1.2 |
+| `*.music_detail`, `*.hashtag_detail`, `*.live_status`, `douyin.trending` | 4 | 0.20 | 1.0 |
 | `*.author_posts` | 3 | 0.12 | 1.8 |
 | `*.author_likes` | 3 | 0.12 | 1.8 |
 | `*.comments`, `*.comment_replies` | 3 | 0.15 | 1.5 |
-| `*.mix_posts` | 3 | 0.15 | 1.5 |
+| `douyin.live_ranking` | 3 | 0.15 | 1.2 |
+| `*.mix_posts`, `*.author_mixes`, `*.music_posts`, `tiktok.hashtag_posts` | 3 | 0.15 | 1.5 |
 | `tiktok.author_followers`, `tiktok.author_following` | 3 | 0.12 | 1.8 |
+| `tiktok.search_posts`, `tiktok.search_authors` | 2 | 0.08 | 1.8 |
 | `*.session_check` | 3 | 0.20 | 1.0 |
 | anything unregistered | 3 | 0.15 | 1.5 |
+
+The wildcard rows are the Douyin and TikTok figures. Bilibili's endpoints are registered under their own names in `src/dtk/scheduler/policies.py`, among them `bilibili.content_streams`, the second request a video detail makes for its playable file. The one to know is `bilibili.author_posts`, the uploader video list: it is the endpoint Bilibili guards hardest, and it has the slowest bucket of any Bilibili endpoint.
 
 A refill of `0.12/sec` means one request every 8.3 seconds, per identity, on that endpoint, once the burst is spent. That is the throughput ceiling of a single identity — the way to go faster is more identities, not a bigger bucket. The risk weight multiplies the cooldown an identity earns when that endpoint gets it risk-controlled.
 
@@ -247,12 +277,13 @@ An open circuit lasts 300 seconds and lets exactly one probe through per 60 seco
 
 ### Refusals
 
-Waiting is bounded: `sched.max_wait_seconds` (default `10`), polled every 250ms. Rejecting early beats queueing indefinitely — a caller left hanging for a minute before failing is worse off than one told to retry immediately. Two refusals skip the wait entirely, because polling cannot change the answer.
+Waiting is bounded: `sched.max_wait_seconds` (default `10`), polled every 250ms. Rejecting early beats queueing indefinitely — a caller left hanging for a minute before failing is worse off than one told to retry immediately. Three refusals skip the wait entirely, because polling cannot change the answer.
 
 | `reject_reason` | Meaning | Waits? | Error the caller sees |
 | --- | --- | --- | --- |
 | `circuit_open` | This endpoint is tripped for everyone | No | `ENDPOINT_CIRCUIT_OPEN` (503) |
 | `pinned_unavailable` | The named identity is retired, still minting, or on another platform | No | `INVALID_PARAM` (400) |
+| `no_login` | The endpoint requires a login and none is in rotation for it | No | `IDENTITY_LOGIN_REQUIRED` (503), with `details.cooling` |
 | `no_identity` | No active or degraded identity exists for this platform | Yes | `IDENTITY_POOL_EXHAUSTED` (503) |
 | `no_token` | Every candidate is out of quota on this endpoint | Yes | `IDENTITY_POOL_EXHAUSTED` (503) |
 | `all_inflight` | Every candidate is mid-request | Yes | `IDENTITY_POOL_EXHAUSTED` (503) |
@@ -261,7 +292,7 @@ Waiting is bounded: `sched.max_wait_seconds` (default `10`), polled every 250ms.
 
 `pinned_unavailable` is deliberately a 400 and not a 503: the pool is fine, and waiting will not mend a parameter naming an identity that cannot serve the request.
 
-`queue_full` is the odd one out in that table. It is raised by the API when a submission arrives at the queue ceiling (`src/dtk/api/routes/operations.py`), before there is a task to schedule, so it reaches the caller in the error envelope's `details.reject_reason` and never becomes a `request_log` row. The other six are the scheduler's own, and those are the ones the Logs page can show you.
+`queue_full` is the odd one out in that table. It is raised by the API when a submission arrives at the queue ceiling (`src/dtk/api/routes/operations.py`), before there is a task to schedule, so it reaches the caller in the error envelope's `details.reject_reason` and never becomes a `request_log` row. The other seven are the scheduler's own, and those are the ones the Logs page can show you.
 
 ### Pinning an identity
 
@@ -326,7 +357,7 @@ Note rules 5 and 9. Both mean *our signature was rejected*, not *this identity i
 
 ### Retrying
 
-A `network_error` is retried on a **different** identity — up to `MAX_TRANSPORT_ATTEMPTS` (3) attempts — because the fault is in the egress rather than in the request. If three separate exits cannot reach the platform, the problem is not the identity, and the caller gets a 500 naming the last error.
+A `network_error` is retried on a **different** identity — up to `MAX_TRANSPORT_ATTEMPTS` (3) attempts — because the fault is in the egress rather than in the request. If three separate exits cannot reach the platform, the problem is not the identity, and the caller gets `UPSTREAM_UNREACHABLE` (502) naming the last error and saying whether that attempt went through a proxy. It was a 500 `INTERNAL` once, which told the caller to report a bug for what is nearly always this host's egress - a server in mainland China reaching TikTok with no proxy on the identity, say.
 
 `risk_control` and `business_error` are not retried. They are answers.
 
@@ -368,7 +399,7 @@ Every response — success or failure, REST or console — has the same four top
 
 `error.code` is a stable enum you can branch on; it is append-only and never renamed and never translated. `error.message` beside it is localized (`?lang=zh`) and must never be parsed. `meta.request_id` on a **finished result** — a `?wait=` call that completed, or the result of a polled task — is the id written to `request_log`, which is what makes a bug report actionable. On the `202` that acknowledges a submission it is only the HTTP correlation id (the same value as the `X-Request-ID` header), and it has no log row of its own: the worker that later runs the task generates its own fetch request id, and that is the one the Logs page holds.
 
-Some codes are marked non-retryable and are advertised as such, so an agent does not burn its budget looping on a permanent failure: `INVALID_URL`, `UNSUPPORTED_CONTENT`, `INVALID_PARAM`, `UNAUTHENTICATED`, `FORBIDDEN_SCOPE`, `NOT_FOUND`, `CONTENT_PRIVATE`, `UPSTREAM_CHANGED`, `CANCELLED`, `METHOD_NOT_ALLOWED`, `UNSUPPORTED_MEDIA_TYPE`, `NOT_CONFIGURED`, and the two setup codes. Full detail in the [REST API guide](./11-api.md) and [MCP and AI agents](./12-mcp.md).
+Some codes are marked non-retryable and are advertised as such, so an agent does not burn its budget looping on a permanent failure: `INVALID_URL`, `UNSUPPORTED_CONTENT`, `INVALID_PARAM`, `UNAUTHENTICATED`, `FORBIDDEN_SCOPE`, `NOT_FOUND`, `CONTENT_PRIVATE`, `MEDIA_WITHHELD`, `UPSTREAM_CHANGED`, `CANCELLED`, `METHOD_NOT_ALLOWED`, `UNSUPPORTED_MEDIA_TYPE`, `NOT_CONFIGURED`, and the two setup codes. Full detail in the [REST API guide](./11-api.md) and [MCP and AI agents](./12-mcp.md).
 
 ### One row per request
 
@@ -387,8 +418,8 @@ Two separate mechanisms, both there to stop repeated questions costing repeated 
 | Setting | Default | Applies to |
 | --- | --- | --- |
 | `cache.content_ttl` | 1800s | Content detail |
-| `cache.author_ttl` | 900s | Author profile |
-| `cache.list_ttl` | 300s | Posts, comments, replies, likes, mixes, followers, following |
+| `cache.author_ttl` | 900s | Author profile, sound, hashtag |
+| `cache.list_ttl` | 300s | Posts, comments, replies, likes, mixes, followers, following, search results, trending boards, live rooms, their audience rankings and on-air checks |
 
 A cache hit costs no identity quota, which makes it the cheapest protection the pool has. It is still logged as a request, with `cache_hit` set — a Logs page that omitted them would make a cache that has started serving everything look like an endpoint nobody is calling.
 
@@ -436,6 +467,7 @@ Two kinds of caller, two mechanisms, one principal. The console uses a server-si
 | --- | --- |
 | `douyin:read` | Douyin platform reads |
 | `tiktok:read` | TikTok platform reads |
+| `bilibili:read` | Bilibili platform reads |
 | `archive:read` | Read what this instance has already stored |
 | `archive:export` | Walk the whole archive in one request |
 | `media:read` | See what media is stored on disk |
@@ -467,7 +499,7 @@ Keys are shown once at creation; only the prefix (e.g. `dtk_a1b2c3d4`) and a SHA
 
 ### Opening an endpoint to the public
 
-Every endpoint requires a credential by default. `api.public_endpoints` lists exceptions by `"<METHOD> <path template>"`, exactly as they appear in the API document. Three groups can **never** be opened whatever the setting says — `/api/v1/admin/*`, `/api/v1/auth/*` and `/api/setup/*` — and there is no override. An anonymous caller on an opened endpoint gets `douyin:read` and `tiktok:read` and nothing else, and is rate-limited by client address rather than by key.
+Every endpoint requires a credential by default. `api.public_endpoints` lists exceptions by `"<METHOD> <path template>"`, exactly as they appear in the API document. Three groups can **never** be opened whatever the setting says — `/api/v1/admin/*`, `/api/v1/auth/*` and `/api/setup/*` — and there is no override. An anonymous caller on an opened endpoint gets `douyin:read`, `tiktok:read` and `bilibili:read` and nothing else, and is rate-limited by client address rather than by key.
 
 One subtlety: bad credentials are not the same as none. A caller that sends a key the instance rejected is told so even on an open endpoint. Silently downgrading them to anonymous would turn "your key expired" into "your key works but sees less", which is the harder of the two to diagnose. More in [Users and API keys](./09-users-and-api-keys.md) and [Security](./15-security.md).
 
@@ -482,10 +514,11 @@ With the model above, most errors classify themselves. This table is the short v
 | `ENDPOINT_CIRCUIT_OPEN` | ≥3 identities failed ≥60% of ≥20 requests on that endpoint in 5 minutes | Probably not the instance. Check the signer and the platform. |
 | `NOT_FOUND` on a link that works in a browser | The platform answered that the post is gone, private, or owner-only | No. `business_error` costs no identity health, by design. |
 | `UPSTREAM_RISK_CONTROL` | That identity was refused — cooled, streak incremented | Not a bug on its own. A whole pool at once is an event. |
+| `UPSTREAM_RISK_CONTROL` on a Bilibili uploader's video list | Bilibili answers a burst from one egress with HTTP 412 pages for a few minutes, whatever the headers | No. Spread the requests out; proxies help. See [Troubleshooting](./14-troubleshooting.md#http-412-on-a-bilibili-uploaders-video-list). |
 | `UPSTREAM_CHANGED` | The response no longer matches what the parser expects | Worth reporting. Quote the `request_id`. |
 | A `signature.refused` or `signature.rejected` rule in the Logs page | *Our* signature was rejected, not the identity | Report it — the platform's SDK likely moved. |
 | A degraded identity that never recovers | Promotion returns it to active but does not clear the streak; only a success does | No. Reset it by hand if the failures were not its fault. |
-| An identity that will not mint, silently | No `DTK_BROWSER_RPC_URL`, or every proxy is already bound | No. The mint log on the Identities page names the reason. |
+| An identity that will not mint, silently | No `DTK_BROWSER_RPC_URL` (Douyin and TikTok only — Bilibili mints without it), or every proxy is already bound | No. The mint log on the Identities page names the reason. |
 
 The general shape: **if the platform answered, the identity is innocent; if the platform refused, the identity pays; if nothing answered, the egress pays; and if our own signature was refused, the identity pays anyway but the rule name tells you where to look.**
 

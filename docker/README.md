@@ -10,11 +10,13 @@ docker/
 ├── Dockerfile           api + worker + migrate (one image, three entrypoints)
 ├── Dockerfile.browser   browser-rpc (optional, --profile browser)
 ├── Dockerfile.downloader  media downloader (optional, --profile downloader)
+├── Dockerfile.transcriber offline FunASR ONNX sidecar (optional, --profile transcriber)
 ├── entrypoint.sh        role dispatch and the DTK_SECRET_KEY gate
 ├── compose.yml          the stack
 ├── compose.test.yml     test fixtures only (owned elsewhere; never used here)
 ├── browser_rpc/         the RPC service source, built into Dockerfile.browser
-└── downloader/          the Go downloader source, built into Dockerfile.downloader
+├── downloader/          the Go downloader source, built into Dockerfile.downloader
+└── transcriber/         the transcription service source, built into Dockerfile.transcriber
 ```
 
 ## Quick start
@@ -57,9 +59,11 @@ With the headless browser (automatic identity minting and the signing fallback):
 
 ```bash
 echo 'DTK_BROWSER_RPC_URL=http://browser-rpc:9000' >> .env
-CLOAKBROWSER_COMMIT=<sha> \
-  docker compose -p dtk -f docker/compose.yml --profile browser up -d --build
+docker compose -p dtk -f docker/compose.yml --profile browser up -d --build
 ```
+
+The CloakBrowser revision comes from `compose.yml`; see
+[The backend is pluggable, and pinned](#the-backend-is-pluggable-and-pinned).
 
 Leaving the profile off is a supported deployment, not a degraded one: a user who
 imports cookies by hand does not need the heaviest container in the stack, and
@@ -83,6 +87,41 @@ Stored media is capped by the `media.max_bytes` setting, 2 GiB by default.
 Past it the oldest unpinned downloads are removed and an alert says what went;
 pinning one in the console exempts it for good.
 
+With offline transcription, prepare quantized FunASR ONNX model directories
+named `asr`, `vad` and `punc` under one host directory. The complete manual
+download and verification procedure is in
+[`documents/en/18-funasr-models.md`](../documents/en/18-funasr-models.md). Then add:
+
+```bash
+cat >> .env <<EOF
+DTK_TRANSCRIBER_URL=http://transcriber:9200
+DTK_TRANSCRIBER_TOKEN=$(openssl rand -hex 24)
+DTK_TRANSCRIBER_MODEL_PATH=/absolute/path/to/funasr-onnx
+DTK_TRANSCRIBER_THREADS=2
+DTK_TRANSCRIBER_JOB_HISTORY=64
+DTK_TRANSCRIBER_PROGRESS_LOG_SECONDS=30
+DTK_TRANSCRIBER_NORMALIZATION_FAILURE_POLICY=fallback
+EOF
+COMPOSE_ENV_FILES=.env docker compose -p dtk -f docker/compose.yml \
+  --profile downloader --profile transcriber up -d --build
+```
+
+`COMPOSE_ENV_FILES=.env` is what makes compose read `DTK_TRANSCRIBER_MODEL_PATH`
+from the root `.env` (see
+[the two ways compose reads `.env`](#configuration-and-the-two-ways-compose-reads-env));
+without it the default
+`docker/models/funasr-onnx` is mounted, empty, and the sidecar reports
+`degraded`. The downloader comes along because what the transcriber reads is
+what the downloader stored. The guided install script can fetch and verify the
+models and write all of this for you.
+
+The models are mounted read-only and the container has no internet route. It
+reads `media-data` read-only, decodes video audio through ffmpeg, and keeps no
+intermediate WAV. Transcripts use contextual Chinese ITN by default. Set the
+normalization failure policy to `fail` when an unnormalized fallback must make
+the whole transcription fail. The sidecar retains only the configured number
+of recent terminal jobs for worker-restart recovery; live work is never evicted.
+
 ## What the images are
 
 **`Dockerfile`** builds in three stages:
@@ -103,6 +142,17 @@ somebody rebuilds one of them.
 
 **`Dockerfile.browser`** builds browser-rpc. It is separate because it is the
 only container that carries a browser, and it is optional.
+
+**`Dockerfile.downloader`** and **`Dockerfile.transcriber`** build the other two
+optional sidecars: a static Go binary on `scratch`, and a Python service with
+ONNX Runtime and a standalone ffmpeg. The transcriber image holds no models -
+they are mounted from the host - so publishing it ships nobody else's weights.
+
+Three of the four are published: the app, the downloader and, from the first
+release that includes transcription, the transcriber
+(`evil0ctal/douyin_tiktok_download_api-transcriber`). browser-rpc is not: it
+installs CloakBrowser from a pinned commit, and that pin is a security control
+that belongs to the operator.
 
 ### Publishing: the `release` branch
 
@@ -235,10 +285,11 @@ This trips people up, so it is worth being explicit.
   picked up even though the compose project directory is `docker/`. Missing file
   is not an error (`required: false`); the entrypoint produces the useful
   message instead.
-* **Interpolation** in `compose.yml` — only the published address,
-  `${DTK_BIND_HOST:-127.0.0.1}:${DTK_BIND_PORT:-8000}:8000` — does *not* read
-  that file. It reads `docker/.env` or the shell. It therefore defaults to
-  loopback, and publishing elsewhere is an explicit act:
+* **Interpolation** in `compose.yml` — the published address
+  `${DTK_BIND_HOST:-127.0.0.1}:${DTK_BIND_PORT:-8000}:8000`, the image names
+  and tag, and the transcriber's model mount `DTK_TRANSCRIBER_MODEL_PATH` — does
+  *not* read that file. It reads `docker/.env` or the shell. It therefore
+  defaults to loopback, and publishing elsewhere is an explicit act:
 
   ```bash
   DTK_BIND_HOST=0.0.0.0 docker compose -p dtk -f docker/compose.yml up -d
@@ -291,6 +342,12 @@ with room. On a small VPS two of them stop the stack rather than slowing it:
   the stack fits in far less day to day; what does not fit is the peak. A mint
   drives Chromium up while postgres is holding its buffers, and with no swap the
   kernel picks a victim — usually postgres, not the process that grew.
+* with transcription on, `transcriber` (2 cores) and `browser-rpc` (4) are both
+  CPU-bound and both caps, not reservations. On a host without that many idle
+  cores a transcription running during a mint takes several times longer - it
+  still finishes. `cpuset` in the override keeps them apart on a host with six
+  or more cores; the numbers are in
+  [documents/en/02-installation.md](../documents/en/02-installation.md#when-transcription-and-the-browser-share-a-host).
 
 Override per host rather than editing `compose.yml`, so the repository keeps
 describing a normal machine and the deviation stays visible:
@@ -320,8 +377,10 @@ redis, `GET /readyz` for api (readiness, so `up --wait` returns when the API can
 actually serve), a Redis TCP probe for the worker, which has no port of its own,
 and `GET /rpc/health` for browser-rpc — that one reads the `status` field rather
 than settling for a 200, because the service answers the probe even when the
-browser backend failed to start. `migrate` has none - a one-shot task's exit
-status is its health, which is what `service_completed_successfully` reads.
+browser backend failed to start. The transcriber's `GET /health` is read the
+same way: it answers `degraded` while its models are missing or failed to
+load. `migrate` has none - a one-shot task's exit status is its health, which
+is what `service_completed_successfully` reads.
 
 ## browser-rpc
 
@@ -336,8 +395,35 @@ POST /rpc/mint    {platform, proxy_url, geo_hint}
 POST /rpc/sign    {platform, url, query, params, user_agent}
                 → {a_bogus | x_bogus | signature, ms_token}
 GET  /rpc/health  → {status, backend, backend_version, chromium_major,
-                     warm_contexts, uptime}
+                     user_agent, warm_contexts, uptime}
 ```
+
+A signature carries the signing page's own User-Agent, whatever the request
+names: the page runs under its browser binary's `navigator.userAgent`, and
+`/rpc/sign` answers with that string. A `user_agent` the platform would not
+accept that signature for - an identity minted under another browser, or
+imported - is refused with `409 user_agent_mismatch` instead of being signed,
+and dtk then signs that identity natively where its settings allow. On TikTok
+that is any other string: it refuses a request whose User-Agent is not the
+one its signature sealed. On Douyin it is one naming another operating
+system: measured on 2026-11-20, Douyin accepted the page's signature for
+identities on other Chrome majors and on Edge, and refused it for a query
+naming macOS, which dtk builds from a macOS identity's User-Agent.
+`/rpc/health` reports the string once a page has opened.
+
+Upgrade browser-rpc together with api and worker - they share
+`DTK_IMAGE_TAG`, and `dtkctl upgrade` moves them together; nothing checks the
+pairing at run time. An api/worker from 5.1.12 or earlier against this
+browser-rpc fails on both platforms: its self-check asks for references under
+a fixed User-Agent, so both of its signing steps report
+`signing_reference_failed`; it reads a 409 as a browser failure, so TikTok
+identities minted under another browser fail with `SIGNING_FAILED` instead of
+being signed natively; and it refuses any answer whose User-Agent differs
+from the one it asked for, so Douyin identities on any other User-Agent string
+fail too, although this service signed them. The other way round, this
+api/worker against a browser-rpc from 5.1.12 or earlier gets back the
+User-Agent it asked for rather than the page's, which is the #832 behaviour:
+TikTok refuses those signatures as risk control.
 
 The clients are `dtk.identity.minting.client.BrowserRpcClient` and
 `dtk.signing.rpc.RpcSigner`; `docker/browser_rpc/tests/test_rpc_api.py` drives
@@ -411,7 +497,10 @@ registry in `backends/__init__.py`.
 
 At least three GitHub organizations publish repositories called `cloakbrowser`
 with identical descriptions (`docs/design/04-transport-signing.md`), so the image
-takes a repository *and a commit*:
+takes a repository *and a commit*. `compose.yml` defaults both: the commit is
+the one `browser_rpc/requirements.txt` was verified with, and as a default
+rather than a line in `.env` it moves with the checkout together with those
+requirements. To build another revision on purpose (a full commit, never a tag):
 
 ```bash
 CLOAKBROWSER_REPO=https://github.com/CloakHQ/cloakbrowser \
@@ -429,11 +518,23 @@ docker build -f docker/Dockerfile.browser \
   --build-arg CLOAKBROWSER_COMMIT=<sha> -t dtk-browser-rpc:dev .
 ```
 
-Built with no commit, the image contains the service and the fake backend but no
-browser, and refuses to mint unless `DTK_BROWSER_BACKEND=fake` is set on purpose.
+Built with a plain `docker build` and no `CLOAKBROWSER_COMMIT` (the Dockerfile's
+own default is empty; only Compose supplies one), the image contains the service
+and the fake backend but no browser, and refuses to mint unless
+`DTK_BROWSER_BACKEND=fake` is set on purpose.
 Nothing falls back to the fake backend on its own: a pool quietly filling with
 synthetic identities looks healthy right up to the moment every request comes
 back risk-controlled.
+
+A build host that cannot reach the official servers has three switches in
+`.env`, all empty by default and all passed through Compose as build arguments:
+`APT_MIRROR` and `PYPI_MIRROR`, which `docker/package-mirrors.sh` applies before
+the first `apt-get` and `pip install` (the transcriber image takes
+`PYPI_MIRROR` too), and `CLOAKBROWSER_DOWNLOAD_MIRROR` for Chromium. They are
+not equally safe - apt checks Debian's signature whoever serves it, pip and a
+Chromium mirror do not - and `documents/en/02-installation.md` says what each
+one is trusted with. A build-time proxy needs both spellings of the proxy
+arguments: apt reads only the lower-case `http_proxy`.
 
 ## Verifying
 
@@ -528,7 +629,8 @@ procedure follows `docs/design/16-salvage-and-debug.md`.
            signer = RpcSigner(c, 'http://browser-rpc:9000')
            spec = RequestSpec.get('https://www.douyin.com/aweme/v1/web/aweme/detail/',
                                   params={'aweme_id': '7'})
-           print(await signer.sign(spec, StaticFingerprint(user_agent='Mozilla/5.0')))
+           # Empty takes the page's own User-Agent, which every platform accepts.
+           print(await signer.sign(spec, StaticFingerprint(user_agent='')))
    asyncio.run(main())"
    ```
 
@@ -541,6 +643,6 @@ procedure follows `docs/design/16-salvage-and-debug.md`.
 | `browser-rpc` mints nothing, `executable doesn't exist` | the pinned revision installs its browser outside `PLAYWRIGHT_BROWSERS_PATH`; see `Dockerfile.browser` |
 | api healthy but the console 404s | the console stage produced no `dist/`; check `web/package.json` has a `build` script |
 | `no worker entry point in this image` | the worker module is named differently; set `DTK_WORKER_COMMAND` |
-| browser-rpc unhealthy, log says `not installed in this image` | built without `CLOAKBROWSER_COMMIT` |
+| browser-rpc unhealthy, log says `not installed in this image` | built with a plain `docker build` and no `--build-arg CLOAKBROWSER_COMMIT=...`, or from a checkout whose `compose.yml` had no default for it; rebuild through Compose |
 | minting always times out | the proxy cannot reach the platform; test the proxy on its own before blaming the browser |
 | renderers crash under load | `shm_size` was lowered; Chromium needs more than the 64MB default |

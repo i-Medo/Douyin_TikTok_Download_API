@@ -1,8 +1,8 @@
 # Quick start
 
 > **[Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)** —
-> a self-hosted Douyin and TikTok data API: REST, MCP and a web console, with
-> an identity pool that maintains itself.
+> a self-hosted Douyin, TikTok and Bilibili data API: REST, MCP and a web
+> console, with an identity pool that maintains itself.
 > [All docs](../README.md) · [中文](../zh/01-quickstart.md)
 
 By the end of this page you will have the stack running on one host, an
@@ -128,50 +128,57 @@ an optional proxy, bound together and rotated by the scheduler. Identities come
 from exactly two places, and one of them is optional infrastructure.
 
 **With the browser container** (`--profile browser`, plus
-`DTK_BROWSER_RPC_URL` pointing at it): a headless browser mints guest identities
-by itself. The worker checks each platform every 60 seconds and mints **one
-identity per tick**, backing off exponentially on failure, until the pool is
-back at `pool.target_size` (8 by default) from its low-water mark
+`DTK_BROWSER_RPC_URL` pointing at it): a headless browser mints Douyin and
+TikTok guest identities by itself. The worker checks each platform every 60
+seconds and mints **one identity per tick**, backing off exponentially on
+failure, until the pool is back at `pool.target_size` (8 by default) from its low-water mark
 `pool.min_size` (3). Refilling therefore takes minutes, on purpose: five fresh
 visitors appearing from one deployment inside a second is a stronger anomaly
 than anything those identities would go on to do.
 
-**Without it** (the default — `DTK_BROWSER_RPC_URL` empty): the refill job is
-skipped entirely, so **the pool starts empty and stays empty**. Concretely:
+Bilibili is the exception to this whole step. Its guest identities are minted
+without a browser — one plain HTTP request through the instance's own transport
+and the identity's proxy — so the worker keeps the Bilibili pool filled the same
+way whether or not the browser container exists.
 
-- The console's Identities page shows minting as unavailable, and the setup
-  wizard's mint step says so rather than failing.
+**Without it** (the default — `DTK_BROWSER_RPC_URL` empty): nothing mints Douyin
+or TikTok identities, so **those two pools start empty and stay empty**.
+Concretely:
+
+- The console's Identities page shows minting Douyin and TikTok as unavailable
+  (Bilibili stays mintable), and the setup wizard's mint step offers Bilibili
+  alone and says why, rather than failing.
 - `POST /api/v1/admin/identities/mint` still accepts the request — it answers
-  `202` with `task_ids` — and the queued task then fails with
+  `202` with `task_ids` — and for Douyin or TikTok the queued task then fails with
   `501 NOT_CONFIGURED`, "This feature is not configured on this instance.",
   carrying `error.details.reason: "browser_rpc_unconfigured"`. The mint call
   takes no `?wait=`, so you read that verdict on the task
   (`GET /api/v1/tasks/<task_id>`) or in the console, not in the reply to the
   mint itself.
-- Every content request fails with `503 IDENTITY_POOL_EXHAUSTED` — "No identity
-  is available; the pool is expected to recover in N seconds" — until you import
-  at least one cookie jar.
+- Every Douyin or TikTok content request fails with
+  `503 IDENTITY_POOL_EXHAUSTED` — "No identity is available; the pool is
+  expected to recover in N seconds" — until you import at least one cookie jar
+  for that platform.
 
 Running without the browser is a supported deployment, not a broken one: a user
 who imports a cookie jar by hand does not need the heaviest container in the
 stack, and the pool falls back to manual import on its own when `browser-rpc` is
-unreachable. But it is not a deployment that works out of the box. Pick one:
+unreachable. But for Douyin and TikTok it is not a deployment that works out of
+the box. Pick one:
 
 | Path | Do this | Cost |
 |---|---|---|
 | Automatic minting | Start with `--profile browser` in step 4 | ~1.7 GB image, 2.57 GiB RAM warm, up to 4 CPUs, a longer build |
 | Manual cookies | Skip the profile; import a jar on the Identities page after step 6 | You supply and refresh the cookies; a logged-in jar is equivalent to the account password |
 
-If you choose the browser, note one thing that trips everyone up:
-`CLOAKBROWSER_COMMIT` is read at **build time**, and it is a compose
-*interpolation* variable — compose reads those from `docker/.env` or from your
-shell, **not** from the repository-root `.env`. Passing it on the command line
-is the reliable way. It is deliberately pinned to a commit rather than a tag
-because several GitHub organizations publish identically described
+If you choose the browser, which version of it goes into the image needs nothing
+from you: `docker/compose.yml` names the CloakBrowser revision this checkout was verified
+with, and the build installs that one. It is pinned to a commit rather than a
+tag because several GitHub organizations publish identically described
 `cloakbrowser` repositories, so a floating tag would not identify any particular
-piece of software. An image built with it empty contains no browser at all and
-says so on `/rpc/health`, rather than quietly minting synthetic identities that
-no platform accepts.
+piece of software. The pin moves with `git pull`, together with the browser's
+own dependencies; to build a different revision on purpose, see
+[the CloakBrowser pin](./02-installation.md#building-the-browser-image-the-cloakbrowser-pin).
 
 ## Step 4 — Start the stack
 
@@ -190,20 +197,13 @@ With the browser container as well:
 
 ```bash
 echo 'DTK_BROWSER_RPC_URL=http://browser-rpc:9000' >> .env
-CLOAKBROWSER_COMMIT=f04c23da285b3b3d3cf10c8f9d282e7adc1d52ce \
-  docker compose -p dtk -f docker/compose.yml --profile browser up -d --build
+docker compose -p dtk -f docker/compose.yml --profile browser up -d --build
 docker compose -p dtk -f docker/compose.yml --profile browser ps
 ```
 
-That commit is CloakBrowser 0.5.10 / Chromium 146, the revision this repository
-has been verified against end to end; it is in `.env.example` for the same
-reason — as a reference value, not as a working configuration. Copying
-`.env.example` to the repository-root `.env` does **not** get the pin into the
-build, because compose interpolation does not read that file: pass it on the
-command line as above, put it in `docker/.env`, or feed the root file to Compose
-with `COMPOSE_ENV_FILES=.env`. Change it deliberately. `browser-rpc` has a
-60-second healthcheck `start_period`, so give it a minute before reading `ps` as
-a verdict.
+The build installs the CloakBrowser revision `docker/compose.yml` names, so
+there is no pin to copy into `.env`. `browser-rpc` has a 60-second healthcheck
+`start_period`, so give it a minute before reading `ps` as a verdict.
 
 ### Where the API is published
 
@@ -302,7 +302,7 @@ The administrator's credentials:
 
 - Username must match `^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$` — letters, digits,
   dot, dash, underscore, 3 to 64 characters, not starting with punctuation.
-- Password: the API's floor is 8 characters, the wizard asks for 12.
+- Password: at least 8 characters, the same floor the API, the CLI and the Users page hold.
 - **There is no password reset by email.** Recovery is a CLI command:
   `docker compose -p dtk -f docker/compose.yml exec api dtk user passwd <name>`.
 
@@ -324,12 +324,12 @@ id and the parsed JSON. That is your first successful parse.
 ## Step 7 — Parse a link from the console
 
 The wizard's smoke test runs once. For a repeatable call, use **Playground** in
-the sidebar (under *Tools*).
+the sidebar (under *Developer*).
 
 1. Pick `POST /api/v1/parse` from the catalogue on the left.
 2. Put a share link, a bare post URL, or the whole clipboard text a platform app
-   produces into `url`. Short links (`v.douyin.com`, `vm.tiktok.com`) are
-   followed for you.
+   produces into `url`. Short links (`v.douyin.com`, `vm.tiktok.com`, `b23.tv`)
+   are followed for you.
 3. Set `wait` to something like `20`.
 4. Submit.
 
@@ -346,17 +346,20 @@ The console uses a session cookie. Programs use an API key, because a key
 carries scopes and can be revoked on its own.
 
 Go to **API keys → Create key**. Give it a name you will recognise in the audit
-log, and tick only what it needs — for this walkthrough, `douyin:read` and
-`tiktok:read`.
+log, and tick only what it needs — for this walkthrough, `douyin:read`,
+`tiktok:read` and `bilibili:read`.
 
 | Scope | What it opens |
 |---|---|
 | `douyin:read` | Parse, post, author and comment endpoints for Douyin |
 | `tiktok:read` | The same endpoints for TikTok |
+| `bilibili:read` | The same for Bilibili, which has no likes, reposts, bookmarks or follow lists, and adds the popular boards and a video's parts |
 | `archive:read` | What this instance has already stored, answered from local storage |
 | `archive:export` | Walk the entire archive in one request — the single call that turns a read key into a copy of the database |
 | `media:read` | What media is on the server's disk, and how much space it uses |
 | `media:write` | Start a download, pin one against cleanup, or cancel one |
+| `transcription:read` | List transcriptions of downloaded videos and read their text |
+| `transcription:write` | Start, cancel and delete a transcription |
 | `identity:manage` | Mint, import, test and retire identities. An ordinary read key must never carry this |
 | `admin` | Everything, settings and users included |
 
@@ -507,8 +510,8 @@ on the request path, so an instance without it is degraded, not unready.
 | No setup banner in the api log | An account already exists — the token is issued only while the `users` table is empty. Sign in at `/login` instead. |
 | `SETUP_TOKEN_INVALID` | The token expired, was spent, or was invalidated by five wrong attempts. `docker compose -p dtk -f docker/compose.yml restart api` prints a live one, or issues a new one if the old is gone. |
 | `503 IDENTITY_POOL_EXHAUSTED` | The pool has no usable identity. Mint one, or import a cookie jar. See step 3. |
-| A mint task fails `501 NOT_CONFIGURED` (the mint call itself returned `202`) | No browser container. Start `--profile browser` and set `DTK_BROWSER_RPC_URL`, or import cookies instead. |
-| `browser-rpc` unhealthy, log says "not installed in this image" | Built without `CLOAKBROWSER_COMMIT`, which is read at build time from the shell, not from the root `.env`. |
+| A mint task fails `501 NOT_CONFIGURED` (the mint call itself returned `202`) | No browser container, and the platform is Douyin or TikTok — Bilibili mints without one. Start `--profile browser` and set `DTK_BROWSER_RPC_URL`, or import cookies instead. |
+| `browser-rpc` unhealthy, log says "not installed in this image" | The image was built with a plain `docker build` and no `--build-arg CLOAKBROWSER_COMMIT=…`, or from an older checkout whose `docker/compose.yml` had no default for it. Rebuild it through Compose, as in step 4. |
 | Minting always times out | The proxy cannot reach the platform. Test the proxy on its own before blaming the browser. |
 | `RATE_LIMITED` on a correct password | The per-account login limit is a real lockout: five failures, fifteen minutes. Wait, or clear the counter — see [Troubleshooting](./14-troubleshooting.md). |
 

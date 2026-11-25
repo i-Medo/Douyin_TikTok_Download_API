@@ -1,8 +1,8 @@
 # Operations
 
 > **[Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API)** —
-> a self-hosted Douyin and TikTok data API: REST, MCP and a web console, with
-> an identity pool that maintains itself.
+> a self-hosted Douyin, TikTok and Bilibili data API: REST, MCP and a web
+> console, with an identity pool that maintains itself.
 > [All docs](../README.md) · [中文](../zh/10-operations.md)
 
 This page is about day two and everything after it: keeping an instance healthy for months without babysitting it. After reading it you will know what the background loops do, how a settings change reaches a running process, how to take and restore a backup (and prove the restore works), how alerting is wired, what gets pruned and when, what to watch, and how to upgrade without losing anything.
@@ -48,7 +48,9 @@ The whole pass logs one `worker.maintenance.done` line with the counts. If you s
 
 ## Settings and how a change takes effect
 
-Runtime configuration lives in the database, not in `.env`. The console page is **Settings** at `/settings`, grouped by key prefix: signing, cache, snapshot, archive, media, watchlist, capacity, retention, api, security, notify, system, and `other` for anything with an unlisted prefix. Scheduler and identity-pool keys (`sched.*`, `pool.*`) are deliberately not here — they live on `/scheduler`, next to the pool they act on.
+Runtime configuration lives in the database, not in `.env`. The console page is **Settings** at `/settings`, grouped by key prefix: signing, cache, snapshot, archive, media, watchlist, capacity, retention, demo, api, security, notify, system, and `other` for anything with an unlisted prefix. Scheduler and identity-pool keys (`sched.*`, `pool.*`) are deliberately not here — they live on `/scheduler`, next to the pool they act on, where each platform's low-water mark and target are edited as one grid.
+
+A search box filters on keys and descriptions, and **Overridden only** narrows the page to database overrides. A few keys stay in their group but are not edited there; each is a pointer to the place that edits it: `demo.enabled` to the Demo mode card at the top of this page, `notify.*` to Notifications, `api.public_endpoints` to Endpoint access and `system.check_updates` to System. A generic row was not merely redundant for these, it was wrong: switching `demo.enabled` from a plain toggle threw away the only response that carries the demo password and key, and `notify.channels`, a list of objects, was shown as `[object Object]` and saved back that way over every channel. Any other value that is a list of records is shown read-only. Save, Cancel and Reset are not drawn for a role that cannot use them.
 
 Every row names its **source**, which is the single most useful thing on the page:
 
@@ -306,11 +308,11 @@ The event set is fixed. Deduplication is the feature, not an optimisation: witho
 
 A window is only held for an alert that actually reached somebody. If every channel refused it, the mark is released so the next occurrence gets a fresh attempt — otherwise one refused connection would buy up to a day of silence.
 
-**Narrowing a channel's events has a sharp edge.** By default a channel receives every event, which is stored by *omitting* the event list. The console's checklist offers only the first seven events in the table above; the three disk-related ones (`capacity_warning`, `capacity_paused`, `media_evicted`) are not on it. So the moment you untick a single box, the channel is stored with an explicit list that cannot contain the disk events, and it stops receiving them. If you want capacity alerts, leave every box ticked on at least one channel.
+**Narrowing a channel's events.** By default a channel receives every event, which is stored by *omitting* the event list — so an event added in a later release reaches it too. The console's checklist offers all ten events in the table above. Untick one and the channel is stored with an explicit list; tick every box again and it goes back to "every event". The last ticked box cannot be cleared, because an empty list would mean everything: disable the channel to silence it. An event name this console does not know is kept as stored and shown in the editor. Earlier consoles offered only the first seven and dropped any other name whenever a channel was saved, so a channel narrowed to a disk event quietly went back to receiving everything — worth checking a narrowed channel's list once after upgrading.
 
 ## Testing a channel
 
-`/notifications` has **Send test alert** in the header (all channels) and a **Test** button on each row (that channel). Operator role or better.
+`/notifications` has **Send test alert** in the header (all channels) and a **Test** button on each row (that channel). Operator role or better; a `viewer` is not shown these buttons, nor the ones that add, edit or delete a channel.
 
 A test does not consult the deduplication windows at all — neither claiming one nor reading one — so pressing the button twice sends twice, and proving a channel does not consume the suppression window of a real alert. The test body names the channel it was sent to, which is how you tell two phones apart.
 
@@ -371,10 +373,10 @@ There are two unauthenticated probes and three authenticated views. Point your m
 | --- | --- | --- |
 | Liveness | `GET /healthz` | `200`, `{"status":"ok","uptime_seconds":…}`. Touches no dependency on purpose: a liveness probe that hits the database turns a brief hiccup into a restart storm. |
 | Readiness | `GET /readyz` | `200` with `postgres` and `redis` both `ok`; `503` otherwise. Browser RPC is deliberately excluded — minting is off the request path, so an instance without it is degraded, not unready. |
-| Instance status | `GET /api/v1/system/status`, console `/system` | Components reachable with sane latencies; Chromium major and wreq profile major aligned; `settings_version` matching what you expect. |
+| Instance status | `GET /api/v1/system/status`, console `/system` | Components reachable with sane latencies — the downloader and the transcriber too, where their profiles run; Chromium major and wreq profile major aligned; `settings_version` matching what you expect. |
 | Endpoint health | `GET /api/v1/admin/endpoints/health`, console Overview | `circuit_open: false` everywhere; risk rate well under `sched.circuit_risk_threshold` (0.6). |
 | Traffic mix | `GET /api/v1/admin/metrics/timeseries`, console Overview | Mostly `ok`; `risk_control` rare and not concentrated on one endpoint. |
-| Pool level | console `/identities`, `/system` | Active identities at or above `pool.min_size` (3) for each platform you use. |
+| Pool level | console `/scheduler`, `/identities`, Overview | Identities at or above that platform's low-water mark (`pool.min_size`, 3, unless the platform has its own) for each platform you use. Read the Scheduler page's "schedulable" count per platform: it is the active count minus reserved identities, which serve only the requests that name them and are not capacity. |
 | Disk | console `/system`, `capacity_*` alerts | Below `capacity.warn_percent`. |
 | Background loops | `worker` logs | A `worker.maintenance.done` line every ~5 minutes; no repeating `worker.loop.failed`. |
 | Backups | console `/backup` | An archive from within your backup interval, with the key check reading `This key`. |
@@ -387,9 +389,9 @@ curl -fsS http://127.0.0.1:8000/readyz
 docker compose -p dtk -f docker/compose.yml ps
 ```
 
-The console's **Logs** page (`/logs`) has two tabs: the request log, searchable by request id, endpoint, outcome and time range, and the audit trail — who changed what, kept in its own table so it is never buried by ordinary traffic. Settings changes, backup and restore requests, notification tests and diagnostics all leave an audit row.
+The console's **Logs** page (`/logs`) has two tabs: the request log, searchable by request id, endpoint, identity, proxy, outcome and time range, and the audit trail — who changed what, kept in its own table so it is never buried by ordinary traffic. The id, endpoint and account filters live in the address (`/logs?tab=requests&proxy_id=…`, `/logs?tab=audit&user_id=…`), so a filtered view is a link you can keep or send. Settings changes, backup and restore requests, notification tests and diagnostics all leave an audit row.
 
-For a structured self-check covering egress, proxies, signing and an end-to-end request, run the diagnosis — from the console at `/diagnose`, or:
+For a structured self-check covering the components (the downloader and the transcriber included, where configured), egress to all three platforms, proxies, signing and an end-to-end request, run the diagnosis — from the console at `/diagnose`, where the end-to-end step runs on a platform you pick or, by default, the one this instance serves most, or:
 
 ```bash
 docker compose -p dtk -f docker/compose.yml exec api dtk diagnose
@@ -408,9 +410,17 @@ docker compose -p dtk -f docker/compose.yml exec api \
 docker compose -p dtk -f docker/compose.yml exec api \
   dtk backup list --dir /var/lib/dtk/backups
 
-# 2. Pull, rebuild, restart.
+# 2. Upgrade. Installed with the script, this is the whole step - it takes
+#    a backup of its own just before migrating, too:
+./dtkctl upgrade
+#    By hand: update the checkout, then pull (published images) or build
+#    (from source) with the same --profile flags you run, and restart.
+#    A checkout the script made is on a release tag, not a branch: there,
+#    git fetch origin tag v5.1.7 && git checkout --detach v5.1.7
 git pull
-docker compose -p dtk -f docker/compose.yml build
+export COMPOSE_ENV_FILES=.env
+docker compose -p dtk -f docker/compose.yml pull api worker   # or: build
+docker compose -p dtk -f docker/compose.yml build browser-rpc # with --profile browser
 docker compose -p dtk -f docker/compose.yml up -d --wait
 
 # 3. Confirm.
@@ -423,9 +433,10 @@ docker compose -p dtk -f docker/compose.yml logs --tail 50 migrate
 Points worth knowing before you upgrade:
 
 - **Keep `DTK_SECRET_KEY` unchanged.** Changing it makes every stored cookie jar and proxy URL undecryptable and every existing archive unrestorable. If it must be rotated, retire the affected identities and re-import or re-mint them.
-- **Roll back by tag, not by database.** Migrations move forward; there is no downgrade path documented here. If a release misbehaves, check out the previous tag, rebuild, and restore from the backup you took in step 1 — into an empty database, since a restore fills gaps rather than reverting.
-- **`build` and `up` only touch the services in the active profiles.** If you deploy with `--profile browser` or `--profile downloader`, repeat those flags on both commands. Compose reads the file rather than the running stack, so without them nothing rebuilds `browser-rpc` or `downloader`: they keep serving the old image while `api` and `worker` move forward, and nothing warns you. [Installation and deployment](./02-installation.md) has the flags in full.
-- **Browser images are pinned deliberately.** `CLOAKBROWSER_COMMIT` is a build argument, and like the published address it is compose interpolation: it is read from `docker/.env` or your shell, not from the repository-root `.env`. Pass it on the command line when you rebuild the browser image, or point compose at the root file with `COMPOSE_ENV_FILES=.env`. It identifies exactly one revision; several unrelated repositories publish identically described "cloakbrowser" projects, so a floating tag would not identify any particular software. Change it on purpose, and re-check signing afterwards.
+- **The version is not yours to edit when the script installed it.** `./dtkctl upgrade` moves the checkout to the release's tag first, and writes `DTK_IMAGE_TAG` into `.env` only once the new images are on the machine and the migrations have run, never before. Until the restart, any failure — or Ctrl-C — puts the checkout and `.env` back as they were and leaves the running version running; it says `Put back: ...` when it does. Just before the migrations it takes a backup with `dtk backup create` into the backup volume, if the API is running; a failed backup stops the upgrade, and `./dtkctl upgrade 5.1.7 --no-backup` skips it. By hand, `DTK_IMAGE_TAG=latest` needs no edit; a pin is moved in `.env` before the pull.
+- **Roll back by tag, not by database.** Migrations move forward; there is no downgrade path documented here. If a release misbehaves, go back to the previous version - `./dtkctl upgrade 5.1.5`, or the old pin by hand. That works only if the previous version has every migration the database has had: `./dtkctl upgrade` checks, and refuses one that does not before it pulls anything. Past such a migration the way back is a new install of the previous version (`DTK_VERSION=5.1.5`) with the backup from step 1, taken while that version was running, restored into it — under the same `DTK_SECRET_KEY`, as in [the restore drill](#a-restore-drill) — since a restore fills gaps rather than reverting.
+- **`build`, `pull` and `up` only touch the services in the active profiles.** If you deploy with `--profile browser`, `--profile downloader` or `--profile transcriber`, repeat those flags on every command, and name `downloader` and `transcriber` on the pull. Compose reads the file rather than the running stack, so without them nothing updates `browser-rpc`, `downloader` or `transcriber`: they keep serving the old image while `api` and `worker` move forward, and nothing warns you. [Installation and deployment](./02-installation.md) has the flags in full.
+- **Browser images are pinned deliberately.** `CLOAKBROWSER_COMMIT` is a build argument that `docker/compose.yml` defaults to the revision the checkout's browser dependencies were verified with, so the pin moves with `git pull`; when it moves, the browser rebuild downloads a new Chromium and takes several minutes. It identifies exactly one revision; several unrelated repositories publish identically described "cloakbrowser" projects, so a floating tag would not identify any particular software. To use another one, set it on purpose and re-check signing afterwards — like the published address it is compose interpolation, read from `docker/.env` or your shell, not from the repository-root `.env`, unless `COMPOSE_ENV_FILES=.env` points compose there as above. A value set that way stays put while the checkout moves: `./dtkctl upgrade` takes out one this project wrote into `.env` itself and warns about one you chose; by hand, delete a line copied from an older `.env.example`. The image itself is rebuilt on every upgrade, because its code comes from the checkout.
 - **Watch for version drift** on `/system` after an upgrade: the Chromium major that produces signatures and the wreq TLS profile major that replays fingerprints have to agree.
 - **Scale by restarting workers, not by editing intervals.** `docker compose -p dtk -f docker/compose.yml up -d --scale worker=4`.
 
@@ -437,12 +448,15 @@ Each `(identity, endpoint)` pair has a token bucket, and each identity serves **
 
 | Endpoint | Burst | Refill | Per identity |
 | --- | --- | --- | --- |
-| `*.content_detail` | 5 | 0.30/s | 18 requests/min |
-| `*.author_profile` | 4 | 0.20/s | 12 requests/min |
-| `*.comments`, `*.comment_replies`, `*.mix_posts` | 3 | 0.15/s | 9 requests/min |
-| `*.author_posts`, `*.author_likes`, `tiktok.author_followers`, `tiktok.author_following` | 3 | 0.12/s | 7.2 requests/min |
+| `*.content_detail`, `bilibili.content_streams` | 5 | 0.30/s | 18 requests/min |
+| `*.author_profile`, `*.related_posts`, `*.music_detail`, `*.hashtag_detail`, `*.live_room`, `*.live_room_by_id`, `*.live_status`, `*.trending`, `bilibili.live_streams` | 4 | 0.20/s | 12 requests/min |
+| `*.comments`, `*.comment_replies`, `*.mix_posts`, `*.author_mixes`, `*.music_posts`, `tiktok.hashtag_posts`, `douyin.live_ranking` | 3 | 0.15/s | 9 requests/min |
+| `douyin.author_posts`, `tiktok.author_posts`, `*.author_likes`, `tiktok.author_followers`, `tiktok.author_following` | 3 | 0.12/s | 7.2 requests/min |
+| `bilibili.author_posts`, `*.search_posts`, `*.search_authors` | 2 | 0.08/s | 4.8 requests/min |
 | `*.session_check` | 3 | 0.20/s | 12 requests/min |
 | anything unregistered | 3 | 0.15/s | 9 requests/min |
+
+Two Bilibili rows are there for a reason. A Bilibili video detail is two upstream requests — the detail, then `bilibili.content_streams` for the playable file the detail does not carry — so it spends a token from each bucket, and the second runs at the detail's rate so a detail never waits on it. `bilibili.author_posts`, an uploader's video list, is the slowest bucket in the table because it is the endpoint Bilibili guards hardest: a burst of requests from one egress gets HTTP 412 pages for a few minutes — see [Troubleshooting](./14-troubleshooting.md#http-412-on-a-bilibili-uploaders-video-list).
 
 So:
 
