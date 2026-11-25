@@ -17,6 +17,7 @@ import type {
   IdentityState,
   Outcome,
   TaskState,
+  TranscriptionState,
   UserRole,
 } from './types'
 
@@ -72,6 +73,14 @@ export const DOWNLOAD_STATUS: Record<DownloadState, StatusMeta> = {
   partial: { tone: 'warning', icon: 'half', labelKey: 'state.download.partial' },
   failed: { tone: 'danger', icon: 'cross', labelKey: 'state.download.failed' },
   cancelled: { tone: 'neutral', icon: 'pause', labelKey: 'state.download.cancelled' },
+}
+
+export const TRANSCRIPTION_STATUS: Record<TranscriptionState, StatusMeta> = {
+  queued: { tone: 'neutral', icon: 'clock', labelKey: 'state.transcription.queued' },
+  running: { tone: 'accent', icon: 'spinner', labelKey: 'state.transcription.running' },
+  done: { tone: 'success', icon: 'check', labelKey: 'state.transcription.done' },
+  failed: { tone: 'danger', icon: 'cross', labelKey: 'state.transcription.failed' },
+  cancelled: { tone: 'neutral', icon: 'pause', labelKey: 'state.transcription.cancelled' },
 }
 
 export const CIRCUIT_STATUS: Record<CircuitState, StatusMeta> = {
@@ -133,12 +142,17 @@ export const ERROR_CODE_TONE: Record<ErrorCode, Tone> = {
   FORBIDDEN_SCOPE: 'caution',
   NOT_FOUND: 'muted',
   CONTENT_PRIVATE: 'muted',
+  MEDIA_WITHHELD: 'muted',
   RATE_LIMITED: 'warning',
   IDENTITY_POOL_EXHAUSTED: 'warning',
+  IDENTITY_LOGIN_REQUIRED: 'warning',
   ENDPOINT_CIRCUIT_OPEN: 'warning',
   UPSTREAM_RISK_CONTROL: 'danger',
   UPSTREAM_CHANGED: 'danger',
   SIGNING_FAILED: 'danger',
+  // The host's egress, usually: something the operator fixes, not an outage
+  // at the platform.
+  UPSTREAM_UNREACHABLE: 'warning',
   TASK_NOT_FOUND: 'muted',
   SETUP_ALREADY_DONE: 'neutral',
   SETUP_TOKEN_INVALID: 'danger',
@@ -148,6 +162,7 @@ export const ERROR_CODE_TONE: Record<ErrorCode, Tone> = {
   // Deliberate load shedding, like a rate limit: it clears on its own.
   QUEUE_FULL: 'warning',
   DOWNLOADER_UNAVAILABLE: 'warning',
+  TRANSCRIBER_UNAVAILABLE: 'warning',
   // Somebody stopped this on purpose. Nothing is wrong, so nothing is flagged.
   CANCELLED: 'neutral',
   // The caller addressed the API wrongly. Their mistake to fix, not an incident.
@@ -162,6 +177,7 @@ export type StatusKind =
   | 'outcome'
   | 'circuit'
   | 'download'
+  | 'transcription'
   | 'health'
   | 'credential'
   | 'key'
@@ -173,6 +189,7 @@ const REGISTRY: Record<StatusKind, Record<string, StatusMeta>> = {
   outcome: OUTCOME_STATUS,
   circuit: CIRCUIT_STATUS,
   download: DOWNLOAD_STATUS,
+  transcription: TRANSCRIPTION_STATUS,
   health: HEALTH_STATUS,
   credential: CREDENTIAL_STATUS,
   key: KEY_STATUS,

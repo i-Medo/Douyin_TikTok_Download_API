@@ -92,13 +92,18 @@ class TestRefusals:
             await plan("https://www.douyin.com/", no_redirect)
 
     async def test_an_unsupported_resource_kind_says_so(self):
-        """A live room is a recognised link the project does not serve yet, and
-        the caller should be told that rather than 'invalid URL'."""
-        live = identify("https://live.douyin.com/123456789")
-        if live.platform is None:
-            pytest.skip("live links are not recognised by the URL layer")
-        with pytest.raises((UnsupportedContent, InvalidUrl)):
-            await plan("https://live.douyin.com/123456789", no_redirect)
+        """A search page is a recognised link /parse does not serve - the
+        search endpoints take a keyword - and the caller should be told that
+        rather than 'invalid URL'. This used a live room until /live existed."""
+        search = identify("https://www.douyin.com/search/cat")
+        assert search.platform is not None
+        with pytest.raises(UnsupportedContent):
+            await plan("https://www.douyin.com/search/cat", no_redirect)
+
+    async def test_a_live_link_is_answered_with_its_room(self):
+        endpoint, params = await plan("https://live.douyin.com/123456789", no_redirect)
+        assert endpoint == "douyin.live_room"
+        assert params == {"room_id": "123456789"}
 
 
 class TestExpansion:
@@ -138,6 +143,154 @@ def test_to_call_is_pure():
     endpoint, params = to_call(identify(DOUYIN_VIDEO))
     assert endpoint == "douyin.content_detail"
     assert params == {"content_id": "7372484719365098803"}
+
+
+@pytest.mark.parametrize(
+    ("link", "endpoint", "music_id"),
+    [
+        (
+            "https://www.douyin.com/music/7661456186985761599",
+            "douyin.music_detail",
+            "7661456186985761599",
+        ),
+        (
+            "https://www.tiktok.com/music/original-sound-7686730447438514957",
+            "tiktok.music_detail",
+            "7686730447438514957",
+        ),
+    ],
+)
+def test_a_music_link_is_answered_with_the_sound(link: str, endpoint: str, music_id: str):
+    assert to_call(identify(link)) == (endpoint, {"music_id": music_id})
+
+
+@pytest.mark.parametrize(
+    ("link", "endpoint", "params"),
+    [
+        (
+            "https://www.douyin.com/hashtag/1592544802272436",
+            "douyin.hashtag_detail",
+            {"hashtag_id": "1592544802272436"},
+        ),
+        ("https://www.tiktok.com/tag/hibachi", "tiktok.hashtag_detail", {"name": "hibachi"}),
+        # The case that made the name explicit: an all-digit hashtag is a
+        # name, and sent as an id it is hashtag number 2024 instead.
+        ("https://www.tiktok.com/tag/2024", "tiktok.hashtag_detail", {"name": "2024"}),
+    ],
+)
+def test_a_hashtag_link_is_answered_with_the_hashtag(link: str, endpoint: str, params: dict):
+    assert to_call(identify(link)) == (endpoint, params)
+
+
+class TestCompletingANamedLink:
+    """A short link to a TikTok tag, handed to an endpoint that names itself."""
+
+    @staticmethod
+    async def to_tag(url: str) -> str | None:
+        return "https://www.tiktok.com/tag/2024" if "/t/" in url else None
+
+    async def test_the_detail_gets_the_name(self):
+        endpoint, filled = await parsing.complete(
+            "tiktok.hashtag_detail", {"url": "https://www.tiktok.com/t/ZTabcdef/"}, self.to_tag
+        )
+        assert (endpoint, filled) == ("tiktok.hashtag_detail", {"name": "2024"})
+
+    async def test_the_list_by_number_refuses_it_by_name(self):
+        with pytest.raises(InvalidParam) as caught:
+            await parsing.complete(
+                "tiktok.hashtag_posts", {"url": "https://www.tiktok.com/t/ZTabcdef/"}, self.to_tag
+            )
+        assert caught.value.details["reason"] == "named_resource"
+
+
+def test_a_reflow_link_is_answered_with_the_broadcast_it_names():
+    """What a Douyin app share link expands to: the broadcast, by its own id,
+    which live.douyin.com/<web_rid> does not take."""
+    endpoint, params = to_call(
+        identify("https://webcast.amemv.com/douyin/webcast/reflow/7318296342189919011?u_code=x")
+    )
+    assert endpoint == "douyin.live_room_by_id"
+    assert params == {"live_id": "7318296342189919011"}
+
+
+class TestCompletingAShareLinkToALiveRoom:
+    """``/douyin/live?url=<v.douyin.com link>``: the route cannot tell before
+    the hop which of the two ways the link names its room."""
+
+    @staticmethod
+    async def to_reflow(url: str) -> str | None:
+        if "v.douyin.com" in url:
+            return "https://webcast.amemv.com/douyin/webcast/reflow/7318296342189919011"
+        return None
+
+    @staticmethod
+    async def to_room(url: str) -> str | None:
+        return "https://live.douyin.com/615171448842" if "v.douyin.com" in url else None
+
+    async def test_a_link_to_a_broadcast_moves_the_call_to_the_endpoint_that_takes_one(self):
+        endpoint, params = await parsing.complete(
+            "douyin.live_room",
+            {"room_id": None, "url": "https://v.douyin.com/AbCdEf1/", "include_raw": True},
+            self.to_reflow,
+        )
+        assert endpoint == "douyin.live_room_by_id"
+        assert params == {"live_id": "7318296342189919011", "include_raw": True}
+
+    async def test_a_link_to_a_room_stays_where_it_was_sent(self):
+        endpoint, params = await parsing.complete(
+            "douyin.live_room",
+            {"room_id": None, "url": "https://v.douyin.com/AbCdEf1/"},
+            self.to_room,
+        )
+        assert (endpoint, params) == ("douyin.live_room", {"room_id": "615171448842"})
+
+    async def test_another_endpoint_still_refuses_the_wrong_kind_of_link(self):
+        with pytest.raises(InvalidParam) as caught:
+            await parsing.complete(
+                "douyin.content_detail",
+                {"url": "https://v.douyin.com/AbCdEf1/"},
+                self.to_reflow,
+            )
+        assert caught.value.details["reason"] == "wrong_resource"
+
+
+def test_a_bilibili_folder_link_is_answered_with_its_videos():
+    """Bilibili has no folder detail; its folder list carries name, cover and size.
+
+    The link used to map onto ``bilibili.collection_detail``, which does not
+    exist, and /parse refused every folder link with INVALID_PARAM.
+    """
+    endpoint, params = to_call(
+        identify("https://space.bilibili.com/18202105/favlist?fid=58074805&ftype=create")
+    )
+    assert endpoint == "bilibili.collection_posts"
+    assert params == {"collection_id": "58074805"}
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        DOUYIN_VIDEO,
+        "https://www.douyin.com/user/MS4wLjABAAAAexample",
+        TIKTOK_VIDEO,
+        "https://www.tiktok.com/@someone",
+        "https://www.tiktok.com/@someone/collection/Folder-7372484719365098803",
+        "https://www.bilibili.com/video/BV1xx411c7mD",
+        "https://space.bilibili.com/670061998",
+        "https://space.bilibili.com/18202105/favlist?fid=58074805",
+        "https://www.douyin.com/music/7661456186985761599",
+        "https://www.tiktok.com/music/original-sound-7686730447438514957",
+        "https://www.douyin.com/hashtag/1592544802272436",
+        "https://www.tiktok.com/tag/hibachi",
+        "https://live.douyin.com/615171448842",
+        "https://www.tiktok.com/@ventisfit/live",
+        "https://live.bilibili.com/173551",
+        "https://webcast.amemv.com/douyin/webcast/reflow/7318296342189919011",
+    ],
+)
+def test_every_link_kind_lands_on_an_endpoint_that_exists(link: str):
+    endpoint, _ = to_call(identify(link))
+    assert endpoint in registry.ENDPOINTS
 
 
 # --------------------------------------------------------------------------

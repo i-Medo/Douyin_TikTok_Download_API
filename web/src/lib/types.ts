@@ -9,8 +9,21 @@
  * as a JavaScript number.
  */
 
-export const PLATFORMS = ['douyin', 'tiktok'] as const
+export const PLATFORMS = ['douyin', 'tiktok', 'bilibili'] as const
 export type Platform = (typeof PLATFORMS)[number]
+
+/**
+ * The largest page each platform serves - dtk.platforms.paging, mirrored. The
+ * API answers a larger `count` with a 400 rather than a short page, so anything
+ * here that sends a fixed size has to stay under it. The comments save on
+ * Downloads sent 50 everywhere, which TikTok had refused since its ceiling was
+ * measured at 35, and Bilibili refuses above 20.
+ */
+export const PAGE_CEILING: Readonly<Record<Platform, number>> = {
+  douyin: 50,
+  tiktok: 35,
+  bilibili: 20,
+}
 
 export const CONTENT_KINDS = ['video', 'image_album', 'live'] as const
 export type ContentKind = (typeof CONTENT_KINDS)[number]
@@ -35,6 +48,7 @@ export const REJECT_REASONS = [
   'queue_full',
   'wait_timeout',
   'pinned_unavailable',
+  'no_login',
 ] as const
 export type RejectReason = (typeof REJECT_REASONS)[number]
 
@@ -44,11 +58,14 @@ export type UserRole = (typeof USER_ROLES)[number]
 export const SCOPES = [
   'douyin:read',
   'tiktok:read',
+  'bilibili:read',
   'identity:manage',
   'archive:read',
   'archive:export',
   'media:read',
   'media:write',
+  'transcription:read',
+  'transcription:write',
   'admin',
 ] as const
 export type Scope = (typeof SCOPES)[number]
@@ -67,6 +84,9 @@ export const DOWNLOAD_STATES = [
   'cancelled',
 ] as const
 export type DownloadState = (typeof DOWNLOAD_STATES)[number]
+
+export const TRANSCRIPTION_STATES = ['queued', 'running', 'done', 'failed', 'cancelled'] as const
+export type TranscriptionState = (typeof TRANSCRIPTION_STATES)[number]
 
 export const BROWSER_FAMILIES = ['chrome', 'firefox', 'safari'] as const
 export type BrowserFamily = (typeof BROWSER_FAMILIES)[number]
@@ -110,6 +130,16 @@ export interface Identity {
   health?: number | null
   fingerprint?: Record<string, unknown> | null
   /**
+   * Which endpoints rotation may hand this identity to. null for every one;
+   * `[]` for none, so only a request that names it uses it; or endpoint names.
+   */
+  rotation_endpoints?: string[] | null
+  /** The operator's own note: whose account it is, where the cookie came from. */
+  note?: string | null
+  /** The account the platform named the last time the session was checked. */
+  account_id?: string | null
+  account_seen_at?: string | null
+  /**
    * Whether the identity still holds the session value its platform issues to
    * a browser. Never the value itself - only which cookie decides it and a
    * verdict, because a spent session and a broken signer look identical from
@@ -131,6 +161,8 @@ export interface Proxy {
   timezone?: string | null
   healthy: boolean
   last_check_at?: string | null
+  /** Why the last probe failed, credentials scrubbed; null after a pass. */
+  last_error?: string | null
   latency_ms?: number | null
   identity_count?: number | null
   created_at: string
@@ -222,6 +254,8 @@ export interface RequestLogRow {
   platform: Platform
   endpoint: string
   identity_id?: string | null
+  /** That identity's note. Never sent to the demo account. */
+  identity_note?: string | null
   proxy_id?: string | null
   outcome: Outcome
   http_status?: number | null

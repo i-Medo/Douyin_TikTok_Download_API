@@ -26,18 +26,22 @@ export const ERROR_CODES = [
   'FORBIDDEN_SCOPE',
   'NOT_FOUND',
   'CONTENT_PRIVATE',
+  'MEDIA_WITHHELD',
   'RATE_LIMITED',
   'IDENTITY_POOL_EXHAUSTED',
+  'IDENTITY_LOGIN_REQUIRED',
   'ENDPOINT_CIRCUIT_OPEN',
   'UPSTREAM_RISK_CONTROL',
   'UPSTREAM_CHANGED',
   'SIGNING_FAILED',
+  'UPSTREAM_UNREACHABLE',
   'TASK_NOT_FOUND',
   'SETUP_ALREADY_DONE',
   'SETUP_TOKEN_INVALID',
   'NOT_CONFIGURED',
   'QUEUE_FULL',
   'DOWNLOADER_UNAVAILABLE',
+  'TRANSCRIBER_UNAVAILABLE',
   'CANCELLED',
   'METHOD_NOT_ALLOWED',
   'UNSUPPORTED_MEDIA_TYPE',
@@ -64,12 +68,15 @@ export const NON_RETRYABLE_CODES: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
   'FORBIDDEN_SCOPE',
   'NOT_FOUND',
   'CONTENT_PRIVATE',
+  'MEDIA_WITHHELD',
   'UPSTREAM_CHANGED',
   'SETUP_ALREADY_DONE',
   'SETUP_TOKEN_INVALID',
   'CANCELLED',
   'METHOD_NOT_ALLOWED',
   'UNSUPPORTED_MEDIA_TYPE',
+  'NOT_CONFIGURED',
+  'IDENTITY_LOGIN_REQUIRED',
 ])
 
 /**
@@ -804,16 +811,23 @@ export async function apiPatch<T>(
  *
  * Errors still arrive as the envelope, so a failure is decoded the usual way
  * rather than handed back as a body of JSON the caller would have to sniff.
+ *
+ * A `body` makes it a POST: exporting a hand-picked selection names the posts
+ * in the body, because five hundred of them do not fit in a query string.
  */
 export async function apiText(
   path: string,
-  options: Omit<RequestOptions, 'method' | 'body'> = {},
+  options: Omit<RequestOptions, 'method'> = {},
 ): Promise<string> {
   const response = await fetch(buildUrl(path, options.params), {
-    method: 'GET',
-    headers: { 'Accept-Language': currentLanguage() },
+    method: options.body === undefined ? 'GET' : 'POST',
+    headers: {
+      'Accept-Language': currentLanguage(),
+      ...(options.body === undefined ? {} : { 'Content-Type': 'application/json' }),
+    },
     credentials: 'same-origin',
     signal: options.signal ?? null,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
   })
   if (!response.ok) {
     let code: unknown = 'INTERNAL'

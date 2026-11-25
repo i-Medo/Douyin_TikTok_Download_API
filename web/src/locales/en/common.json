@@ -2,7 +2,7 @@
   "app": {
     "name": "DTK",
     "console": "Console",
-    "tagline": "Self-hosted Douyin and TikTok data API",
+    "tagline": "Self-hosted Douyin, TikTok and Bilibili data API",
     "documentTitle": "{page} · DTK console"
   },
   "action": {
@@ -92,6 +92,13 @@
       "running": "Downloading",
       "done": "Stored",
       "partial": "Partly stored",
+      "failed": "Failed",
+      "cancelled": "Cancelled"
+    },
+    "transcription": {
+      "queued": "Queued",
+      "running": "Transcribing",
+      "done": "Completed",
       "failed": "Failed",
       "cancelled": "Cancelled"
     },

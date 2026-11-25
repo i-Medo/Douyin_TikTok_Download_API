@@ -3,7 +3,8 @@
     "group": {
       "monitor": "Monitor",
       "pool": "Pool",
-      "tools": "Tools",
+      "content": "Content",
+      "developer": "Developer",
       "access": "Access",
       "operations": "Operations"
     },
@@ -23,6 +24,7 @@
     "endpointAccess": "Endpoint access",
     "tools": "Building blocks",
     "downloads": "Downloads",
+    "transcriptions": "Transcriptions",
     "library": "Library",
     "watchlist": "Watchlist",
     "scheduler": "Scheduler",
@@ -111,6 +113,13 @@
     "notSignedIn": "Not signed in",
     "rateLimit": "Rate limit: {remaining} of {limit} left",
     "breadcrumb": "Breadcrumb"
+  },
+  "platform": {
+    "name": {
+      "bilibili": "Bilibili",
+      "douyin": "Douyin",
+      "tiktok": "TikTok"
+    }
   },
   "pool": {
     "summary": "{count, plural, one {# identity active} other {# identities active}}",
@@ -223,7 +232,8 @@
     },
     "endpointCount": "{count, plural, one {# endpoint declared} other {# endpoints declared}}",
     "poolDistribution": "Pool state distribution",
-    "poolHint": "Every identity, by state, across platforms.",
+    "poolDistributionFor": "{platform} identities by state",
+    "poolHint": "Every identity, by state, per platform.",
     "rates": "Success and risk-control rate",
     "ratesHint": "Share of requests per bucket. Times are local; the server stores UTC.",
     "volume": "Request volume",
@@ -233,21 +243,34 @@
     "noEndpointsHint": "The platform adapters report no endpoints, which is a deployment problem rather than an empty database.",
     "noIdentities": "The pool is empty",
     "noIdentitiesHint": "Mint or import an identity before sending traffic.",
+    "unservedBrowser": "Minting {platform} needs the browser container, which this instance does not run. Import a cookie to serve it.",
+    "unservedOff": "Automatic minting is off for {platform}, so it is served only by identities you import.",
     "alert": {
       "poolEmpty": "No active identity",
       "poolEmptyHint": "Requests are rejected with IDENTITY_POOL_EXHAUSTED until the pool recovers.",
+      "platformAction": "Open {platform} identities",
+      "platformDown": "No active {platform} identity",
+      "platformDownHint": "{platform} requests are rejected with IDENTITY_POOL_EXHAUSTED until one recovers. The other platforms are unaffected.",
+      "platformEmpty": "No {platform} identity yet",
+      "platformEmptyHint": "Calls to {platform} are refused until an identity is minted or imported for it.",
+      "platformEmptyAuto": "The worker checks every minute and mints them on its own. Until the first one lands, calls to {platform} are refused.",
+      "platformEmptyMinting": "The first one is being minted. Until it lands, calls to {platform} are refused.",
+      "platformEmptyBackoff": "Minting has failed {failures, plural, one {# time} other {# times}} in a row and is not retried until {when}. Until an identity lands, calls to {platform} are refused.",
       "degraded": "{count, plural, one {# degraded identity} other {# degraded identities}}",
       "degradedHint": "Degraded identities still serve traffic, but they fail more often than the rest."
     },
     "byEndpoint": "Success rate by endpoint",
-    "byEndpointHint": "The busiest endpoints in this window, up to six. Pick one above to see it on its own."
+    "byEndpointHint": "The busiest endpoints in this window, up to six. Pick one above to see it on its own.",
+    "transcriptions": "Transcriptions",
+    "transcriptionsHint": "stored videos turned into text"
   },
   "identity": {
     "column": {
       "health": "Health",
       "cooldown": "Cooldown left",
       "minted": "Minted",
-      "session": "Credential"
+      "session": "Credential",
+      "kind": "Kind"
     },
     "noProxy": "Server egress",
     "source": {
@@ -257,7 +280,8 @@
     "failCount": "{count, plural, one {# failure} other {# failures}}",
     "retire": "Retire",
     "retired": "{count, plural, one {# identity retired} other {# identities retired}}",
-    "bulkRetire": "Retire selected",
+    "retireFailed": "Could not retire these identities",
+    "bulkRetire": "{count, plural, one {Retire # identity} other {Retire # identities}}",
     "retireDialog": {
       "title": "Retire {count, plural, one {# identity} other {# identities}}?",
       "description": "Retiring wipes the stored cookies. The statistics stay, the credential does not, and it cannot be brought back."
@@ -274,17 +298,30 @@
       "allSources": "All sources",
       "anyLogin": "Logged in or guest",
       "loggedInOnly": "Logged in only",
-      "guestOnly": "Guests only"
+      "guestOnly": "Guests only",
+      "anyRotation": "In rotation or not",
+      "rotatingOnly": "In rotation",
+      "reservedOnly": "Reserved only",
+      "limitedOnly": "Limited only",
+      "searchPlaceholder": "Search id, note, proxy, reason"
     },
     "mint": {
       "action": "Mint",
       "title": "Mint identities",
-      "description": "Minting drives a real browser through the proxy and takes a few seconds each.",
+      "description": "Guest identities, minted one at a time through the proxy.",
       "count": "How many",
       "proxyHint": "An identity stays bound to the proxy it was minted behind.",
       "anyProxy": "Let the scheduler choose",
       "done": "{count, plural, one {# identity minted} other {# identities minted}}",
-      "failed": "Minting failed"
+      "failed": "Minting failed",
+      "browserOnly": "{platforms} can only be minted in the browser container, which this instance does not run. Import cookies for them instead.",
+      "descriptionBrowser": "{platform} guests are minted in a real browser, through the proxy. Each takes a few seconds.",
+      "descriptionNative": "{platform} guests are minted with plain HTTP requests through the proxy - no browser needed. Each takes a second or two.",
+      "none": "Nothing can be minted on this instance. Import cookies instead.",
+      "partial": "{done} minted, {failed} failed",
+      "progress": "{finished} of {total} finished…",
+      "reasonTimes": "{reason} (×{count})",
+      "submit": "{count, plural, one {Mint # identity} other {Mint # identities}}"
     },
     "import": {
       "action": "Import cookies",
@@ -294,17 +331,19 @@
       "formats": "Accepted: a request header, an extension JSON export, a Netscape cookies.txt, or one key=value per line.",
       "userAgent": "User agent",
       "userAgentHint": "From the same browser session, so the fingerprint matches the cookies.",
-      "proxyHint": "Pick the egress this account normally signs in from.",
+      "proxyHint": "Pick the egress this account normally signs in from. With no proxy the identity goes out directly from this server for good - from mainland China that cannot reach TikTok.",
+      "noProxy": "No proxy - direct from this server",
       "submit": "Store identity",
       "stored": "Identity imported.",
       "failed": "Import failed",
-      "acknowledge": "I understand this cookie set is equivalent to the account password.",
+      "acknowledge": "I understand this cookie set is equivalent to the account password, and that the account could be banned; I use it at my own risk.",
       "expiryNotice": "This session is expected to expire on {date}. A notification goes out before it does.",
       "risk": {
         "title": "This is a credential",
         "equivalence": "A logged-in cookie set is equivalent to the account password: whoever holds it can act as that account.",
         "storage": "It is stored encrypted and no endpoint ever returns it, but an administrator of this instance can use it.",
-        "dedicated": "Use an account kept for this purpose, never your main one."
+        "dedicated": "Use an account kept for this purpose, never your main one.",
+        "ban": "Platforms rarely ban an account for reading data with it, but a ban cannot be ruled out. Importing a login, and using what it is imported for, is at your own risk."
       },
       "format": "Format",
       "browser": "Browser",
@@ -318,7 +357,17 @@
         "session": "session",
         "useful": "useful",
         "other": "other"
-      }
+      },
+      "detected": "These cookies look like {platform}'s.",
+      "needs": {
+        "bilibili": "buvid3 is required. SESSDATA and bili_jct are the login, and SESSDATA also says when it expires. buvid4 and b_nut make a guest look more like the browser it came from.",
+        "douyin": "ttwid is required. sessionid and sid_guard are the login, and sid_guard also says when it expires. odin_tt, s_v_web_id, msToken and UIFID_TEMP make a guest refused less often.",
+        "tiktok": "ttwid is required, and msToken is what requests are signed with. sessionid and sid_guard are the login, and sid_guard also says when it expires."
+      },
+      "reserve": "Only requests that name it",
+      "reserveHint": "Stored out of rotation: only a request that names it with identity= uses it. For an account imported to read one thing with, which rotation would otherwise spend on everything.",
+      "reserveLastNote": "No other {platform} login is in rotation, so {endpoints} will go on answering IDENTITY_LOGIN_REQUIRED wherever a login is needed.",
+      "switchTo": "Switch to {platform}"
     },
     "test": {
       "title": "Identity test",
@@ -387,30 +436,82 @@
       "invalid": "The mark must be at least 1 and the target no lower than the mark",
       "reset": "Restore default",
       "resetHint": "Drop this platform's own numbers and follow the global ones on the Scheduler page again",
-      "resetDone": "Back to the global thresholds"
+      "resetDone": "Back to the global thresholds",
+      "nativeOnly": "No browser container is configured. Bilibili guests are minted over plain HTTP and refill on their own; Douyin and TikTok live on what you import by hand.",
+      "loadFailed": "Could not read the refill status"
     },
     "mintLog": {
-      "inFlight": "Minting a {platform} identity",
-      "idle": "Idle",
       "backoff": "{failures, plural, one {# failure in a row} other {# failures in a row}} — not trying again until {when}",
       "ok": "Minted",
       "allOk": "{count, plural, one {last # attempt succeeded} other {last # attempts all succeeded}}",
       "someFailed": "{failures} of the last {count} failed",
+      "skipped": "Refill paused since {since}: every exit already has one of this platform's identities",
       "reason": {
         "minted": "Minted",
-        "no_free_proxy": "Every proxy already has a live identity of this platform behind it; two behind one exit is the recombination the pool exists to prevent",
+        "no_free_proxy": "Every exit already has a live identity of this platform behind it: one per proxy, plus this machine's IP while the platform's direct_egress setting on the Scheduler page is on. Two behind one exit is the recombination the pool exists to prevent. For more identities, add proxies or lower the refill mark to the number of exits. It is waiting for a free exit, not a mint going wrong.",
         "proxy_not_found": "The proxy this mint was pinned to no longer exists",
         "proxy_undecryptable": "The chosen proxy's URL could not be decrypted, and minting on the direct egress would bind the identity to an exit it will never use",
         "rpc_unavailable": "The browser container did not answer",
-        "unusable_fingerprint": "The browser reported a fingerprint with no usable version, so the identity was refused rather than paired with a guessed TLS profile"
-      }
+        "unusable_fingerprint": "The browser reported a fingerprint with no usable version, so the identity was refused rather than paired with a guessed TLS profile",
+        "mint_refused": "Bilibili did not hand out a guest session this time",
+        "busy": "Another mint was running, and this one gave up waiting for its turn",
+        "locked": "Another worker was minting, and this one gave up waiting for its turn",
+        "browser_rpc_unconfigured": "This instance has no browser container to mint this platform with",
+        "disabled": "This platform cannot be minted on this instance"
+      },
+      "now": "Minting now"
     },
     "reset": {
       "action": "Reset",
       "bulk": "{count, plural, one {Reset # identity} other {Reset # identities}}",
       "done": "{count, plural, one {# identity is back in rotation} other {# identities are back in rotation}}",
       "dialogTitle": "{count, plural, one {Put # identity back into rotation?} other {Put # identities back into rotation?}}",
-      "dialogBody": "The cooldown and the consecutive failure count are cleared and the identity is marked active. Do this when the failures were not its fault - a run of bad ids, or a proxy that has since been fixed. If the session itself is burnt, the platform will refuse it again within a few requests and it will cool straight back down."
+      "dialogBody": "The cooldown and the consecutive failure count are cleared and the identity is marked active. Do this when the failures were not its fault - a run of bad ids, or a proxy that has since been fixed. If the session itself is burnt, the platform will refuse it again within a few requests and it will cool straight back down.",
+      "failed": "Could not reset these identities"
+    },
+    "rotation": {
+      "title": "Rotation",
+      "limited": "Rotation uses it only for: {endpoints}",
+      "reserved": "Reserved",
+      "reservedHint": "Out of rotation: only requests that name this identity use it",
+      "limitedTag": "Limited",
+      "saved": "Rotation updated",
+      "failed": "Could not change the rotation",
+      "everywhere": "In rotation for every endpoint.",
+      "mode": "What rotation may use it for",
+      "modes": {
+        "all": "Every endpoint",
+        "limited": "Only the endpoints ticked below",
+        "reserved": "Only requests that name it"
+      },
+      "modeHint": {
+        "all": "Rotation may hand it to any endpoint. Endpoints that need a login still prefer or require one, and with guests first on, the rest reach a login only when no guest can.",
+        "limited": "Rotation hands it out for the ticked endpoints and nothing else - how a login is kept for the endpoints that need one. A request that names it is never limited by this.",
+        "reserved": "Rotation never hands it out, not even for an endpoint or a later page that needs a login: only a request carrying identity= with its id uses it. It is left out of the pool level."
+      },
+      "mixedPlatforms": "A list of endpoints is set on one platform at a time, and the selection spans several.",
+      "pickLogin": "Only the ones that need a login",
+      "pickAll": "All",
+      "pickNone": "None",
+      "login": {
+        "required": "Needs a login",
+        "paging": "Later pages need a login",
+        "preferred": "Fuller with a login"
+      },
+      "loginHint": {
+        "required": "A guest identity gets nothing here, so rotation sends only logins.",
+        "paging": "A guest gets the first page and nothing after it, so later pages go only to logins.",
+        "preferred": "A guest gets less here - Douyin leaves the newest posts out of an author's first page - so a login is used when rotation has one."
+      },
+      "unlisted": "Set through the API; this build does not list it.",
+      "sessionBoundNote": "Endpoints that answer only about the identity asking - its own bookmarks and bookmark folders - are not listed: they always need identity=, so rotation never reaches them.",
+      "pickSome": "Tick at least one endpoint. To keep it out of rotation entirely, choose \"Only requests that name it\".",
+      "bulkAction": "{count, plural, one {Set rotation for # identity} other {Set rotation for # identities}}",
+      "bulkTitle": "{count, plural, one {Rotation for # identity} other {Rotation for # identities}}",
+      "bulkDescription": "One choice for every selected identity. Retired ones are left out.",
+      "bulkApply": "{count, plural, one {Apply to # identity} other {Apply to # identities}}",
+      "bulkDone": "{count, plural, one {Rotation set for # identity} other {Rotation set for # identities}}",
+      "bulkLoses": "{platform}: every login in rotation for {endpoints} is in this selection, so those would answer IDENTITY_LOGIN_REQUIRED wherever a login is needed."
     },
     "history": {
       "title": "Identity history",
@@ -436,7 +537,8 @@
       "empty": "This identity holds no cookies at all, which means it can only ever be refused.",
       "wiped": "Retired identities have their jar wiped, so there is nothing left to show.",
       "missing": "Missing a cookie this build treats as required: {names}. Requests on this identity will be refused whatever else is in the jar.",
-      "maskNote": "Values are shown as their first and last four characters. The full values are never sent to this page - the jar is the credential, and a logged-in one is somebody's account.",
+      "maskNote": "Values are shown as their first and last four characters. The full values are sent to this page only when you ask for them below, and every reading is written to the audit log.",
+      "maskNoteReadOnly": "Values are shown as their first and last four characters. Reading the full values takes the operator role.",
       "reveal": "Show the real values",
       "revealFailed": "Could not read this jar",
       "revealed": "These are working credentials. Anyone who sees this screen can make requests as this identity. Reading them was recorded in the audit log.",
@@ -495,7 +597,15 @@
       "UIFID_TEMP": "The visitor id a Douyin mint produces, and what the web signature SDK signs with. This build looks for it under six spellings and cannot sign a Douyin request without one of them.",
       "uifid_temp": "The visitor id a Douyin mint produces, and what the web signature SDK signs with.",
       "UIFIDTEMP": "The visitor id a Douyin mint produces, under another of the spellings the SDK accepts.",
-      "uifidtemp": "The visitor id a Douyin mint produces, under another of the spellings the SDK accepts."
+      "uifidtemp": "The visitor id a Douyin mint produces, under another of the spellings the SDK accepts.",
+      "buvid3": "Bilibili's visitor id, handed to a browser on its first visit. Without it the signed endpoints treat a request as coming from no browser at all.",
+      "buvid4": "Bilibili's second visitor id, issued beside buvid3.",
+      "b_nut": "When this visitor first arrived on Bilibili, as a Unix time.",
+      "SESSDATA": "A logged-in Bilibili session. Anyone holding this is signed in as that account.",
+      "bili_jct": "Bilibili's CSRF token for a logged-in session. Only writes need it.",
+      "DedeUserID": "The id of the Bilibili account this session is signed in as.",
+      "buvid_fp": "A browser fingerprint id the Bilibili page computes and stores.",
+      "_uuid": "Another Bilibili visitor id the page sets on first load."
     },
     "drawerTitle": "Identity",
     "export": {
@@ -509,9 +619,87 @@
       "loaded": "{file} · {count, plural, one {1 identity} other {# identities}}. The paste form below is off while a file is loaded.",
       "submit": "{count, plural, one {Restore 1 identity} other {Restore # identities}}",
       "done": "{count, plural, =0 {Nothing was restored} one {1 identity restored} other {# identities restored}}",
-      "skipped": "{count, plural, one {1 was skipped - its jar had expired or was empty.} other {# were skipped - their jars had expired or were empty.}}",
+      "skipped": "{count, plural, one {1 was skipped} other {# were skipped}}: {reasons}.",
       "failed": "Could not restore from this file",
-      "unreadable": "This is not a file Export wrote."
+      "unreadable": "This is not a file Export wrote.",
+      "entry": "#{number} · {platform}",
+      "lapsed": "login expired {date} - restored all the same, and signs as a guest",
+      "logins": "Logins",
+      "missing": "missing {names}",
+      "ofTotal": "{count} of {total}",
+      "reason": {
+        "no_cookies": "no cookies - it was retired before the export",
+        "unknown_platform": "a platform this build does not know",
+        "unusable": "unusable"
+      },
+      "reasonCount": "{reason} ({count})",
+      "restorable": "Can be restored",
+      "skippedLabel": "Skipped"
+    },
+    "bulk": {
+      "partial": "{done} done, {failed} failed"
+    },
+    "drawer": {
+      "copied": "Identity id copied",
+      "copyId": "Copy id",
+      "expires": "Login expires",
+      "export": "Export",
+      "notFound": "No identity with this id. It may have been deleted, or the link is wrong.",
+      "openLogs": "Open in Logs",
+      "retireReason": "Retired because: {reason}",
+      "retiredAt": "Retired"
+    },
+    "expiry": {
+      "days": "expires in {count}d",
+      "expired": "expired",
+      "expiredOn": "Login expired {date}",
+      "hours": "expires in {count}h",
+      "on": "Login expires {date}"
+    },
+    "kind": {
+      "guest": "Guest",
+      "loggedIn": "Logged in"
+    },
+    "logins": {
+      "breakdown": "({parts})",
+      "cooling": "{count} cooling",
+      "import": "Import a login",
+      "inRotation": "Logged in, in rotation: {count}",
+      "lastBody": "No other logged-in {platform} identity is in rotation for them. After this, {endpoints} will answer IDENTITY_LOGIN_REQUIRED wherever a login is needed, unless the request names an identity.",
+      "lastRetire": "{platform}: no logged-in identity would be left in rotation, so {endpoints} would answer IDENTITY_LOGIN_REQUIRED wherever a login is needed.",
+      "lastTitle": "Take the last {platform} login off these endpoints?",
+      "limited": "{count} limited",
+      "none": "None, so {endpoints} answer IDENTITY_LOGIN_REQUIRED wherever a login is needed.",
+      "noneHint": "A guest gets less from these endpoints than a login: on some nothing after the first page, on some nothing at all. Rotation skips a reserved login even here, and a cooling one until its cooldown ends.",
+      "reserved": "{count} reserved",
+      "changeAnyway": "Change it anyway"
+    },
+    "paging": {
+      "ceiling": "The newest {shown} are shown. Narrow the filters to reach the rest.",
+      "loadMore": "Load more",
+      "searchScope": "search covers these",
+      "showing": "Showing {shown} of {total}"
+    },
+    "note": {
+      "label": "Note",
+      "placeholder": "Whose account, where the cookie came from",
+      "none": "No note",
+      "add": "Add a note",
+      "count": "{used} / {max}",
+      "saved": "Note saved",
+      "failed": "Could not save the note",
+      "importHint": "Shown beside its id wherever the identity appears. One line, at most 200 characters."
+    },
+    "account": {
+      "label": "Platform account",
+      "hint": "What the platform said these cookies belong to the last time the session was checked. Douyin names an id even for a guest, so for Douyin it confirms the client, not a login.",
+      "seen": "checked {when}"
+    },
+    "serves": {
+      "title": "Only identities rotation may send to {endpoint}",
+      "why": "Those in rotation for every endpoint, and those limited to a list that names it. Reserved identities never match, and guests do not where the endpoint needs a login from its first page.",
+      "readyTitle": "Only identities rotation can send to {endpoint} now",
+      "readyWhy": "Those in rotation for it, active or degraded, and only the logins where it needs one from its first page: the ones the Scheduler page counts under Can serve. Cooling identities come back when they recover, and are listed under Cooling there."
     }
   },
   "proxy": {
@@ -544,14 +732,31 @@
     },
     "delete": {
       "title": "Delete {count, plural, one {# proxy} other {# proxies}}?",
-      "description": "Identities bound to a deleted proxy are retired: an identity must never go out through a different egress."
+      "description": "Identities bound to a deleted proxy are retired: an identity must never go out through a different egress.",
+      "retires": "{count, plural, one {This retires # identity: its cookies are wiped and it cannot be brought back.} other {This retires # identities: their cookies are wiped and they cannot be brought back.}}",
+      "retiresNone": "No identity is bound to it, so none is retired.",
+      "rowIdentities": "{count, plural, one {# identity} other {# identities}}"
+    },
+    "drawer": {
+      "title": "Proxy",
+      "checked": "Checked {when}",
+      "neverChecked": "Never checked",
+      "lastError": "Last error",
+      "identities": "{count, plural, =0 {Bound identities} one {# bound identity} other {# bound identities}}",
+      "noIdentities": "No identity is bound to this proxy.",
+      "reserved": "Kept out of rotation",
+      "recentTitle": "Recent requests",
+      "recentHint": "{count, plural, one {The latest request through this proxy in the last 24 hours.} other {The latest # requests through this proxy in the last 24 hours.}}",
+      "recentEmpty": "No request went out through this proxy in the last 24 hours.",
+      "viewRequests": "View requests"
     },
     "bulk": {
       "enable": "Mark healthy",
       "disable": "Mark unhealthy",
       "delete": "Delete selected",
       "enabled": "{count, plural, one {# proxy marked healthy} other {# proxies marked healthy}}",
-      "disabled": "{count, plural, one {# proxy marked unhealthy} other {# proxies marked unhealthy}}"
+      "disabled": "{count, plural, one {# proxy marked unhealthy} other {# proxies marked unhealthy}}",
+      "partial": "{done} done, {failed} failed"
     },
     "import": {
       "action": "Bulk import",
@@ -585,7 +790,11 @@
     },
     "test": {
       "title": "Proxy probe",
-      "failed": "Probe failed"
+      "failed": "Probe failed",
+      "all": "Test all",
+      "selected": "Test {count} selected",
+      "progress": "Testing {done} of {total}",
+      "summary": "{ok} ok, {failed} failed"
     }
   },
   "settings": {
@@ -593,6 +802,18 @@
     "precedence": "Order of precedence: database override, then the .env seed, then the code default. Once a key is stored here, editing .env changes nothing until the row is reset.",
     "precedenceCount": "{count, plural, one {# key currently overrides its .env value} other {# keys currently override their .env value}}",
     "readOnly": "Your role can read settings but not change them.",
+    "search": "Search keys and descriptions",
+    "overriddenOnly": "Overridden only",
+    "noMatch": {
+      "title": "No setting matches",
+      "description": "Nothing matches the search and the filter. Clear them to see every setting."
+    },
+    "managed": {
+      "demo": "Switched in the Demo mode card above",
+      "endpointAccess": "Edited on the Endpoint access page",
+      "notifications": "Edited on the Notifications page",
+      "system": "Edited on the System page"
+    },
     "source": {
       "database": "Database override",
       "databaseHint": "Stored in the settings table. This value wins, and the .env entry is ignored until you reset the row.",
@@ -612,7 +833,8 @@
     },
     "hint": {
       "onePerLine": "One entry per line.",
-      "json": "JSON value."
+      "json": "JSON value.",
+      "structured": "Structured value, shown read-only. Change it on the page that manages it, or through the API."
     },
     "row": {
       "default": "Default: {value}",
@@ -658,14 +880,14 @@
     "groupHint": {
       "sched": "Waiting, queueing, cooldowns and the thresholds that trip an endpoint.",
       "pool": "Water marks and the conservative per-identity request rate.",
-      "signing": "Which signer produces the request signature. The in-process algorithms no longer match what either platform sends, so the browser is the working default.",
+      "signing": "Which signer produces the request signature. The in-process algorithms are the default and need no browser; the browser signer is the fallback for the day a platform ships a new SDK.",
       "cache": "How long a parsed result stays reusable.",
       "snapshot": "Deduplication window for writes to the content history.",
       "retention": "How long logs, events and tasks are kept. Content snapshots are never deleted automatically.",
       "api": "Abuse limits, the long-poll ceiling and the default response language.",
       "security": "Every key here is sensitive: allowlists, CORS and the download proxy.",
       "notify": "Delivery switch, channels and the default alert language.",
-      "system": "Instance behaviour, including the opt-in update check.",
+      "system": "Instance behaviour, including the daily update check, which is on by default.",
       "other": "Keys with no group of their own.",
       "archive": "What this instance keeps after a task result expires. The archive holds the current state of a post; the metric history beside it holds how it changed.",
       "capacity": "How this instance behaves as the disk fills. It warns, then pauses background writers - it never deletes.",
@@ -675,8 +897,8 @@
     },
     "choice": {
       "signing.mode": {
-        "rpc": "Browser (recommended) - runs the platform's own script",
-        "native": "In-process algorithms - no browser needed",
+        "rpc": "Browser - runs the platform's own script; the fallback when a platform changes its SDK",
+        "native": "In-process algorithms (recommended) - no browser needed",
         "auto": "In-process, switching to the browser when signatures start failing"
       },
       "security.request_proxy": {
@@ -698,11 +920,28 @@
       "password": "Password",
       "apiKey": "API key",
       "enabledButMissing": "Demo mode is on but no account exists. Reissue the credentials to mint one.",
+      "stateOn": "Demo mode is on.",
+      "stateOff": "Demo mode is off.",
+      "adminOnly": "Only an administrator can switch it or reissue its credentials.",
+      "cannotRead": "Your account cannot read the demo's state. Ask an administrator whether demo mode is on.",
+      "missingScopes": "The published key was minted without {scopes}, which this release publishes. Reissue the credentials to add it - that also ends every open demo session.",
+      "missingScopesReadOnly": "The published key was minted without {scopes}, which this release publishes. An administrator can reissue the credentials to add it.",
+      "confirm": {
+        "onTitle": "Turn demo mode on?",
+        "onBody": "This publishes a shared read-only account and API key: anyone who can reach this instance can sign in with them and call the platform endpoints. The password and the key are shown once, right after this.",
+        "offTitle": "Turn demo mode off?",
+        "offBody": "Every open demo session ends now and the published API key stops working. Nothing is deleted: turning demo mode back on restores the same account and key.",
+        "rotateTitle": "Reissue the demo credentials?",
+        "rotateBody": "This generates a new password and API key, revokes the current key and ends every open demo session at once. Anyone using the published password or key is cut off until you publish the new pair."
+      },
       "note": "The demo account is read-only: it calls the platform endpoints and reads the pages that carry no credential. It cannot download, change a setting or see the identity pool. Its requests are not written to the request log or the archive, and its tasks are swept within minutes. Turning demo mode off ends every open demo session and stops the key working, without deleting anything.",
       "toast": {
         "on": "Demo mode is on",
         "off": "Demo mode is off",
-        "rotated": "New demo credentials issued"
+        "rotated": "New demo credentials issued",
+        "onFailed": "Could not turn demo mode on",
+        "offFailed": "Could not turn demo mode off",
+        "rotateFailed": "Could not reissue the demo credentials"
       }
     }
   },
@@ -781,6 +1020,8 @@
       "languageInherit": "Use the default",
       "events": "Events",
       "eventsHint": "Clear what this channel should not receive. The deduplication window of each event is fixed and shown beside it.",
+      "eventsLast": "At least one event stays ticked. To silence the channel, disable it.",
+      "eventsUnknown": "Also subscribed to events this console does not know: {events}. They are kept as they are.",
       "enabled": "Enabled",
       "enabledHint": "A disabled channel is kept but skipped.",
       "maskedHint": "Shown masked. Leave it untouched to keep the stored value; type a new one to replace it, or clear it to remove it."
@@ -804,7 +1045,10 @@
       "proxy_unhealthy": "A proxy failed its probe and was taken out of rotation.",
       "signature_stale": "The local signature stopped matching the browser result; the algorithm has drifted.",
       "cookie_expiring": "A logged-in cookie jar is close to expiry and needs renewing.",
-      "backup_failed": "A backup run did not finish."
+      "backup_failed": "A backup run did not finish.",
+      "capacity_warning": "Disk usage on a volume this instance writes to passed the warning threshold.",
+      "capacity_paused": "Disk usage passed the hard stop: background collection and new downloads are paused until space is freed.",
+      "media_evicted": "Stored media was deleted to stay under the size ceiling. The alert lists what was removed."
     },
     "toast": {
       "saved": "Saved",
@@ -863,7 +1107,7 @@
     },
     "updates": {
       "title": "Update check",
-      "description": "Off by default. Nothing leaves this machine unless you turn it on.",
+      "description": "On by default. Your browser, not this server, asks GitHub once a day whether a newer release exists, so the request says nothing about this deployment. Turn it off and no one asks.",
       "outbound": "This check is an outbound request from your browser to github.com. A deployment without egress should leave it off.",
       "toggle": "Allow the update check",
       "toggleHint": "Stored as a runtime setting, so the choice survives a restart.",
@@ -876,7 +1120,13 @@
       "saved": "Saved",
       "saveFailed": "Could not save the update-check setting"
     },
-    "notConfigured": "Not configured"
+    "notConfigured": "Not configured",
+    "notConfiguredProfile": "Not configured: the {profile} profile is not running here",
+    "detailCode": {
+      "unreachable": "Configured, and not answering",
+      "timeout": "Configured, and too slow to answer",
+      "degraded": "Answering, but not ready to work"
+    }
   },
   "diagnose": {
     "redacted": "The report is redacted before it leaves the server: proxy passwords, cookies and API keys are masked. It is safe to paste into a public issue.",
@@ -893,7 +1143,7 @@
       "idle": "Not run"
     },
     "step": {
-      "components": "Postgres, Redis and the browser RPC answer.",
+      "components": "Postgres, Redis and the browser RPC answer, and so do the downloader and the transcriber where their profiles run.",
       "egress": "This host reaches the platform domains directly.",
       "proxies": "Every proxy dials, and reports its exit address and country.",
       "pool": "How many identities are usable, and how long since the oldest one succeeded.",
@@ -908,7 +1158,10 @@
       "title": "What to run",
       "description": "All six steps run in order. Each has its own timeout, so a hung dependency cannot stall the rest.",
       "smoke": "Include the end-to-end fetch",
-      "smokeHint": "Step 6 pulls one fixed public link through the whole pipeline. Turn it off to keep the run entirely local."
+      "smokeHint": "Step 6 pulls one fixed public link through the whole pipeline. Turn it off to keep the run entirely local.",
+      "platform": "Platform for the end-to-end fetch",
+      "platformAuto": "Automatic",
+      "platformHint": "Automatic uses the platform with the most identities in rotation. With none anywhere, Douyin when a browser is configured and Bilibili when not."
     },
     "steps": {
       "title": "Steps",
@@ -931,7 +1184,9 @@
     "toast": {
       "startFailed": "Could not start the self check",
       "copied": "Report copied"
-    }
+    },
+    "expired": "The last report is no longer kept on the server. Run the check again for a fresh one.",
+    "readOnly": "Running the self check, and reading its report, needs an operator role."
   },
   "backup": {
     "keyExplainer": "Credentials are exported as ciphertext and the archive never contains the master key. A restore therefore needs the same DTK_SECRET_KEY that created it; under a different key the proxy URLs and cookie jars cannot be decrypted.",
@@ -996,9 +1251,12 @@
     "you": "you",
     "adminOnly": "Only an administrator can manage accounts. Your own password and sessions are below.",
     "cannotDeleteSelf": "You cannot delete the account you are signed in with.",
+    "demoLocked": "Managed by demo mode.",
+    "demoLockedLink": "Open settings",
     "action": {
       "create": "Add user",
-      "changeRole": "Change role"
+      "changeRole": "Change role",
+      "resetPassword": "Reset password"
     },
     "column": {
       "id": "User id",
@@ -1018,14 +1276,14 @@
     },
     "matrix": {
       "title": "What each role can do",
-      "description": "Three roles, no groups and no per-object permissions: a self-hosted instance has a handful of users, and a rule set that fits on one screen is one people actually follow.",
+      "description": "Three roles for people and one for the public demo account, no groups and no per-object permissions: a self-hosted instance has a handful of users, and a rule set that fits on one screen is one people actually follow.",
       "capability": "Capability"
     },
     "capability": {
       "backup": "Create and restore backups",
       "diagnose": "Run the self check",
       "fetch": "Call the platform endpoints",
-      "keys": "Create and revoke API keys",
+      "keys": "Create, edit and revoke API keys",
       "pool": "Manage identities and proxies",
       "read": "Read the pool, proxies, keys and settings",
       "readPublic": "Read the overview, library, downloads, logs and system pages",
@@ -1072,7 +1330,20 @@
       "deleteDescription": "Type {username} to confirm.",
       "deleteWarning": "The account and every session it opened are removed. The last administrator cannot be deleted.",
       "signOutTitle": "Sign out other devices?",
-      "signOutDescription": "Every session except this one is revoked immediately."
+      "signOutDescription": "Every session except this one is revoked immediately.",
+      "roleTitle": "Change this account's role?",
+      "roleDescription": "{username} goes from {from} to {to}. It takes effect on their next request.",
+      "roleSelfWarning": "This is the account you are signed in with. Below administrator you can no longer manage accounts, and only another administrator can give the role back.",
+      "roleAdminWarning": "An administrator can change sensitive settings, manage every account and restore backups."
+    },
+    "reset": {
+      "title": "Reset the password for {username}",
+      "description": "For someone who cannot sign in. Tell them the new password over a channel you trust: it is not shown again once saved, here or anywhere else.",
+      "revokes": "Every session this account has open is signed out.",
+      "submit": "Reset password",
+      "done": "Password reset for {username}",
+      "doneHint": "{count, plural, =0 {No session was open.} one {# session was signed out.} other {# sessions were signed out.}}",
+      "failed": "Could not reset the password"
     },
     "toast": {
       "created": "User {username} created",
@@ -1095,14 +1366,31 @@
     "createdAck": "I have stored this key somewhere safe",
     "createdDone": "Done",
     "activeCount": "{count, plural, one {# active key} other {# active keys}}",
+    "editTitle": "Edit API key",
+    "editDescription": "Change the name or the scopes. The key itself stays the same, so whatever already uses it keeps working and gets the new scopes on its next call.",
+    "editedToast": "Key {name} saved",
+    "editFailed": "Could not save the key",
     "field": {
       "name": "Name",
+      "owner": "Owner",
       "prefix": "Prefix"
     },
+    "owner": {
+      "demo": "Demo account",
+      "other": "Another account",
+      "you": "You"
+    },
+    "mineOnly": "Only my keys",
     "nameHint": "Something recognisable in the audit log, such as the script or host that will use it.",
     "nameRequired": "Give the key a name.",
     "scopesHint": "A key reaches only the endpoint groups ticked here. Identity management and cookie import always require identity:manage.",
     "scopesRequired": "Pick at least one scope.",
+    "preset": {
+      "clear": "Clear",
+      "label": "Start from",
+      "platformReads": "All platform reads",
+      "readOnly": "Read only"
+    },
     "scope": {
       "douyinRead": "Read Douyin data",
       "tiktokRead": "Read TikTok data",
@@ -1111,7 +1399,10 @@
       "archiveRead": "Read the content archive",
       "archiveExport": "Export the whole archive",
       "mediaRead": "See stored media",
-      "mediaWrite": "Store and pin media"
+      "mediaWrite": "Store and pin media",
+      "transcriptionRead": "Read transcriptions",
+      "transcriptionWrite": "Create transcriptions",
+      "bilibiliRead": "Read Bilibili data"
     },
     "scopeHint": {
       "douyinRead": "Post, author, comment and parse endpoints for Douyin.",
@@ -1121,7 +1412,10 @@
       "archiveRead": "Everything this instance has already collected, answered from local storage. Separate from the platform scopes on purpose: opening a platform endpoint must not open the whole collection.",
       "archiveExport": "Walk the entire archive in one request. This is the single call that turns a read key into a copy of the database.",
       "mediaRead": "List what is on the server's disk and how much space it uses. Files themselves are never served through the API.",
-      "mediaWrite": "Start a download, pin one against cleanup, or cancel one. It spends an identity and fills a disk, so no read scope implies it."
+      "mediaWrite": "Start a download, pin one against cleanup, or cancel one. It spends an identity and fills a disk, so no read scope implies it.",
+      "transcriptionRead": "Read completed transcription text and its source metadata.",
+      "transcriptionWrite": "Start, refresh, or cancel an on-demand video transcription.",
+      "bilibiliRead": "The same endpoints for Bilibili."
     },
     "rateLimitHint": "Requests per minute. This is abuse protection, not a billing quota: the project has no plans, metering or usage settlement. It exists so one runaway script cannot drain the identity pool. Leave empty to inherit the instance default.",
     "rateLimitInvalid": "Enter a whole number between {min} and {max}, or leave it empty.",
@@ -1142,6 +1436,13 @@
     "revokeDescription": "Calls made with {name} start failing with UNAUTHENTICATED on the next request. This cannot be undone.",
     "revokedToast": "Key revoked",
     "revokeFailed": "Could not revoke the key",
+    "revokeDemoWarning": "This is the key the demo publishes. Revoking it stops the demo API for every visitor until the demo credentials are reissued; the demo login keeps working. To replace the key, reissue the credentials under Settings → Demo mode instead.",
+    "addBilibili": "Add bilibili:read",
+    "bilibiliAddedToast": "{name} can now read Bilibili",
+    "bilibiliGap": "No bilibili:read",
+    "bilibiliGapHint": "Reads Douyin or TikTok but not Bilibili. A key keeps the scopes it was created with; upgrading does not add new ones.",
+    "bilibiliGapBanner": "{count, plural, one {# active key reads} other {# active keys read}} Douyin or TikTok but not Bilibili. Keys keep the scopes they were created with, so a key from before Bilibili was added is refused there until bilibili:read is added. Use Add bilibili:read beside each key that should have it.",
+    "bilibiliGapBannerReadOnly": "{count, plural, one {# active key reads} other {# active keys read}} Douyin or TikTok but not Bilibili. Keys keep the scopes they were created with; an operator can add bilibili:read to the ones that should have it.",
     "emptyTitle": "No API keys yet",
     "emptyDescription": "Create one per script or agent, so a single leak can be revoked without disturbing anything else.",
     "search": "Search name, prefix or scope",
@@ -1154,11 +1455,12 @@
     "bulkRevokeTitle": "Revoke the selected keys?",
     "bulkRevokeBody": "{count, plural, one {# key stops working immediately} other {# keys stop working immediately}}. Anything using them starts getting 401 on its next call. Revoking cannot be undone; mint a replacement instead.",
     "bulkRevokedToast": "{count, plural, one {# key revoked} other {# keys revoked}}",
-    "demoNote": "The demo key is shown in full because it is published — anyone trying this instance is meant to copy it. It calls the Douyin and TikTok endpoints and nothing else.",
+    "demoNote": "The demo key is shown in full because it is published — anyone trying this instance is meant to copy it. It reads the platform endpoints and nothing else: no archive, no downloads, no administration.",
     "demoWhy": "Every other key shows only its prefix, and that is not a setting: the server stores a digest, so there is no plaintext to reveal."
   },
   "playground": {
     "catalogTitle": "Endpoints",
+    "choiceDefault": "Default",
     "circuitAggregate": "{open} of {total} endpoints are tripped.",
     "circuitLabel": "Circuit",
     "contextDescription": "Polled every few seconds, so it is current at the moment a call fails.",
@@ -1171,6 +1473,7 @@
     "endpoint": {
       "parse": "Parse any link",
       "video": "Post detail",
+      "parts": "Video parts (multi-part videos)",
       "comments": "Post comments",
       "replies": "Comment replies",
       "user": "Author profile",
@@ -1183,7 +1486,20 @@
       "collectionPosts": "Saved posts (one folder)",
       "mix": "Author's own series (mix / playlist)",
       "followers": "Author followers",
-      "following": "Author following"
+      "following": "Author following",
+      "popular": "Popular and rankings",
+      "related": "Related posts",
+      "mixes": "Author's series (mixes / playlists / seasons)",
+      "music": "Sound detail",
+      "musicPosts": "Posts using a sound",
+      "hashtag": "Hashtag detail",
+      "hashtagPosts": "Posts under a hashtag",
+      "searchPosts": "Search posts",
+      "searchUsers": "Search accounts",
+      "live": "Live room",
+      "liveRanking": "Live room audience ranking",
+      "liveStatus": "Whether live rooms are on air",
+      "trending": "Trending board"
     },
     "endpointLabel": "Endpoint",
     "explainAbsent": "This run did not ask what request was made, so there is nothing to show. It happened, and this instance knows exactly what it sent upstream.",
@@ -1193,13 +1509,36 @@
     "explainRun": "Send again and explain it",
     "failureDescription": "The stable code, the identity that served it, the circuit and the pool, in one place.",
     "failureTitle": "Why this call failed",
+    "guest": {
+      "action": "Add a logged-in identity",
+      "bilibiliComments": "Bilibili shows a guest only the three hottest comments (the three newest with sort=new) and no further page.",
+      "douyinAuthorPosts": "Douyin leaves an author's newest posts out of what it shows a guest, so the first items here may not be the latest, and later pages need a logged-in identity.",
+      "generic": "It may hold less than a logged-in identity would see.",
+      "tiktokSearchPosts": "TikTok shows a guest a thin first page of search results - often a handful of posts - and no further page.",
+      "title": "A guest identity answered, because no logged-in one was available."
+    },
     "healthUnavailable": "Endpoint health is unavailable.",
     "historyEmpty": "Calls you make appear here.",
     "historyRestore": "Put these parameters back in the form. It does not re-send.",
     "historyTitle": "This session",
     "identityAuto": "Any identity (scheduler picks)",
     "identityLoggedIn": "logged in",
+    "identityRequired": "This endpoint answers only about the identity sending it, so it needs one pinned in identity below. Pick a logged-in one: a guest has nothing saved to show.",
+    "identityRequiredForbidden": "This endpoint answers only about the identity sending it, so it needs one pinned with identity, and pinning takes the operator role. This session cannot make the call; an operator can.",
+    "loadExample": "Load a {platform} example",
+    "loadExampleHint": "Fills the target with a real, public one.",
     "metaTitle": "Response metadata",
+    "next": {
+      "download": "Download media",
+      "downloadFailed": "Could not start the download",
+      "downloadFetchingFirst": "Fetching the post first, then its media",
+      "downloadReused": "{reason, select, in_flight {Already downloading this post} other {Already downloaded; nothing to do}}",
+      "downloadStarted": "Download started",
+      "openAuthor": "This author in Library",
+      "openDownload": "Open in Downloads",
+      "openPost": "Open in Library",
+      "title": "Next"
+    },
     "nextPage": "Fetch the next page",
     "nextPageHint": "This page has a cursor. Fetching the next one spends another request.",
     "noRequestId": "Not reported",
@@ -1210,23 +1549,57 @@
     "outOfRange": "Enter a value between {min} and {max}.",
     "param": {
       "aweme_id": "Post id. Provide this or a link.",
+      "board": "Which list: hot (popular now, the default), weekly (the weekly selection), precious (the editors' all-time selection) or rank (the site-wide top 100).",
+      "boardCursor": "For hot, the page number. For weekly, the issue number; empty is the newest issue. precious and rank are one page each and ignore it.",
+      "boardCount": "Items per page for hot, up to {max}. The other boards come in the size the site makes them - an issue of weekly is 50, rank is 100 - and ignore it.",
+      "collection_id": "The folder's id, from a folder link or from the folder list.",
       "comment_id": "The comment whose replies you want.",
-      "count": "Items per page, up to 50.",
+      "count": "Items per page, up to {max} on this platform.",
       "cursor": "Opaque cursor from the previous page. Leave empty for the first page.",
       "explain": "Report which identity served the request, the cookie jar it used, and the exact upstream URL. Skips the cache and needs the operator role.",
       "identity": "Send as one named identity and no other. For content only that account can see. The request is never served from another identity and never from the cache.",
+      "identitySessionBound": "Required here: this endpoint answers about the identity sending it and nobody else. The request is never served from another identity and never from the cache.",
       "include_raw": "Also return the untouched platform payload.",
       "mix_id": "The collection's id, from a mix or playlist link.",
       "needsRole": "Needs the {role} role. This instance is signed in below that, so the parameter is not sent.",
+      "part": "Which part of a video uploaded in several, from 1. The stream returned is that part's. Empty is the first part, or the one the link's ?p= names.",
       "proxy": "Send the upstream request through this proxy. Refused unless an administrator has enabled security.request_proxy.",
       "refresh": "Ignore any cached or in-flight answer and ask upstream again. Without it a repeat inside the cache window is free: 30 minutes for one post, 15 for a profile, 5 for anything paged (cache.* in Settings). A refresh costs an identity and a real request.",
       "sec_user_id": "Stable author id. Provide this or a link.",
+      "sort": "Order of the comments: hot (the default) or new. Send the same order again with a later page's cursor.",
       "url": "A post or profile link, or the share text around one.",
-      "wait": "Seconds the server may hold the connection before answering with a task id instead."
+      "wait": "Seconds the server may hold the connection before answering with a task id instead.",
+      "music_id": "The sound's id: the music_id in a post's music block, or the number a music link ends in. Provide this or a link.",
+      "musicUrl": "A link to the sound's page, or the share text around one.",
+      "hashtag_id": "The hashtag's numeric id: the number in a Douyin hashtag link, or the hashtag_id the hashtag detail returns.",
+      "hashtagUrl": "A link to the hashtag's page. A TikTok tag link names the hashtag rather than numbering it.",
+      "hashtagPostsUrl": "A link that carries the hashtag's id. A TikTok tag link names it instead, so look it up with the hashtag detail first.",
+      "hashtagName": "The hashtag's name, with or without the #. Provide this, an id or a link.",
+      "keyword": "What to search for, as you would type it into the platform's search box.",
+      "liveUrl": "A link to the live room.",
+      "room_id": "The number in the live room's link. Provide this or a link.",
+      "live_id": "The broadcast's own id: the live_id a room answer carries, or the number in a Douyin app share link. Provide this, a room or a link.",
+      "live_ids": "The broadcasts to check, comma-separated: the live_id each room answer carries, up to 100.",
+      "rankingLiveId": "The broadcast: the live_id a live room answer carries while the room is on.",
+      "trendingBoard": "Which board: hot (the default), entertainment, society or challenge. Bilibili has hot only."
+    },
+    "paramFor": {
+      "bilibili": {
+        "aweme_id": "A bvid such as BV1xx411c7mD; an av number is converted. Provide this or a link.",
+        "sec_user_id": "The author's numeric mid, the number in a space.bilibili.com link. Provide this or a link."
+      },
+      "tiktok": {
+        "profileUrl": "A profile link names an @handle, which only the author profile accepts. The author lists need sec_user_id.",
+        "sec_user_id": "The author's secUid, which starts MS4wLjABAAAA. Provide this or a link.",
+        "room_id": "The @handle of the account broadcasting, which is what a TikTok live link carries. Provide this or a link."
+      }
     },
     "poolEmptyHint": "No identity is active. Requests are rejected with IDENTITY_POOL_EXHAUSTED until one recovers.",
+    "poolEmptyHintFor": "No {platform} identity is active. {platform} requests are rejected with IDENTITY_POOL_EXHAUSTED until one recovers; the other platforms are unaffected.",
     "poolInline": "active {active} · cooling {cooling} · degraded {degraded}",
     "poolLabel": "Identity pool",
+    "poolLabelFor": "{platform} identity pool",
+    "poolManage": "Manage",
     "poolUnavailable": "Pool state is unavailable.",
     "rawAbsent": "not requested",
     "rawDescription": "The platform payload, kept because it is the evidence when a parser breaks.",
@@ -1262,8 +1635,10 @@
     "snippetNote": "The console authenticates with a session cookie. Outside the browser use Authorization: Bearer or X-API-Key.",
     "snippetTitle": "Copy-ready call",
     "taskState": "Task",
+    "unserved": "Not served on {platform}",
+    "unservedNotice": "{platform} does not serve this endpoint, so the call would only be refused with UNSUPPORTED_CONTENT. Pick another platform or endpoint.",
     "upstreamCurl": "The upstream request as curl",
-    "upstreamCurlNote": "The platform's own endpoint, not this API. Send the query byte for byte — re-encoding it changes what the signature covers — and keep the User-Agent, which both platforms hash in. TikTok also checks that the TLS fingerprint agrees with the User-Agent, so plain curl is refused there whatever the signature says."
+    "upstreamCurlNote": "The platform's own endpoint, not this API. Send the query byte for byte — re-encoding it changes what the signature covers — and keep the User-Agent, which Douyin and TikTok hash in. TikTok also checks that the TLS fingerprint agrees with the User-Agent, so plain curl is refused there whatever the signature says."
   },
   "parse": {
     "inputTitle": "Links",
@@ -1299,11 +1674,14 @@
     "previewEmpty": "Nothing to preview.",
     "rawTitle": "Result payload",
     "imageAlt": "Image {index}",
+    "liveAlt": "Live photo {index}",
+    "liveBadge": "Live photo",
     "downloadTitle": "Download",
     "downloadDescription": "Files go straight from the platform CDN to your browser. The server never relays media.",
     "downloadVideo": "Video",
     "downloadCover": "Cover",
     "downloadImage": "Image {index}",
+    "downloadLiveVideo": "Live photo {index} - the clip",
     "noVideo": "No video stream in this result.",
     "noCover": "No cover image.",
     "noImage": "No image.",
@@ -1314,6 +1692,13 @@
     "downloadBlockedTitle": "The browser could not fetch the file",
     "downloadBlockedBody": "All {count} mirrors refused a cross-origin read, which is CORS or hotlink protection rather than a broken link. The first mirror was opened in a new tab: save it from there, or enable the optional server-side download proxy.",
     "downloadNote": "A blocked download rarely means a dead file. Open the link and save it from the new tab instead.",
+    "offBrowser": {
+      "bound": "None of this video's links played here. TikTok ties them to the session that fetched them, and a browser cannot send that session's token. Save it to this instance; it plays in the download list below once it lands.",
+      "refused": "None of this video's links played in the browser: the platform refused them, or they have expired. Save it to this instance; it plays in the download list below once it lands.",
+      "save": "Save to this instance",
+      "saveHint": "Fetched by this instance, which sends what the platform asks for.",
+      "saveHintBound": "Fetched by this instance: TikTok ties the link to the session that found it."
+    },
     "queue": {
       "action": "{count, plural, =0 {Save to this instance} one {Save 1 to this instance} other {Save # to this instance}}",
       "one": "Save",
@@ -1326,8 +1711,8 @@
     "detectedWithRejects": "{count, plural, one {# link} other {# links}} ready · {rejected, plural, one {# line not recognised} other {# lines not recognised}}",
     "rejected": {
       "content_id": "A post id with no platform on it. Paste the link instead, or say which platform it belongs to.",
-      "bad_id": "This looks like a post id but cannot be one — both platforms mint ids whose high bits are the second they were issued.",
-      "unknown": "No Douyin or TikTok link in this line."
+      "bad_id": "All digits, but not a Douyin or TikTok post id: theirs carry the second they were issued in the high bits, and this one does not hold a real time. A Bilibili video goes in as its BV id or its link.",
+      "unknown": "No Douyin, TikTok or Bilibili link in this line."
     }
   },
   "logs": {
@@ -1354,10 +1739,21 @@
       "action": "Action",
       "actor": "Who",
       "target": "Target",
-      "ip": "Source address"
+      "ip": "Source address",
+      "proxyId": "Proxy id"
     },
+    "actorAll": "Everyone",
+    "auditShown": "{count, plural, one {# entry shown} other {# entries shown}}",
     "byApiKey": "API key",
     "bySystem": "System",
+    "endpointAll": "Every endpoint",
+    "invalidId": "Not a complete id yet, so this filter is not applied.",
+    "loadOlder": "Load older",
+    "noOlder": "Nothing older.",
+    "onlyThisActor": "Only this account's actions",
+    "onlyThisIdentity": "Only this identity",
+    "onlyThisProxy": "Only this proxy",
+    "openIdentity": "Open identity",
     "emptyTitle": "No requests in this window",
     "emptyDescription": "Widen the time range, or clear a filter.",
     "detailTitle": "Request detail",
@@ -1374,7 +1770,8 @@
       "all_inflight": "Every identity is busy",
       "queue_full": "The wait queue is full",
       "wait_timeout": "Gave up waiting for an identity",
-      "pinned_unavailable": "The named identity cannot serve this"
+      "pinned_unavailable": "The named identity cannot serve this",
+      "no_login": "Needs a signed-in identity; none in rotation"
     }
   },
   "docs": {
@@ -1403,6 +1800,13 @@
     "confirmTitle": "Serve this endpoint without a key?",
     "confirmBody": "{endpoint} will answer anyone who can reach this server. Anonymous callers get read access only and are rate limited by address, but every call still spends this instance's identity pool.",
     "confirmAction": "Open it",
+    "confirmEveryPlatform": "Its path takes a platform, so it serves every platform this instance supports - {platforms} - including any added in a later release.",
+    "confirmPlatforms": "It serves {platforms}.",
+    "covers": "Serves {platforms}",
+    "closeAll": "Close all",
+    "closeAllTitle": "{count, plural, one {Close the opened endpoint?} other {Close all # opened endpoints?}}",
+    "closeAllBody": "{count, plural, one {It will need an API key again. Anyone calling it without one gets 401 from now on.} other {Each of them will need an API key again. Anyone calling them without one gets 401 from now on.}}",
+    "readOnly": "Only an administrator can open or close endpoints.",
     "saved": "Endpoint access updated",
     "saveFailed": "Could not update endpoint access",
     "openCount": "{count, plural, =0 {No endpoint open} one {# endpoint open} other {# endpoints open}}",
@@ -1413,6 +1817,7 @@
       "content": "Content",
       "archive": "Archive",
       "downloads": "Downloads",
+      "transcriptions": "Transcriptions",
       "tasks": "Tasks",
       "tools": "Tools",
       "admin": "Administration",
@@ -1451,7 +1856,7 @@
       "title": "Sign a platform API URL",
       "description": "Pure arithmetic. Nothing is fetched and no identity is spent.",
       "urlHint": "The full API URL including its query. The signature is appended to what you send.",
-      "userAgentHint": "Both platforms hash this into the signature. Leave it blank for a Chrome default.",
+      "userAgentHint": "Douyin and TikTok hash this into the signature; Bilibili's WBI signature does not use it. Leave it blank for a Chrome default.",
       "userAgentPlaceholder": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/146.0.0.0 Safari/537.36",
       "msTokenHint": "TikTok only. Sealed into the signature, so it must be the token the request will carry - an invented value is worse than none.",
       "msTokenPlaceholder": "Leave blank if you have none",
@@ -1521,7 +1926,7 @@
       "valueLabel": "Signature or signed URL",
       "valueHint": "A whole signed URL is the most useful form: only then is the string each parameter covers known exactly, so only then can the checks run. A single parameter value, or a name=value pair, works too.",
       "valuePlaceholder": "https://www.douyin.com/aweme/v1/web/aweme/detail/?…&a_bogus=…",
-      "userAgentHint": "Both platforms hash the User-Agent into the signature. Fill this in and the result says whether the UA you are sending is the one the signature was computed with — which is the most common way a hand-built request fails while looking correct.",
+      "userAgentHint": "Douyin and TikTok hash the User-Agent into the signature; Bilibili's WBI signature does not. Fill this in and the result says whether the UA you are sending is the one the signature was computed with — which is the most common way a hand-built request fails while looking correct.",
       "parameterLabel": "Read it as",
       "parameterHint": "Left on auto, the value is identified by properties no other parameter has. Name it yourself if you are holding something unusual.",
       "parameterAuto": "Identify it automatically",
@@ -1574,7 +1979,8 @@
         "key_travels_in_the_envelope": "The envelope carries its own key — which is how the platform decrypts it, and how this can be read at all.",
         "constant_placeholder": "TikTok Web sends a literal here on every HTTP request; the real algorithm of this name is only used for websocket handshakes.",
         "superseded_by_a_bogus": "Douyin has moved on to a_bogus. TikTok Web still accepts this one, and some Douyin endpoints do.",
-        "issued_by_the_platform": "Minted by the platform for a browser. It cannot be computed, only obtained — mint an identity on the identity tab."
+        "issued_by_the_platform": "Minted by the platform for a browser. It cannot be computed, only obtained — mint an identity on the identity tab.",
+        "wbi_keys_unavailable": "The key this md5 covers is mixed from two keys Bilibili publishes to every visitor, and this instance could not fetch them just now. The query could not be checked; nothing here says it is wrong."
       }
     },
     "parse": {
@@ -1587,12 +1993,14 @@
     },
     "identity": {
       "title": "Mint a guest identity",
-      "description": "Drives a real browser to the platform and returns the cookies it was issued. Nothing is stored.",
+      "description": "Drives a real browser to Douyin or TikTok, or asks Bilibili over plain HTTP, and returns the cookies the platform issued. Nothing is stored.",
       "proxyHint": "Mint behind this egress, so the jar matches the address you will use it from. Subject to the security.request_proxy setting.",
       "action": "Mint",
       "slow": "Takes tens of seconds: a browser has to launch, load the page and wait for its scripts to finish.",
+      "plainHttp": "One plain HTTP request to Bilibili; no browser is involved.",
       "cookies": "Cookies",
       "cookiesHint": "Send all of them together. msToken and UIFID_TEMP are the ones no algorithm can produce.",
+      "cookiesHintBilibili": "Send them together. buvid3 and buvid4 are the visitor ids Bilibili handed out, and b_nut is when.",
       "fingerprint": "Fingerprint",
       "fingerprintHint": "Send requests with this User-Agent. A jar used with a different one is a weaker identity than no identity."
     },
@@ -1600,7 +2008,7 @@
       "title": "Batch ids",
       "description": "Sort a pasted list of links and post ids without fetching anything. No identity is spent and nothing leaves this machine.",
       "field": "Links and ids",
-      "hint": "One per line. Blank lines and duplicates are dropped. A post id carries the second it was issued, so a typo is named here instead of becoming an upstream request.",
+      "hint": "One per line. Blank lines and duplicates are dropped. A Douyin or TikTok post id carries the second it was issued, so a typo is named here instead of becoming an upstream request; a Bilibili BV id is recognised on its own.",
       "action": "{count, plural, =0 {Parse} one {Parse # line} other {Parse # lines}}",
       "copyIds": "Copy the ids",
       "copied": "Ids copied",
@@ -1621,14 +2029,113 @@
       }
     }
   },
+  "transcriptions": {
+    "title": "Transcriptions",
+    "description": "Durable transcripts created from videos already stored on this instance.",
+    "column": {
+      "content": "Content",
+      "state": "State",
+      "platform": "Platform",
+      "preview": "Transcript",
+      "duration": "Duration",
+      "model": "Model",
+      "normalization": "Normalization",
+      "created": "Created",
+      "finished": "Finished"
+    },
+    "filter": {
+      "allStates": "All states",
+      "allPlatforms": "All platforms",
+      "search": "Search transcriptions",
+      "searchPlaceholder": "Words from the text, a title or a post id"
+    },
+    "normalization": {
+      "applied": "Applied",
+      "requested": "Requested",
+      "off": "Off"
+    },
+    "empty": {
+      "title": "No transcriptions yet",
+      "description": "Open a stored video's details on the Downloads page to start one.",
+      "action": "Go to Downloads",
+      "filteredTitle": "Nothing matches",
+      "filteredDescription": "No transcription matches the search and filters above."
+    },
+    "detail": {
+      "title": "Transcription details",
+      "loading": "Loading transcription…",
+      "progress": "{stage} · {percent, number}%",
+      "export": "Export .txt",
+      "noText": "No final text is available yet.",
+      "model": "Model",
+      "source": "Source file",
+      "sourceSize": "Source size",
+      "sha256": "SHA-256",
+      "downloadId": "Download ID",
+      "taskId": "Task ID",
+      "created": "Created",
+      "started": "Started",
+      "finished": "Finished",
+      "provisional": "Provisional text. Punctuation and number formatting are applied once the whole recording is done.",
+      "openDownload": "Open the download",
+      "openInLibrary": "Open in the Library"
+    },
+    "cancel": {
+      "action": "Cancel transcription",
+      "title": "Cancel this transcription?",
+      "description": "Queued or running work will stop. The record remains available in the console."
+    },
+    "delete": {
+      "selected": "Delete {count, plural, one {# selected record} other {# selected records}}",
+      "title": "Delete {count, plural, one {# transcription} other {# transcriptions}}?",
+      "description": "Transcript text and metadata will be permanently removed. The source download and video files are not changed.",
+      "liveHint": "Cancel running transcriptions before deleting them."
+    },
+    "toast": {
+      "cancelled": "Transcription cancelled",
+      "cancelFailed": "Could not cancel the transcription",
+      "deleted": "{count, plural, one {# transcription deleted} other {# transcriptions deleted}}",
+      "deleteFailed": "Could not delete the transcription records",
+      "alreadySettled": "The transcription had already finished, so there was nothing to cancel"
+    },
+    "stage": {
+      "queued": "Queued",
+      "decode": "Decoding audio",
+      "vad": "Finding speech",
+      "asr": "Recognising speech",
+      "punctuation": "Adding punctuation",
+      "normalization": "Writing numbers as digits"
+    },
+    "page": {
+      "range": "{from}-{to} of {total}",
+      "previous": "Previous",
+      "next": "Next"
+    },
+    "transcriber": {
+      "offTitle": "Transcription is not turned on",
+      "offBody": "The transcriber is optional and off by default. With the guided install, turn it on from the menu: bash install.sh --manage, then Manage, 11 (Transcription on or off). On an install of your own, start the transcriber compose profile and set DTK_TRANSCRIBER_URL.",
+      "downTitle": "The transcriber is not answering",
+      "downBody": "It is configured, but it failed its health check, so nothing can be transcribed until it is back. See whether its container is running with ./dtkctl ps, and why it stopped with ./dtkctl logs transcriber.",
+      "guide": "How to turn it on"
+    }
+  },
   "downloads": {
     "title": "Downloads",
     "description": "Media this instance has stored on its own disk. Files land on the server's media volume; this page indexes them, and a stored file can be saved from here.",
     "unavailableTitle": "No downloader running",
     "unavailable": "The downloader container is not reachable.",
     "unavailableHint": "Start it with --profile downloader and set DTK_DOWNLOADER_URL. Everything else on this instance is unaffected; only fetching the bytes is missing.",
+    "transcription": {
+      "action": "Transcribe video",
+      "failed": "Could not start the transcription",
+      "evicted": "The video file has been cleaned up. Download it again before transcribing.",
+      "unfinished": "Wait for the download to finish before transcribing.",
+      "noVideo": "This download has no completed video file to transcribe.",
+      "open": "Open the transcript",
+      "openRunning": "Open the transcript (in progress)"
+    },
     "evicted": "Cleaned up",
-    "evictedHint": "The files were removed to stay under the media ceiling. The record is kept, and asking again fetches them back.",
+    "evictedHint": "The files were removed from the media volume - by hand, or to stay under the media ceiling. The record is kept, and asking again fetches them back.",
     "pin": "Pin",
     "pinned": "Pinned",
     "pinHint": "Keep these files when the size ceiling cleans up. This is the only way to stop them being removed.",
@@ -1651,6 +2158,7 @@
     },
     "field": {
       "platform": "Platform",
+      "platformFromLink": "From the link",
       "contentId": "Content id",
       "contentIdHint": "The post id as the archive holds it. Parse the post first if it is not there yet."
     },
@@ -1666,11 +2174,15 @@
     },
     "filter": {
       "allStates": "Any state",
-      "allPlatforms": "Every platform"
+      "allPlatforms": "Every platform",
+      "search": "Search downloads",
+      "searchPlaceholder": "Title, author or post id"
     },
     "empty": {
       "title": "Nothing stored yet",
-      "description": "Start one above. Files land on the server's media volume, laid out as platform/author/post with a meta.json beside them."
+      "description": "Start one above. Files land on the server's media volume, laid out as platform/author/post with a meta.json beside them.",
+      "filteredTitle": "Nothing matches",
+      "filteredDescription": "No download matches the search and filters above. Clear the search, or pick another state or platform."
     },
     "toast": {
       "started": "Download started",
@@ -1696,7 +2208,7 @@
       "unpinned": "{count, plural, one {# download unpinned} other {# downloads unpinned}}",
       "deleted": "{count, plural, one {# download removed} other {# downloads removed}}",
       "deleteTitle": "Delete the selected downloads?",
-      "deleteBody": "{count, plural, one {# download's files are removed} other {# downloads' files are removed}} from the media volume. The record stays and says the files were cleaned up, so you can tell this apart from never having fetched them - and asking for the download again restores them.",
+      "deleteBody": "{count, plural, one {# download's files are removed} other {# downloads' files are removed}} from the media volume. The record stays and says the files were cleaned up, so you can tell this apart from never having fetched them - and asking for the download again restores them. Pinned downloads and ones still running are left alone.",
       "deleteConfirm": "Delete the files"
     },
     "dedupe": {
@@ -1720,6 +2232,7 @@
     },
     "target": {
       "unrecognised": "That is not a link this instance recognises",
+      "shortLink": "That is a short link, which says nothing until it is opened. Open it and paste the profile's full address.",
       "expected": {
         "video": "That is a profile link. Paste a post link, or use \"Save this author's posts\".",
         "user": "That is a post link. Paste the author's profile link or their sec_user_id."
@@ -1730,7 +2243,7 @@
         "label": "A post",
         "description": "Paste a link or a post id. If this instance has never seen the post it fetches it first, then downloads it. A link is not a host this dials: it is matched against the platforms this build knows, and only the post id inside it is used.",
         "field": "Link or post id",
-        "hint": "A share link, the share text around one, or a bare post id. A link says which platform it is; a bare id needs the menu beside it.",
+        "hint": "A share link, the share text around one, or a bare post id. A link says which platform it is, and so does a Bilibili BV or av id; a bare number needs the menu beside it.",
         "placeholder": "https://www.douyin.com/video/7408915107113127220",
         "action": "Save the media"
       },
@@ -1746,7 +2259,7 @@
         "label": "Comments",
         "description": "Read a post's comments and save them as a JSON file. Comments are data rather than media, so they come to your browser, not to the server's media volume.",
         "field": "Link or post id",
-        "hint": "Reads up to 5 pages of 50 through the identity pool. Each page is a real request.",
+        "hint": "Reads up to 5 pages through the identity pool, each as long as the platform serves: 50 comments on Douyin, 35 on TikTok, 20 on Bilibili. Each page is a real request.",
         "placeholder": "https://www.douyin.com/video/7408915107113127220",
         "action": "Save the comments"
       },
@@ -1754,7 +2267,7 @@
         "label": "An author's posts",
         "description": "Queue a download for everything on an author's most recent page. Paste their profile link; the platform comes from the link.",
         "field": "Profile link or author id",
-        "hint": "A profile link, or the bare sec_user_id the archive and the playground give you. The platform comes from a link; a bare id needs the menu.",
+        "hint": "A profile link, or the bare author id the archive and the playground give you: sec_user_id on Douyin, secUid on TikTok, the numeric mid on Bilibili. The platform comes from a link; a bare id needs the menu.",
         "placeholder": "https://www.douyin.com/user/MS4wLjABAAAA…",
         "action": "Queue their posts"
       }
@@ -1767,17 +2280,65 @@
       "label": "How many posts",
       "hint": "Newest first, paging the feed until it has this many. Every post is a download and every page is a read through the identity pool.",
       "count": "The newest {count}",
-      "all": "Everything the feed will give up"
+      "all": "Everything the feed will give up",
+      "confirmTitle": "Queue everything this author has posted?",
+      "confirmBody": "This reads up to {pages} pages of their posts through the identity pool - around {posts} posts - and starts one download for each. Every download spends the pool and fills the media volume. You can stop it while it runs.",
+      "confirmAction": "Queue them all"
     },
     "progress": {
       "files": "{done}/{total} files",
-      "hint": "Counted in files, not bytes: the platform declares a size and the sidecar does not trust it, so there is no total to divide by."
+      "bytes": "{done} / {total}",
+      "rate": "{rate}/s",
+      "eta": "{time} left",
+      "hint": "Bytes written so far, against the size each file's server declared. Until every file has started, the bar counts files instead."
     },
     "retry": {
       "action": "Retry",
       "hint": "Fetches the post again from scratch. There is no resume - media links are signed and expire, so partial bytes cannot be continued.",
       "started": "Trying again",
       "failed": "Could not retry"
+    },
+    "detail": {
+      "loading": "Loading the download…",
+      "openInLibrary": "Open in the Library"
+    },
+    "page": {
+      "range": "{from}-{to} of {total}",
+      "previous": "Previous",
+      "next": "Next"
+    },
+    "run": {
+      "reading": "Reading page {page} · {found} found",
+      "queued": "Queued {done} of {total} · {failed} failed · {skipped} already here",
+      "commentsSaved": "{count, plural, =0 {No comments to save} one {# comment saved} other {# comments saved}}",
+      "stop": "Stop",
+      "dismiss": "Dismiss",
+      "stopped": "Stopped. Nothing after that point was read or queued.",
+      "errorStop": "Stopped at page {page}: {message} What the earlier pages gave is kept.",
+      "loginStop": {
+        "author": "Page {page} onwards needs a signed-in {platform} identity, so it stopped there and queued what the earlier pages gave.",
+        "comments": "Page {page} onwards needs a signed-in {platform} identity, so it stopped there and saved what the earlier pages gave."
+      },
+      "loginFirst": "Reading this needs a signed-in {platform} identity, and none is available.",
+      "signIn": "Add a signed-in identity",
+      "firstError": "First failure: {message}",
+      "guest": {
+        "bilibiliComments": "A guest identity answered, and Bilibili shows a guest only the three hottest comments - the thread may be much longer.",
+        "douyinAuthor": "A guest identity answered, and Douyin leaves an author's newest posts out of what it shows a guest - the latest may be missing.",
+        "generic": "A guest identity answered, so this may be less than a signed-in identity would see."
+      }
+    },
+    "part": {
+      "label": "Part",
+      "hint": "Bilibili videos can come in several parts. A plain download stores the first; pick another to store that one, in a folder of its own. A link's ?p= picks it too.",
+      "first": "First part",
+      "firstOption": "P1 · {title} · {duration} (the default)",
+      "numbered": "Part {part}",
+      "option": "P{part} · {title} · {duration}",
+      "load": "List the parts",
+      "loaded": "{count, plural, one {# part} other {# parts}}",
+      "single": "This video has one part.",
+      "failed": "Could not list the parts. The first part, or the one the link names, is still downloadable."
     }
   },
   "library": {
@@ -1812,7 +2373,13 @@
       "storedOnly": "Downloaded only",
       "notStoredOnly": "Not downloaded",
       "activeCount": "{count, plural, one {# filter narrowing this list} other {# filters narrowing this list}}",
-      "noneActive": "Showing everything"
+      "noneActive": "Showing everything",
+      "authorChip": "Author: {name}",
+      "tagChip": "Tag: #{tag}",
+      "removeAuthor": "Stop narrowing to this author",
+      "removeTag": "Stop narrowing to this tag",
+      "byAuthor": "Show only posts by {name}",
+      "byTag": "Show only posts tagged #{tag}"
     },
     "column": {
       "post": "Post",
@@ -1848,8 +2415,11 @@
       "location": "Location",
       "openOnPlatform": "Open on the platform",
       "goneHint": "This post is no longer available on the platform. What is here is what this instance saw while it still was.",
-      "savedNoVideo": "The media for this post is stored, but it has no video file - an image post keeps its pictures instead.",
-      "exportFiles": "Export the stored files"
+      "savedNoVideo": "The media for this post is stored, but it has no video file - an image post keeps its pictures instead, and a live photo its clip beside the picture.",
+      "exportFiles": "Export the stored files",
+      "transcribeUnsaved": "Save the media to this instance first, with the button below; the transcriber reads the stored file, not the platform's.",
+      "loading": "Loading the post…",
+      "openDownload": "Open the download"
     },
     "page": {
       "previous": "Previous",
@@ -1858,7 +2428,9 @@
     },
     "empty": {
       "title": "Nothing archived yet",
-      "description": "Posts are archived automatically as they are parsed. Parse one from the parse tool or the API and it will appear here."
+      "description": "Posts are archived automatically as they are fetched. Store one from Downloads - a link, a batch of links, or an author's posts - or parse one in the Playground or through the API, and it will appear here.",
+      "filteredTitle": "Nothing matches",
+      "filteredDescription": "No archived post matches these filters. Remove a filter, or clear them all."
     },
     "toast": {
       "stored": "Saving started. The row appears under Downloads and the player here once it lands.",
@@ -1939,11 +2511,23 @@
       "addTo": "Add to collection",
       "removeFrom": "Remove from this collection",
       "noCollections": "No collections yet",
-      "delete": "Delete"
+      "delete": "Delete",
+      "store": "Save media",
+      "storeHint": "Download each selected post to this instance's disk, one at a time. Posts already stored are counted, not fetched again.",
+      "storeProgress": "Saving {done} of {total}…",
+      "storeDone": "{done} queued · {skipped} already stored · {failed} failed",
+      "transcribe": "Transcribe",
+      "transcribeHint": "Transcribe each selected video whose media is stored here. Image posts and posts not saved yet are skipped and counted.",
+      "transcribeProgress": "Transcribing {done} of {total}…",
+      "transcribeDone": "{done} sent to the transcriber · {skipped} skipped, not a stored video · {failed} failed",
+      "export": "Export selected",
+      "stop": "Stop",
+      "stopped": "Stopped before the end of the selection.",
+      "firstError": "First failure: {message}"
     },
     "delete": {
       "title": "Delete these posts?",
-      "body": "{count, plural, one {# post and any media stored for it will be deleted from this instance.} other {# posts and any media stored for them will be deleted from this instance.}} The posts stay on the platform. This cannot be undone and there is no trash.",
+      "body": "{count, plural, one {# post and any media stored for it will be deleted from this instance.} other {# posts and any media stored for them will be deleted from this instance.}} The posts stay on the platform. This cannot be undone and there is no trash. Their download records go too, so they are not counted as cleaned up on the downloads page; to remove only the files and keep the records, delete them from the downloads page.",
       "action": "Delete"
     },
     "exportVideo": "Export the video file"
@@ -1955,6 +2539,10 @@
     "pauseConfirm": "{count, plural, one {Pause # watched target?} other {Pause all # watched targets?}} Nothing already collected is affected; they simply stop running until you enable them again.",
     "paused": "Paused",
     "remove": "Remove",
+    "removeTitle": "Stop watching {target}?",
+    "removeBody": "Its schedule is removed. Everything it has already collected stays in the archive and in the snapshot history.",
+    "editLabel": "Edit {target}",
+    "openInLibrary": "See what it has collected, in the Library ({target})",
     "neverRun": "Not run yet",
     "failing": "{count, plural, one {# failure in a row} other {# failures in a row}}",
     "toggleLabel": "Collect {target} on a schedule",
@@ -1979,10 +2567,22 @@
       "kind": "Watch",
       "target": "Target",
       "targetHint": {
-        "author": "The author's stable id - sec_user_id on Douyin, the numeric id on TikTok. Not the handle: users change those.",
-        "content": "The post id, as the archive holds it."
+        "author": "A profile link, or the author's stable id: sec_user_id on Douyin, secUid on TikTok, the numeric mid on Bilibili. Not the handle - users change those. A link sets the platform.",
+        "content": "A post link, or the post id as the archive holds it - a BV id on Bilibili. A link sets the platform."
       },
-      "interval": "Every"
+      "interval": "Every",
+      "label": "Name",
+      "labelHint": "Optional. Left empty, the first run fills in the author's name."
+    },
+    "target": {
+      "unrecognised": "That is not a link this instance recognises.",
+      "shortLink": "That is a short link, which says nothing until it is opened. Open it and paste the full address.",
+      "expectedUser": "That is a post link. Watch an author with their profile link, or switch Watch to a post.",
+      "expectedVideo": "That is a profile link. Watch a post with its own link, or switch Watch to an author."
+    },
+    "edit": {
+      "title": "Edit a watched target",
+      "labelHint": "Empty hands the name back to the platform: the next run fills it in."
     },
     "kind": {
       "author": "An author",
@@ -2003,6 +2603,7 @@
     "toast": {
       "added": "Now watching; the first run is queued",
       "addFailed": "Could not watch that target",
+      "saved": "Saved",
       "removed": "Stopped watching. Everything already collected is kept.",
       "paused": "{count, plural, one {Paused # target} other {Paused # targets}}"
     }
@@ -2010,8 +2611,27 @@
   "scheduler": {
     "pool": {
       "active": "Schedulable right now",
+      "activeReserved": "{count, plural, one {Schedulable right now; # reserved identity is not counted} other {Schedulable right now; # reserved identities are not counted}}",
       "cooling": "Resting off a risk-control hit; they come back on their own",
       "degraded": "Hit the cooldown ceiling. Last resort, used only when nothing is active"
+    },
+    "census": {
+      "title": "Per platform",
+      "description": "A request is only ever served by an identity of its own platform. Reserved identities are active but serve only the requests that name them, so they are not counted as schedulable.",
+      "schedulable": "Schedulable",
+      "reserved": "Reserved"
+    },
+    "marks": {
+      "title": "Pool size per platform",
+      "description": "Leave a cell empty to inherit the global pool.min_size or pool.target_size shown in it. A low-water mark of 0 turns automatic minting off for that platform.",
+      "min_size": "Low-water mark",
+      "target_size": "Target",
+      "inherit": "inherits {value}",
+      "cellLabel": "{platform}: {field}",
+      "invalid": "A whole number, 0 or more",
+      "save": "{count, plural, =0 {Save} one {Save # change} other {Save # changes}}",
+      "saved": "Pool sizes saved",
+      "saveFailed": "Could not save the pool sizes"
     },
     "rotationTitle": "How one request picks an identity",
     "rotationDescription": "Five stages, in this order. A request that clears all five gets a lease; anything else is refused with the reason, which is what the request log records.",
@@ -2029,7 +2649,27 @@
       "pool": "How many identities to keep, and what counts as one worth keeping."
     },
     "overridesTitle": "Where these values come from",
-    "overrides": "{count, plural, =0 {Every value on this page is the built-in default or an environment seed.} one {# value is stored in the database and overrides its environment seed.} other {# values are stored in the database and override their environment seeds.}}"
+    "overrides": "{count, plural, =0 {Every value on this page is the built-in default or an environment seed.} one {# value is stored in the database and overrides its environment seed.} other {# values are stored in the database and override their environment seeds.}}",
+    "coverage": {
+      "title": "Logins and who serves each endpoint",
+      "description": "Counted the way the scheduler hands identities out: per endpoint, from those in rotation for it. A request that names an identity with identity= is not limited by any of this.",
+      "guestsFirst": "Guests first where no login is needed",
+      "guestsFirstOn": "Endpoints a guest answers just as well go to guest identities, and to a login only when no guest can. Logins are kept for the endpoints that need them.",
+      "guestsFirstOff": "Logins and guests share every endpoint by recency. A login is spent on requests a guest would have answered the same.",
+      "login": "Login",
+      "ready": "Can serve",
+      "signedIn": "Logins",
+      "dedicated": "Limited to it",
+      "cooling": "Cooling",
+      "open": "List these identities",
+      "openCooling": "List the cooling ones",
+      "noLogin": "No login in rotation: where this endpoint needs one, it answers IDENTITY_LOGIN_REQUIRED.",
+      "reserved": "{count, plural, one {# identity serves only requests that name it} other {# identities serve only requests that name them}}",
+      "caption": "{platform} endpoints",
+      "footnote": "Endpoints that answer only about the identity asking are not listed: they always need identity=.",
+      "saved": "Setting saved",
+      "saveFailed": "Could not save the setting"
+    }
   },
   "about": {
     "contact": {
@@ -2092,7 +2732,7 @@
       "become": "To sponsor this project, see github.com/sponsors/evil0ctal.",
       "label": "Sponsor"
     },
-    "tagline": "A self-hosted API for Douyin and TikTok data, and a console for running it.",
+    "tagline": "A self-hosted API for Douyin, TikTok and Bilibili data, and a console for running it.",
     "title": "About"
   },
   "mcp": {
@@ -2153,6 +2793,8 @@
       "list_comments": "Top-level comments on a post, one page at a time.",
       "get_content_history": "Recorded metric history for a post or an author.",
       "pool_status": "Identity-pool and endpoint health, for when calls start failing.",
+      "download_media": "Store a post's media on this instance; transcribe_video takes the download_id it returns.",
+      "transcribe_video": "Transcribe an already downloaded video and return its full text.",
       "get_task_result": "Collect a result that did not finish in time."
     },
     "usage": {
@@ -2175,7 +2817,7 @@
     "notice": {
       "title": "A newer release is available",
       "body": "This instance runs {current}. The latest release is {latest}.",
-      "how": "Updating is a pull and a restart — see \"Updating\" in the README. Your data, settings and identity pool are untouched by it.",
+      "how": "Installed with the install script? Run ./dtkctl upgrade in its directory; it pulls, migrates and restarts, and records the new version itself. Otherwise see \"Updating to a new release\" in the README. Your data, settings and identity pool are untouched by it.",
       "releaseNotes": "Release notes"
     }
   }

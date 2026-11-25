@@ -47,6 +47,10 @@ export const paths = {
     session: (id: string) => `${API_V1}/admin/identities/${encodeURIComponent(id)}/session`,
     /** Clears a cooldown and a failure streak. Refused on a retired identity. */
     reset: (id: string) => `${API_V1}/admin/identities/${encodeURIComponent(id)}/reset`,
+    /** Which endpoints rotation may use it for: null all, [] none, or a list. */
+    rotation: (id: string) => `${API_V1}/admin/identities/${encodeURIComponent(id)}/rotation`,
+    /** Per platform and endpoint, how many identities rotation may send. */
+    coverage: `${API_V1}/admin/identities/coverage`,
     /** Cookie names, roles and masked values. Never the values themselves. */
     cookies: (id: string) => `${API_V1}/admin/identities/${encodeURIComponent(id)}/cookies`,
     /** The same jar with its real values. Audited; operator role only. */
@@ -70,7 +74,11 @@ export const paths = {
   archive: {
     list: `${API_V1}/archive`,
     stats: `${API_V1}/archive/stats`,
+    /** GET exports what a filter matches; POST, the posts named in the body. */
     export: `${API_V1}/archive/export`,
+    /** One archived post, with what is stored for it, as a listed row has. */
+    post: (platform: string, contentId: string) =>
+      `${API_V1}/archive/${encodeURIComponent(platform)}/${encodeURIComponent(contentId)}`,
     recheck: `${API_V1}/archive/recheck`,
     backfill: `${API_V1}/archive/backfill`,
     /** Removes the archive rows and, unless told otherwise, the stored files. */
@@ -97,12 +105,25 @@ export const paths = {
     /** Starts a settled download over. There is no resume; see the route. */
     retry: `${API_V1}/downloads/retry`,
     storage: `${API_V1}/downloads/storage`,
-    pin: (id: string) => `${API_V1}/downloads/${encodeURIComponent(id)}/pin`,
+    /** One download, with the same title, progress and transcript as a listed row. */
     byId: (id: string) => `${API_V1}/downloads/${encodeURIComponent(id)}`,
+    pin: (id: string) => `${API_V1}/downloads/${encodeURIComponent(id)}/pin`,
+    /**
+     * DELETE removes the files and keeps the record, which then reads as
+     * cleaned up. Not `/downloads/{id}`: DELETE there cancels a transfer and
+     * leaves a finished one alone, and the Delete button was once wired to it.
+     */
+    files: (id: string) => `${API_V1}/downloads/${encodeURIComponent(id)}/files`,
     // A plain href the browser follows, so the session cookie authenticates it
     // the same way it does every other request from this page.
     file: (id: string, name: string) =>
       `${API_V1}/downloads/${encodeURIComponent(id)}/files/${encodeURIComponent(name)}`,
+  },
+  transcriptions: {
+    list: `${API_V1}/transcriptions`,
+    create: `${API_V1}/transcriptions`,
+    delete: `${API_V1}/transcriptions/delete`,
+    byId: (id: string) => `${API_V1}/transcriptions/${encodeURIComponent(id)}`,
   },
   tools: {
     sign: `${API_V1}/tools/sign`,
@@ -148,6 +169,8 @@ export const paths = {
   },
   system: {
     status: `${API_V1}/system/status`,
+    /** Which operations each platform serves, and which need a pinned identity. */
+    capabilities: `${API_V1}/system/capabilities`,
     health: '/healthz',
     ready: '/readyz',
   },

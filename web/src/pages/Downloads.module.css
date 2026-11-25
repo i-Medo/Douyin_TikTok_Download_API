@@ -202,35 +202,62 @@
   max-width: 260px;
 }
 
-/* -------------------------------------------------------------------------- */
-/* Progress                                                                    */
-/* -------------------------------------------------------------------------- */
+/* The part menu and the button that fills it, side by side until the phone
+   width runs out. */
+.partPicker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2);
+}
+
+.partField {
+  min-width: 0;
+  width: min(100%, 420px);
+}
 
 /*
- * By files, not by bytes. The platform declares a size and the sidecar does
- * not trust it - the ceiling is enforced on bytes actually written - so there
- * is no denominator. Files done out of files planned is a real fraction; the
- * bytes sit beside it as the number that keeps moving.
+ * The account of an author or comments run, under the form that started it.
+ *
+ * Inset rather than a card of its own: it belongs to the form above it, and it
+ * stays after the run so its notes - two failed, page two needs a login - can
+ * be read rather than raced against a toast.
  */
-.progress {
+.run {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  min-width: 0;
-}
-
-.progressTrack {
-  display: block;
-  height: 4px;
-  border-radius: 2px;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
   background: var(--bg-inset);
-  overflow: hidden;
 }
 
-.progressFill {
-  display: block;
-  height: 100%;
-  border-radius: 2px;
-  background: var(--accent);
-  transition: width var(--duration-2, 200ms) var(--ease);
+.runNote {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-xs);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.runNote a,
+.crossLinks a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.runNote a:hover,
+.crossLinks a:hover {
+  text-decoration: underline;
+}
+
+/* Where the same post lives on the other content pages. */
+.crossLinks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin: 0;
+  font-size: var(--text-xs);
 }

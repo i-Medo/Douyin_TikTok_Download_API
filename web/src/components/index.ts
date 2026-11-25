@@ -23,8 +23,14 @@ export type { CheckboxProps } from './Checkbox'
 export { CodeBlock } from './CodeBlock'
 export type { CodeBlockProps } from './CodeBlock'
 
+export { CompactProgress } from './CompactProgress'
+export type { CompactProgressProps } from './CompactProgress'
+
 export { ConfirmDialog } from './ConfirmDialog'
 export type { ConfirmDialogProps } from './ConfirmDialog'
+
+export { ContentNextSteps } from './ContentNextSteps'
+export type { AuthorTarget, ContentNextStepsProps, PostTarget } from './ContentNextSteps'
 
 export { CopyableId } from './CopyableId'
 export type { CopyableIdProps } from './CopyableId'
@@ -114,6 +120,17 @@ export { TimeSeriesChart } from './TimeSeriesChart'
 export type { ChartPoint, ChartSeries, TimeSeriesChartProps } from './TimeSeriesChart'
 
 export { ToastProvider, useToast } from './Toast'
+export {
+  TranscribeButton,
+  TranscriberNotice,
+  transcriberGuideHref,
+  useTranscriberState,
+} from './TranscribeButton'
+export type {
+  ExistingTranscription,
+  TranscribeButtonProps,
+  TranscriberState,
+} from './TranscribeButton'
 export type { ToastApi, ToastOptions, ToastTone } from './Toast'
 
 export { TopBar } from './TopBar'

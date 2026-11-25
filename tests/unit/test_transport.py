@@ -11,8 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Mapping
-from datetime import timedelta
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, ClassVar
 
 import pytest
 import wreq
@@ -101,9 +101,18 @@ def make_identity(
 
 
 class FakeCookie:
-    def __init__(self, name: str, value: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        value: str,
+        *,
+        max_age: timedelta | None = None,
+        expires: datetime | None = None,
+    ) -> None:
         self.name = name
         self.value = value
+        self.max_age = max_age
+        self.expires = expires
 
 
 class FakeStatus:
@@ -117,6 +126,10 @@ class FakeStatus:
 
     def __str__(self) -> str:
         return f"{self._code} OK"
+
+
+def _view(data: bytes) -> memoryview:
+    return memoryview(data).toreadonly()
 
 
 class FakeResponse:
@@ -135,21 +148,29 @@ class FakeResponse:
         self._body = body
         self._body_error = body_error
         self._body_delay = body_delay
-        # wreq hands back a header map that iterates as (bytes, bytes) pairs.
+        # wreq hands back a header map that iterates as pairs of read-only
+        # memoryviews since 0.13 - bytes before it. The release notes name the
+        # body and not the headers; measured with 0.13.0, both changed.
         self.headers = [
-            *((k.encode(), v.encode()) for k, v in (headers or {}).items()),
-            *header_pairs,
+            (_view(name), _view(value))
+            for name, value in (
+                *((k.encode(), v.encode()) for k, v in (headers or {}).items()),
+                *header_pairs,
+            )
         ]
         self.url = url
         self.cookies = cookies
         self.closed = 0
 
-    async def bytes(self) -> bytes:
+    async def bytes(self) -> memoryview:
         if self._body_delay:
             await asyncio.sleep(self._body_delay)
         if self._body_error is not None:
             raise self._body_error
-        return self._body
+        # What wreq 0.13 returns, read-only and without a copy. This double
+        # returned bytes while 0.13 did not, which is how a transport that
+        # called .decode() on a memoryview passed every test here.
+        return _view(self._body)
 
     async def close(self) -> None:
         self.closed += 1
@@ -181,14 +202,6 @@ class RecordingFactory:
         client = FakeClient(options)
         self.built.append(client)
         return client
-
-
-class RecordingSink:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, str]]] = []
-
-    async def __call__(self, identity_id: str, cookies: Mapping[str, str]) -> None:
-        self.calls.append((identity_id, dict(cookies)))
 
 
 def make_transport(**kwargs: Any) -> tuple[WreqTransport, RecordingFactory]:
@@ -555,6 +568,40 @@ class TestClassifier:
         assert result.outcome is Outcome.RISK_CONTROL
         assert result.rule == "payload.withheld"
 
+    #: Douyin's answer for a deleted image post, captured 2026-10-21 (#795):
+    #: the post named, no reason, no sentence.
+    UNEXPLAINED: ClassVar[dict[str, Any]] = {
+        "status_code": 0,
+        "aweme_detail": None,
+        "filter_detail": {"aweme_id": "7697962930159039461", "filter_reason": ""},
+        "log_pb": {"impr_id": "x"},
+    }
+
+    @staticmethod
+    def _asking_for(aweme_id: str, payload: Any) -> RawResponse:
+        return RawResponse(
+            status=200,
+            headers={"content-type": "application/json"},
+            body=json.dumps(payload).encode(),
+            final_url=(
+                "https://www.douyin.com/aweme/v1/web/aweme/detail/"
+                f"?device_platform=webapp&aid=6383&aweme_id={aweme_id}&a_bogus=x"
+            ),
+        )
+
+    def test_naming_the_post_asked_for_is_an_answer_without_a_reason(self) -> None:
+        """The post was deleted; Douyin's page says so and gives no reason here
+        either. Read as withholding, it cooled a healthy identity on every ask."""
+        result = classify_detailed(self._asking_for("7697962930159039461", self.UNEXPLAINED))
+        assert result.outcome is Outcome.BUSINESS_ERROR
+        assert result.rule == "payload.explained"
+        assert result.detail == "no reason given"
+
+    def test_naming_another_post_says_nothing_about_this_one(self) -> None:
+        result = classify_detailed(self._asking_for("7345492945006595379", self.UNEXPLAINED))
+        assert result.outcome is Outcome.RISK_CONTROL
+        assert result.rule == "payload.withheld"
+
     def test_a_reason_and_a_sentence_are_reported_together(self) -> None:
         """Owner-only, the shape captured on 2026-09-08."""
         response = json_response(
@@ -903,6 +950,19 @@ class TestRequestWiring:
         with pytest.raises(InvalidParam):
             await transport.request(make_identity(), RequestSpec(url="https://x/a", method="FROB"))
 
+    async def test_the_body_is_bytes_whatever_wreq_hands_back(self) -> None:
+        """wreq 0.13 returns a memoryview; everything downstream decodes bytes."""
+        transport, factory = make_transport()
+        identity = make_identity()
+        await transport.request(identity, RequestSpec(url="https://x/a"))
+        factory.built[0].response = FakeResponse(body='{"desc": "café"}'.encode())
+
+        raw = await transport.request(identity, RequestSpec(url="https://x/a"))
+
+        assert type(raw.body) is bytes
+        assert raw.json() == {"desc": "café"}
+        assert raw.text == '{"desc": "café"}'
+
     async def test_response_is_adapted(self) -> None:
         transport, factory = make_transport()
         identity = make_identity()
@@ -923,41 +983,71 @@ class TestRequestWiring:
         assert raw.elapsed_ms >= 0
         assert transport.classify(raw).outcome is Outcome.BUSINESS_ERROR
 
-    async def test_set_cookies_go_back_to_the_pool(self) -> None:
-        sink = RecordingSink()
-        transport, factory = make_transport(cookie_sink=sink)
+    async def test_set_cookies_come_back_on_the_response(self) -> None:
+        transport, factory = make_transport()
         identity = make_identity(cookies={"ttwid": "old"})
         await transport.request(identity, RequestSpec(url="https://x/a"))
         factory.built[0].response = FakeResponse(
             cookies=(FakeCookie("ttwid", "rotated"), FakeCookie("msToken", "fresh"))
         )
 
+        raw = await transport.request(identity, RequestSpec(url="https://x/a"))
+
+        assert raw.set_cookies == {"ttwid": "rotated", "msToken": "fresh"}
+        # The identity the caller holds is not changed behind its back: keeping
+        # them is the caller's decision, in the caller's session.
+        assert identity.cookies == {"ttwid": "old"}
+
+    @pytest.mark.parametrize(
+        "deletion",
+        [
+            FakeCookie("sessionid", ""),
+            FakeCookie("sessionid", "x", max_age=timedelta(0)),
+            FakeCookie("sessionid", "x", expires=datetime(2001, 1, 1, tzinfo=UTC)),
+            FakeCookie("sessionid", "x", expires=datetime(2001, 1, 1)),
+        ],
+        ids=["empty", "max-age-0", "expired", "expired-naive"],
+    )
+    async def test_a_deletion_is_not_a_value(self, deletion: FakeCookie) -> None:
+        transport, factory = make_transport()
+        identity = make_identity()
         await transport.request(identity, RequestSpec(url="https://x/a"))
+        factory.built[0].response = FakeResponse(cookies=(deletion, FakeCookie("odin_tt", "new")))
 
-        assert sink.calls == [("id-1", {"ttwid": "rotated", "msToken": "fresh"})]
+        raw = await transport.request(identity, RequestSpec(url="https://x/a"))
 
-    async def test_a_failing_sink_does_not_lose_the_response(self) -> None:
-        async def broken_sink(identity_id: str, cookies: Mapping[str, str]) -> None:
-            raise RuntimeError("database is down")
+        assert raw.set_cookies == {"odin_tt": "new"}
 
-        transport, factory = make_transport(cookie_sink=broken_sink)
+    async def test_a_cookie_that_lives_on_is_kept(self) -> None:
+        transport, factory = make_transport()
         identity = make_identity()
         await transport.request(identity, RequestSpec(url="https://x/a"))
         factory.built[0].response = FakeResponse(
-            body=b'{"status_code": 0, "aweme_detail": {"aweme_id": "7"}}',
-            cookies=(FakeCookie("ttwid", "rotated"),),
+            cookies=(
+                FakeCookie("odin_tt", "a", max_age=timedelta(days=365)),
+                FakeCookie("ttwid", "b", expires=datetime(2099, 1, 1, tzinfo=UTC)),
+            )
         )
 
         raw = await transport.request(identity, RequestSpec(url="https://x/a"))
 
-        assert transport.classify(raw).outcome is Outcome.OK
+        assert raw.set_cookies == {"odin_tt": "a", "ttwid": "b"}
 
-    async def test_no_cookies_no_sink_call(self) -> None:
-        sink = RecordingSink()
-        transport, _ = make_transport(cookie_sink=sink)
-        await transport.request(make_identity(), RequestSpec(url="https://x/a"))
+    async def test_no_cookies_is_an_empty_mapping(self) -> None:
+        transport, _ = make_transport()
+        raw = await transport.request(make_identity(), RequestSpec(url="https://x/a"))
 
-        assert sink.calls == []
+        assert raw.set_cookies == {}
+
+    async def test_the_values_stay_out_of_the_repr(self) -> None:
+        transport, factory = make_transport()
+        identity = make_identity()
+        await transport.request(identity, RequestSpec(url="https://x/a"))
+        factory.built[0].response = FakeResponse(cookies=(FakeCookie("sessionid", "s3cret"),))
+
+        raw = await transport.request(identity, RequestSpec(url="https://x/a"))
+
+        assert "s3cret" not in repr(raw)
 
     async def test_network_failure_raises_and_classifies(self) -> None:
         transport, factory = make_transport()
