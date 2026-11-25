@@ -5,6 +5,7 @@ import {
   Button,
   Card,
   CodeBlock,
+  ContentNextSteps,
   CopyableId,
   DataTable,
   SigningStages,
@@ -18,13 +19,14 @@ import {
   Textarea,
   useToast,
 } from '@/components'
-import { useApiMutation, useFormatters } from '@/hooks'
+import { useApiMutation, useFormatters, usePlatformInSentence } from '@/hooks'
 import { apiGet, apiPost, isApiError } from '@/lib/api'
+import { copyText } from '@/lib/clipboard'
 import { paths } from '@/lib/endpoints'
 import { MISSING } from '@/lib/format'
-import type { DecodedParameter, SigningStage } from '@/components'
+import type { AuthorTarget, DecodedParameter, PostTarget, SigningStage } from '@/components'
 import { SIGNING_EXAMPLES } from '@/lib/signingExamples'
-import type { Platform } from '@/lib/types'
+import { PLATFORMS, type Platform } from '@/lib/types'
 
 
 /**
@@ -35,7 +37,7 @@ import type { Platform } from '@/lib/types'
  * make them explorable without writing a curl line, and to put the one warning
  * that matters where it will actually be read.
  *
- * That warning: a signature alone is not enough. Both platforms answer a
+ * That warning: a signature alone is not enough. Douyin and TikTok answer a
  * *session*, so a correct signature sent with no cookies gets 200 and an empty
  * body - measured, and the first thing anyone hits. The signing form therefore
  * says what else has to line up, and the minting form is what produces it.
@@ -43,7 +45,6 @@ import type { Platform } from '@/lib/types'
 
 type ToolTab = 'sign' | 'decode' | 'parse' | 'batch' | 'identity'
 
-const PLATFORMS: readonly Platform[] = ['douyin', 'tiktok']
 
 /**
  * What the decode tab starts with when the sign tab hands off to it.
@@ -118,6 +119,7 @@ interface SignResult {
 
 function SignForm({ onDecode }: { onDecode: (seed: DecodeSeed) => void }) {
   const { t } = useTranslation('console')
+  const platformPhrase = usePlatformInSentence()
   const toast = useToast()
   const [platform, setPlatform] = useState<Platform>('douyin')
   const [url, setUrl] = useState('')
@@ -165,7 +167,7 @@ function SignForm({ onDecode }: { onDecode: (seed: DecodeSeed) => void }) {
                     loadExample(name)
                   }}
                 >
-                  {t('tools.sign.loadExample', { platform: name })}
+                  {t('tools.sign.loadExample', { platform: platformPhrase(name) })}
                 </Button>
               ))}
             </div>
@@ -308,6 +310,7 @@ const DECODE_PARAMETERS = [
   'msToken',
   'x-secsdk-web-signature',
   'verifyFp',
+  'w_rid',
 ] as const
 
 /**
@@ -320,9 +323,10 @@ const DECODE_PARAMETERS = [
  * out of it.
  *
  * The User-Agent field is not decoration and is worth filling in even when the
- * answer seems obvious. Both platforms hash the UA into the signature, and "the
- * UA I am sending is not the UA I signed with" is the single most common way a
- * hand-built request fails while looking perfectly correct.
+ * answer seems obvious. Douyin and TikTok hash the UA into the signature, and
+ * "the UA I am sending is not the UA I signed with" is the single most common
+ * way a hand-built request fails while looking perfectly correct. Bilibili's
+ * WBI signs the query alone, so there it changes nothing.
  */
 function DecodeForm({ seed }: { seed: DecodeSeed | null }) {
   const { t } = useTranslation('console')
@@ -436,13 +440,39 @@ interface ParseResult {
   needs_expansion: boolean
 }
 
+/** The post or author a parsed link names, in the shape the next steps take. */
+function parseTargets(result: ParseResult): {
+  post: PostTarget | null
+  author: AuthorTarget | null
+} {
+  const platform = (PLATFORMS as readonly string[]).includes(result.platform ?? '')
+    ? (result.platform as Platform)
+    : null
+  if (!result.allowed || !platform || !result.resource_id) return { post: null, author: null }
+  if (result.resource === 'video') {
+    return { post: { platform, contentId: result.resource_id }, author: null }
+  }
+  // A TikTok profile link yields its @handle, which is not the key the archive
+  // files an author under; Douyin's sec_user_id and Bilibili's mid are.
+  if (result.resource === 'user' && !result.handle) {
+    return { post: null, author: { platform, uid: result.resource_id } }
+  }
+  return { post: null, author: null }
+}
+
 function ParseForm() {
   const { t } = useTranslation('console')
+  const toast = useToast()
   const [text, setText] = useState('')
 
-  const parse = useApiMutation<ParseResult, void>(() =>
-    apiGet<ParseResult>(paths.tools.parseUrl, { params: { url: text.trim() } }),
+  // The other tabs report a refused request in a toast; this one had no
+  // handler at all and its error panel skips API errors, so a refusal - a
+  // rate limit, an over-long paste - left the page exactly as it was.
+  const parse = useApiMutation<ParseResult, void>(
+    () => apiGet<ParseResult>(paths.tools.parseUrl, { params: { url: text.trim() } }),
+    { onError: (error) => toast.apiError(error) },
   )
+  const targets = parse.data ? parseTargets(parse.data) : null
 
   return (
     <>
@@ -471,8 +501,13 @@ function ParseForm() {
 
       {parse.data && (
         <Card title={t('tools.parse.result')}>
-          {parse.data.needs_expansion && <p className="u-muted">{t('tools.parse.shortLink')}</p>}
-          <CodeBlock json={parse.data} />
+          <div className="u-stack-sm">
+            {parse.data.needs_expansion && <p className="u-muted">{t('tools.parse.shortLink')}</p>}
+            <CodeBlock json={parse.data} />
+            {targets && (targets.post || targets.author) ? (
+              <ContentNextSteps post={targets.post} author={targets.author} />
+            ) : null}
+          </div>
         </Card>
       )}
     </>
@@ -493,9 +528,10 @@ interface BatchItem {
   url: string | null
   needs_expansion: boolean
   /**
-   * When the id was issued. Both platforms mint post ids whose high 32 bits are
-   * a Unix second, so this comes out of the id itself rather than out of a
+   * When the id was issued. Douyin and TikTok mint post ids whose high 32 bits
+   * are a Unix second, so this comes out of the id itself rather than out of a
    * request. It is at or a little before the publication time, never after.
+   * A Bilibili BV id carries no time, so its rows have none.
    */
   minted_at: string | null
 }
@@ -564,8 +600,13 @@ function BatchForm() {
                     .filter((item) => item.resource_id && item.kind !== 'bad_id')
                     .map((item) => item.resource_id)
                     .join('\n')
-                  void navigator.clipboard.writeText(ids)
-                  toast.success(t('console:tools.batch.copied'))
+                  // Through the fallback, not navigator.clipboard: a console
+                  // reached over plain http has no clipboard API, so this
+                  // threw there - after a toast that said it had worked.
+                  void copyText(ids).then((copied) => {
+                    if (copied) toast.success(t('console:tools.batch.copied'))
+                    else toast.error(t('common:action.copyFailed'))
+                  })
                 }}
               >
                 {t('console:tools.batch.copyIds')}
@@ -668,6 +709,12 @@ interface IdentityResult {
   exit_ip: string | null
 }
 
+/**
+ * Minted over plain HTTP by the server, not in the browser. Only the hints
+ * below depend on it; whether minting works at all is the server's answer.
+ */
+const BROWSERLESS_MINT: readonly Platform[] = ['bilibili']
+
 function IdentityForm() {
   const { t } = useTranslation('console')
   const toast = useToast()
@@ -708,13 +755,24 @@ function IdentityForm() {
           <Button variant="primary" loading={mint.isPending} onClick={() => mint.mutate()}>
             {t('tools.identity.action')}
           </Button>
-          <p className="u-xs u-muted">{t('tools.identity.slow')}</p>
+          <p className="u-xs u-muted">
+            {BROWSERLESS_MINT.includes(platform)
+              ? t('tools.identity.plainHttp')
+              : t('tools.identity.slow')}
+          </p>
         </div>
       </Card>
 
       {mint.data && (
         <>
-          <Card title={t('tools.identity.cookies')} description={t('tools.identity.cookiesHint')}>
+          <Card
+            title={t('tools.identity.cookies')}
+            description={
+              mint.data.platform === 'bilibili'
+                ? t('tools.identity.cookiesHintBilibili')
+                : t('tools.identity.cookiesHint')
+            }
+          >
             <CodeBlock json={mint.data.cookies} />
           </Card>
           <Card
