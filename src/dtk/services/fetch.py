@@ -30,7 +30,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 from urllib.parse import urlencode
@@ -39,16 +39,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dtk.core.errors import (
     DtkError,
+    IdentityLoginRequired,
     Internal,
+    InvalidParam,
     NotFound,
     UpstreamChanged,
     UpstreamRiskControl,
+    UpstreamUnreachable,
 )
 from dtk.core.logging import get_logger
-from dtk.core.types import Outcome, Platform
+from dtk.core.types import LoginNeed, Outcome, Platform
 from dtk.db.models import Identity as IdentityRow
 from dtk.db.models import RequestLog
-from dtk.identity.pool import IdentityPool
+from dtk.identity.pool import IdentityPool, LiveIdentity
+from dtk.identity.rotation import rotate
 from dtk.ops.masking import mask_url
 from dtk.platforms import PlatformAdapter, get_adapter
 from dtk.platforms.base import RequestSpec as PlatformRequestSpec
@@ -62,9 +66,10 @@ from dtk.transport.base import (
     Transport,
     TransportFailure,
     TransportIdentity,
+    with_signed_cookies,
 )
 from dtk.transport.base import RequestSpec as TransportRequestSpec
-from dtk.transport.classify import Classification
+from dtk.transport.classify import LOGIN_REQUIRED_RULE, Classification
 from dtk.transport.emulation import UnsupportedFingerprint
 from dtk.transport.headers import build_headers
 
@@ -74,6 +79,25 @@ log = get_logger(__name__)
 #: failures before giving up. Small on purpose: if three separate egresses
 #: cannot reach the platform, the problem is not the identity.
 MAX_TRANSPORT_ATTEMPTS = 3
+
+#: How long an identity whose device id could not be read goes before the page
+#: is asked again. Long enough that a page the platform will not serve costs
+#: one request an hour per identity, not one per call.
+DEVICE_ID_RETRY_SECONDS = 3600.0
+
+#: Responses whose Set-Cookie an identity keeps: every one the platform
+#: answered, refusals included, as a browser would. Not a transport failure or
+#: a 5xx, where there is no answer from the platform to keep.
+#:
+#: Refusals were left out at first, on the theory that a risk page describes a
+#: visitor being turned away. Measured on 2026-11-20 it is the other way round
+#: on TikTok: each msToken carries a use budget (about 22 author_profile calls
+#: on a guest), the API sets a fresh one on most answers, and the refusal that
+#: spends the last of a budget - signature.rejected, an empty 200 with
+#: tt_orcas_res: 1 - carries a fresh one too. A jar that adopted it answered
+#: again on its next call; one that kept replaying its minted token was dead
+#: for good. That replayed token was #830's rejections.
+_KEEPS_NOTHING: frozenset[Outcome] = frozenset({Outcome.NETWORK_ERROR})
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +127,9 @@ class Explanation:
     endpoint: str
     #: Masked. The exit is an operator credential and stays one.
     proxy: str | None
+    #: The POST body as sent, or None. Without it a curl of a signed POST
+    #: replays an empty body under a signature that hashed a full one.
+    body: str | None = None
 
 
 @dataclass(slots=True)
@@ -116,6 +143,10 @@ class FetchResult:
     signer: str | None = None
     #: Present only when the caller asked, and had the scope to.
     explain: Explanation | None = None
+    #: A guest answered an endpoint that gives guests less, because rotation
+    #: had no signed-in identity. Said on the result, since the payload looks
+    #: complete: Douyin's author feed simply starts a few posts late (#783).
+    guest_fallback: bool = False
 
 
 @dataclass(slots=True)
@@ -191,8 +222,18 @@ class _Attempt:
     outcome: Outcome
     payload: dict[str, Any] | None = None
     error_code: str | None = None
+    #: The classifier rule that decided :attr:`outcome`, where one did.
+    rule: str | None = None
     signer: str | None = None
     explain: Explanation | None = None
+    #: Whether this attempt went out through a proxy; None if it never got as
+    #: far as loading the identity. A failure to connect means one thing with
+    #: a proxy in between and another without one, and the caller is the one
+    #: who has to tell them apart.
+    proxied: bool | None = None
+    #: Whether the identity that answered holds a signed-in session; None if
+    #: it never got as far as loading one.
+    authenticated: bool | None = None
 
 
 class SignedRequest(Protocol):
@@ -221,6 +262,11 @@ class SignedRequest(Protocol):
     def headers(self) -> Mapping[str, str]: ...
 
     @property
+    def cookies(self) -> Mapping[str, str]:
+        """Cookies the signature was computed under; they override the jar's."""
+        ...
+
+    @property
     def signer(self) -> str: ...
 
     def signed_url(self, base_url: str) -> str: ...
@@ -232,7 +278,12 @@ ProxyResolver = Callable[[str], Awaitable[str | None]]
 #: `verifyFp` in the query is the `s_v_web_id` in the jar the request carries.
 #: Passing only the fingerprint is what let the two disagree, and a request whose
 #: signature names a different session than its cookies gets an empty payload.
-SignFn = Callable[[Platform, str, dict[str, Any], TransportIdentity], Awaitable[SignedRequest]]
+#:
+#: The request is passed whole for the same reason. This used to be the URL and
+#: the parameters, which is everything a GET has - and a POST's body and method
+#: never reached the signer, so a_bogus would have hashed an empty body for a
+#: request that went out carrying one.
+SignFn = Callable[[Platform, PlatformRequestSpec, TransportIdentity], Awaitable[SignedRequest]]
 
 
 class FetchService:
@@ -256,6 +307,9 @@ class FetchService:
         self._cooldown_base = cooldown_base
         self._cooldown_max = cooldown_max
         self._timeout = request_timeout
+        #: Identities whose device id could not be read, and when to try again.
+        #: In memory only: losing it on restart costs one extra page request.
+        self._device_id_retry_at: dict[str, float] = {}
 
     # -- one upstream call -------------------------------------------------
 
@@ -268,10 +322,13 @@ class FetchService:
         ctx: FetchContext,
         *,
         started: float,
+        login: LoginNeed = LoginNeed.NONE,
     ) -> _Attempt:
         platform = Platform(adapter.platform)
         try:
-            lease = await self._scheduler.acquire(endpoint, platform, identity_id=ctx.identity_id)
+            lease = await self._scheduler.acquire(
+                endpoint, platform, identity_id=ctx.identity_id, login=login
+            )
         except DtkError as exc:
             # A refusal is the shape of an outage, and it happens before there is
             # anything else to log. Without this row the Logs page falls silent
@@ -291,12 +348,18 @@ class FetchService:
             raise
 
         proxy_id: uuid.UUID | None = None
+        #: What the identity's device page set, carried by this call and kept
+        #: with its answer - see `_with_device_id` for why not before it.
+        carried: dict[str, str] = {}
         payload: dict[str, Any] | None = None
         status: int | None = None
         signer: str | None = None
         explanation: Explanation | None = None
         outcome = Outcome.NETWORK_ERROR
         error_code: str | None = None
+        rule: str | None = None
+        proxied: bool | None = None
+        authenticated: bool | None = None
 
         try:
             proxy_url = (
@@ -319,7 +382,10 @@ class FetchService:
                 outcome = Outcome.NETWORK_ERROR
                 error_code = "identity_gone"
                 return _Attempt(lease=lease, outcome=outcome, error_code=error_code)
+            identity, carried = await self._with_device_id(session, adapter, identity)
             proxy_id = await _proxy_id_of(session, identity.id)
+            proxied = identity.proxy_url is not None
+            authenticated = identity.authenticated
 
             # The identity's own browser values, not a constant. Douyin and
             # TikTok both echo the screen, the language, the OS and the browser
@@ -341,8 +407,12 @@ class FetchService:
                 fingerprint=identity.fingerprint,
                 proxy_url=identity.proxy_url,
             )
-            signed = await self._sign(platform, spec["url"], dict(spec.get("params") or {}), sender)
+            signed = await self._sign(platform, spec, sender)
             signer = signed.signer
+            # Same reason: when the signer sealed a cookie of its own - the
+            # browser page's msToken - the request carries that one, or the
+            # query and the Cookie header describe two sessions.
+            sender = with_signed_cookies(sender, signed.cookies)
 
             outbound = _to_transport_spec(spec, signed, endpoint)
             if ctx.explain:
@@ -354,11 +424,12 @@ class FetchService:
                     method=outbound.method,
                     url=_full_url(outbound),
                     headers=_outbound_headers(identity.fingerprint, outbound.headers),
-                    cookie_header=_cookie_header(identity.cookies),
+                    cookie_header=_cookie_header(sender.cookies),
                     identity_id=str(lease.identity_id),
                     signer=signer,
                     endpoint=endpoint,
                     proxy=mask_url(identity.proxy_url),
+                    body=outbound.body.decode("utf-8", "replace") if outbound.body else None,
                 )
 
             response = await self._transport.request(
@@ -369,7 +440,13 @@ class FetchService:
             status = response.status
             classification, payload = self._classify(adapter, endpoint, response)
             outcome = classification.outcome
+            rule = classification.rule
             error_code = _error_code_for(classification, payload)
+            if outcome not in _KEEPS_NOTHING:
+                await self._keep_cookies(
+                    session, identity, response, sealed=signed.cookies, carried=carried
+                )
+                carried = {}
         except TransportFailure as exc:
             outcome = Outcome.NETWORK_ERROR
             error_code = "transport_failure"
@@ -384,6 +461,11 @@ class FetchService:
             error_code = exc.code.value
             raise
         finally:
+            if carried:
+                # The call kept nothing of its own - no answer, or it raised
+                # before one - but the device page did answer, and what it set
+                # is kept the way any answer's is.
+                await self._absorb(session, lease.identity_id, carried)
             await self._scheduler.release(lease, outcome)
             await self._pool.record_outcome(
                 session,
@@ -412,9 +494,172 @@ class FetchService:
             outcome=outcome,
             payload=payload,
             error_code=error_code,
+            rule=rule,
             signer=signer,
             explain=explanation,
+            proxied=proxied,
+            authenticated=authenticated,
         )
+
+    async def _with_device_id(
+        self, session: AsyncSession, adapter: PlatformAdapter, identity: LiveIdentity
+    ) -> tuple[LiveIdentity, dict[str, str]]:
+        """``identity``, carrying the device id its platform issued its session.
+
+        Read once per identity, as that identity - its own jar, exit and TLS
+        profile - from a page that states it, and kept in the fingerprint. The
+        page is not scheduled or logged as a call: it is part of being a
+        visitor at all, the request a browser makes before any API call.
+
+        A failure leaves the identity as it was, and its requests go out with
+        a made-up id as they always did; the page is asked again after
+        :data:`DEVICE_ID_RETRY_SECONDS`, not on every call.
+
+        Also returns the cookies the page set that the jar would keep. The call
+        that follows carries them, as a browser's next request would, but they
+        are written with that call's own answer rather than here: writing locks
+        the identity's row until the caller commits, and the call is a signing
+        and an upstream round trip. Written here, as 5.1.12 did, every other
+        request on the identity waited for both whenever the page set a cookie
+        the jar did not hold - 1.9-2.0s of a 2.0s call, measured on Postgres
+        for #832, against 0.07s written with the answer.
+        """
+        page_url = adapter.device_id_page()
+        if page_url is None or identity.fingerprint.device_id:
+            return identity, {}
+        now = time.monotonic()
+        if self._device_id_retry_at.get(identity.id, 0.0) > now:
+            return identity, {}
+        sender = TransportIdentity(
+            id=identity.id,
+            platform=identity.platform,
+            cookies=identity.cookies,
+            fingerprint=identity.fingerprint,
+            proxy_url=identity.proxy_url,
+        )
+        device_id: str | None = None
+        response: RawResponse | None = None
+        try:
+            response = await self._transport.request(
+                sender,
+                TransportRequestSpec(
+                    url=page_url,
+                    headers={"Accept": "text/html,application/xhtml+xml"},
+                    endpoint=f"{identity.platform.value}.device_id",
+                ),
+                self._timeout,
+            )
+            if response.status == 200:
+                device_id = adapter.read_device_id(_text_of(response.body))
+        except TransportFailure as exc:
+            log.info(
+                "fetch.device_id.unreachable",
+                identity_id=identity.id,
+                error=type(exc.cause).__name__ if exc.cause else str(exc)[:120],
+            )
+        carried: dict[str, str] = {}
+        if response is not None and response.status < 500:
+            # The page is an answer like any other, and the call that follows
+            # goes out with what it set, as a browser's next request would. The
+            # same rules the pool writes by decide what that is, so the call
+            # never carries a value the jar would then refuse.
+            rotation = rotate(
+                identity.platform,
+                identity.cookies,
+                {
+                    name: value
+                    for name, value in response.set_cookies.items()
+                    if identity.cookies.get(name) != value
+                },
+            )
+            if rotation.changed:
+                carried = {name: rotation.jar[name] for name in rotation.changed}
+                identity = replace(identity, cookies=rotation.jar)
+        if not device_id:
+            self._device_id_retry_at[identity.id] = now + DEVICE_ID_RETRY_SECONDS
+            log.info("fetch.device_id.unread", identity_id=identity.id)
+            return identity, carried
+        self._device_id_retry_at.pop(identity.id, None)
+        await self._pool.remember_device_id(session, identity.id, device_id)
+        log.info("fetch.device_id.learned", identity_id=identity.id)
+        return (
+            replace(identity, fingerprint=replace(identity.fingerprint, device_id=device_id)),
+            carried,
+        )
+
+    async def _keep_cookies(
+        self,
+        session: AsyncSession,
+        identity: LiveIdentity,
+        response: RawResponse,
+        *,
+        sealed: Mapping[str, str] | None = None,
+        carried: Mapping[str, str] | None = None,
+    ) -> tuple[str, ...]:
+        """Keep what the platform set on ``response`` in the identity's jar.
+
+        Never at the cost of the response it came with: the request has already
+        spent the identity's rate budget, and a jar that missed one rotation
+        still answers. A failure is logged, not raised.
+
+        ``sealed`` are the cookies a signer put in place of the jar's for this
+        request - a browser page's own msToken. The platform's answer for
+        those names answers that page's session, not the identity's, and
+        writing it into the jar would have the next natively signed request
+        carry another session's token: on TikTok the one case worse than
+        sending none.
+
+        So an identity signed only by browser-rpc keeps the msToken it last
+        used natively (#832 review), and that is by design. A TikTok page with
+        a usable token always seals its own now, so the jar's is never sent and
+        is not spent: a token is spent by use, not by age (a 386-minute-old one
+        answered; docs/design/02-identity-pool.md). Keeping the answer's would
+        also change the jar on every call, and browser-rpc binds a page to the
+        whole jar, so every browser-signed call would rebind its page - 2.2s
+        against 12ms measured, before the readiness wait. If the jar's token
+        is spent by the time native signs it, the refusal carries a fresh one,
+        which is kept, and the identity's next call answers (4/4, doc 02).
+
+        A value the request already carried is not offered at all: the pool
+        reads the row under a lock to write it, and a platform re-sending what
+        the jar holds - TikTok's home page does it with tt_chain_token on every
+        load - is not worth one.
+
+        ``carried`` is what the identity's device page set before this request
+        (see `_with_device_id`), written here in the same lock; the response's
+        own value wins where both set a name.
+        """
+        offered = {
+            **(carried or {}),
+            **{
+                name: value
+                for name, value in response.set_cookies.items()
+                if name not in (sealed or {}) and identity.cookies.get(name) != value
+            },
+        }
+        return await self._absorb(session, identity.id, offered)
+
+    async def _absorb(
+        self, session: AsyncSession, identity_id: str, offered: Mapping[str, str]
+    ) -> tuple[str, ...]:
+        """`IdentityPool.absorb_cookies`, never at the cost of the response."""
+        if not offered:
+            return ()
+        try:
+            return await self._pool.absorb_cookies(session, identity_id, offered)
+        except Exception as exc:
+            # A database error here has already aborted the transaction, and
+            # the bookkeeping that follows fails on it with "current transaction
+            # is aborted"; the SQLSTATE is the only place the cause - a deadlock,
+            # say - is still named.
+            sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+            log.error(
+                "fetch.cookies.keep_failed",
+                identity_id=identity_id,
+                error=type(exc).__name__,
+                **({"sqlstate": sqlstate} if sqlstate else {}),
+            )
+            return ()
 
     def _classify(
         self, adapter: PlatformAdapter, endpoint: str, response: RawResponse
@@ -449,6 +694,13 @@ class FetchService:
         if marker:
             log.warning("fetch.risk_control", marker=marker, status=response.status)
             return Classification(Outcome.RISK_CONTROL, "platform.risk_marker", marker), payload
+        absent = spec.absent_when_null if spec is not None else None
+        if absent is not None and absent in payload and payload[absent] is None:
+            # A fact about what was asked for, so nothing is held against the
+            # identity that asked.
+            return Classification(
+                Outcome.BUSINESS_ERROR, "payload.absent", f"{absent} is null"
+            ), payload
         return classification, payload
 
     # -- public ------------------------------------------------------------
@@ -467,6 +719,17 @@ class FetchService:
         ctx = ctx or FetchContext()
         adapter = get_adapter(platform)
         started = time.monotonic()
+        spec = adapter.endpoints.specs.get(endpoint)
+        if spec is not None and spec.session_bound and ctx.identity_id is None:
+            # Here rather than only at the route, because this is where the
+            # cache is decided: whatever the entry point, an unpinned answer
+            # would be some account's private list, written to a shared key.
+            raise InvalidParam(
+                f"{endpoint} answers only about the identity sending it, so it "
+                "needs one pinned with `identity`",
+                details={"endpoint": endpoint, "field": "identity"},
+            )
+        login = spec.login_for(params) if spec is not None else LoginNeed.NONE
         digest = cache.cache_key(
             endpoint, params, include_raw=ctx.include_raw, egress=ctx.request_proxy
         )
@@ -520,7 +783,9 @@ class FetchService:
 
         last_error: str | None = None
         for attempt in range(attempts):
-            call = await self._call_once(session, adapter, endpoint, params, ctx, started=started)
+            call = await self._call_once(
+                session, adapter, endpoint, params, ctx, started=started, login=login
+            )
             duration_ms = _elapsed_ms(started)
             # Before any raise below, and overwritten by each attempt: what is
             # described is the last attempt made, which is the one whose failure
@@ -532,9 +797,13 @@ class FetchService:
                 last_error = call.error_code or "network_error"
                 if attempt + 1 < attempts:
                     continue  # a different identity, i.e. a different egress
-                raise Internal(
+                raise UpstreamUnreachable(
                     f"upstream unreachable after {attempts} attempts",
-                    details={"endpoint": endpoint, "last_error": last_error},
+                    details={
+                        "endpoint": endpoint,
+                        "last_error": last_error,
+                        "proxied": call.proxied,
+                    },
                 )
 
             if call.outcome is Outcome.RISK_CONTROL:
@@ -542,6 +811,15 @@ class FetchService:
                     "the platform returned a risk-control response",
                     retry_after=self._cooldown_base,
                     details={"endpoint": endpoint},
+                )
+
+            if call.outcome is Outcome.BUSINESS_ERROR and call.rule == LOGIN_REQUIRED_RULE:
+                # The platform said who may ask, not that nothing is there. Read
+                # as NOT_FOUND it told a guest's keyword search that the search
+                # did not exist (TikTok's 2483, 2026-11-02).
+                raise IdentityLoginRequired(
+                    "the platform answered that this request needs a signed-in identity",
+                    details={"endpoint": endpoint, "authenticated": bool(call.authenticated)},
                 )
 
             if call.outcome is Outcome.BUSINESS_ERROR:
@@ -555,9 +833,20 @@ class FetchService:
                 # endpoint answers in a shape this build cannot read.
                 raise UpstreamChanged("response.body", platform=platform.value)
 
-            parsed = parse(call.payload)
+            payload = await self._follow_up(
+                session, adapter, endpoint, call.payload, ctx, params=params
+            )
+            parsed = parse(payload)
             result = _dump(parsed, include_raw=ctx.include_raw)
-            if cacheable:
+            guest_fallback = (
+                login is LoginNeed.PREFERRED
+                and ctx.identity_id is None
+                and call.authenticated is False
+            )
+            # Not cached: the cache would go on serving the guest's shorter
+            # answer for its whole TTL after a signed-in identity is imported,
+            # to callers who were never told it came from a guest.
+            if cacheable and not guest_fallback:
                 await cache.put(digest, result, cache_ttl)
 
             return FetchResult(
@@ -569,9 +858,72 @@ class FetchService:
                 request_id=ctx.request_id,
                 signer=call.signer,
                 explain=call.explain,
+                guest_fallback=guest_fallback,
             )
 
         raise Internal("unreachable")
+
+    async def _follow_up(
+        self,
+        session: AsyncSession,
+        adapter: PlatformAdapter,
+        endpoint: str,
+        payload: dict[str, Any],
+        ctx: FetchContext,
+        *,
+        params: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """The second call an answer asked for, folded in - or the answer alone.
+
+        Made through :meth:`_call_once` like any other call: scheduled on the
+        pool, signed, classified and written to the request log under its own
+        endpoint name, so it is neither free nor invisible. A pinned request
+        stays on its identity.
+
+        Its failure is not the request's, unless the plan says it is.
+        Bilibili's detail is a real answer without its ``playurl``; refusing it
+        because the second call was rate-limited would turn a missing stream
+        into a missing post. The weekly selection's index is not an answer at
+        all without the issue it names, and a part asked for by number is not
+        that part without its own file - those raise as the first call would.
+        """
+        plan = adapter.follow_up(endpoint, payload, params)
+        if plan is None:
+            return payload
+        spec = adapter.endpoints.specs.get(plan.endpoint)
+        login = spec.login_for(plan.params) if spec is not None else LoginNeed.NONE
+        try:
+            extra = await self._call_once(
+                session,
+                adapter,
+                plan.endpoint,
+                dict(plan.params),
+                ctx,
+                started=time.monotonic(),
+                login=login,
+            )
+        except DtkError as exc:
+            log.warning(
+                "fetch.follow_up_refused",
+                endpoint=plan.endpoint,
+                after=endpoint,
+                error=exc.code.value,
+            )
+            if plan.required:
+                raise
+            return payload
+        if extra.outcome is not Outcome.OK or extra.payload is None:
+            log.warning(
+                "fetch.follow_up_failed",
+                endpoint=plan.endpoint,
+                after=endpoint,
+                outcome=extra.outcome.value,
+                error=extra.error_code,
+            )
+            if plan.required:
+                raise _follow_up_error(plan.endpoint, extra.outcome, self._cooldown_base)
+            return payload
+        return plan.merge(payload, extra.payload)
 
     async def _log_request(
         self,
@@ -688,7 +1040,6 @@ def _to_transport_spec(
     were dropped on the floor here, so every Douyin request arrived with a
     signature in the query and none in the headers, and was answered 403.
     """
-    body = spec.get("body")
     return TransportRequestSpec(
         # The signed URL, so the query is exactly what was signed. `params` is
         # left None deliberately: handing the transport both would let it
@@ -697,15 +1048,39 @@ def _to_transport_spec(
         method=str(spec.get("method") or "GET"),
         params=None if signed.query else {k: str(v) for k, v in (spec.get("params") or {}).items()},
         headers={**dict(spec.get("headers") or {}), **dict(signed.headers)},
-        json_body=body if body else None,
+        # The very bytes the signer hashed - the platform built them once.
+        body=spec.get("body") or None,
         # The logical name, never the signed URL: that carries tokens and would
         # make every log line unique and uncorrelatable.
         endpoint=endpoint,
     )
 
 
+def _follow_up_error(endpoint: str, outcome: Outcome, cooldown: int) -> DtkError:
+    """What a required follow-up's failure is, in the first call's terms."""
+    details = {"endpoint": endpoint}
+    if outcome is Outcome.RISK_CONTROL:
+        return UpstreamRiskControl(
+            "the platform returned a risk-control response",
+            retry_after=cooldown,
+            details=details,
+        )
+    if outcome is Outcome.BUSINESS_ERROR:
+        return NotFound("the requested content does not exist or is unavailable", details=details)
+    if outcome is Outcome.NETWORK_ERROR:
+        return UpstreamUnreachable("upstream unreachable", details=details)
+    # Classified OK and still no JSON: the shape this build cannot read.
+    return UpstreamChanged("response.body", platform=endpoint.split(".", 1)[0])
+
+
 def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
+
+
+def _text_of(body: Any) -> str:
+    if isinstance(body, bytes | bytearray | memoryview):
+        return bytes(body).decode("utf-8", errors="replace")
+    return str(body or "")
 
 
 def _reject_reason(exc: DtkError) -> str | None:

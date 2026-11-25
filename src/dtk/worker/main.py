@@ -147,6 +147,7 @@ def explain_meta(explanation: Explanation) -> dict[str, Any]:
         "signer": explanation.signer,
         "endpoint": explanation.endpoint,
         "proxy": explanation.proxy,
+        "body": explanation.body,
     }
 
 
@@ -255,6 +256,7 @@ class DatabaseTaskStore:
     async def complete(self, task_id: uuid.UUID, result: dict[str, Any]) -> None:
         async with self._session_factory() as session:
             await tasks.finish(session, task_id, result=result)
+        await self._wake(task_id)
         await self._clear_attempts(task_id)
 
     async def fail(
@@ -274,7 +276,15 @@ class DatabaseTaskStore:
                 result={"data": None, "meta": meta} if meta else None,
                 error=error,
             )
+        await self._wake(task_id)
         await self._clear_attempts(task_id)
+
+    async def _wake(self, task_id: uuid.UUID) -> None:
+        # After the session block, which is the commit - see
+        # tasks.wake_waiters. Suppressed: the row is already final, and a
+        # waiter that misses the wake-up rereads it within five seconds anyway.
+        with contextlib.suppress(Exception):
+            await tasks.wake_waiters(task_id)
 
     async def _clear_attempts(self, task_id: uuid.UUID) -> None:
         with contextlib.suppress(Exception):
@@ -579,8 +589,7 @@ class TaskWorker:
         hosts = extra_url_hosts(self._config())
         fetcher = parsing.egress_fetcher(self._egress, extra_hosts=hosts)
         if named:
-            completed = await parsing.complete(run.endpoint, run.params, fetcher, extra_hosts=hosts)
-            return run.endpoint, completed
+            return await parsing.complete(run.endpoint, run.params, fetcher, extra_hosts=hosts)
 
         endpoint, resolved = await parsing.plan(url, fetcher, extra_hosts=hosts)
         # Pass through anything the caller also set, such as include_raw.
@@ -621,6 +630,12 @@ class TaskWorker:
             return params
 
         definition = registry.definition_for(endpoint)
+        if definition.platform not in registry.HANDLE_PLATFORMS:
+            # Bilibili has no handles: a number there is the author's id, and
+            # looking it up as a handle asked its profile for a parameter it
+            # does not have - every Bilibili author call failed here, found by
+            # the end-to-end run rather than by a unit test.
+            return params
         if registry.UNIQUE_ID in definition.accepts:
             # The endpoint takes the handle as it stands; `_route_handle` will
             # put it in the right slot and no lookup is needed.
@@ -754,7 +769,11 @@ class TaskWorker:
             # database out of whatever strangers happened to paste.
             if parsed and not run.is_demo:
                 await self._record_snapshots(session, parsed[-1], config)
-                await self._archive(session, parsed[-1], config)
+                # A detail read for a later part carries that part's file.
+                # Archived, it would replace the first part's, and the next
+                # download of the post would store this part under its name.
+                if not _names_a_later_part(params):
+                    await self._archive(session, parsed[-1], config)
 
         return _result_payload(
             call.definition.name, call.platform, result, pinned=ctx.identity_id is not None
@@ -801,6 +820,11 @@ class TaskWorker:
             log.debug("worker.archived", contents=written)
 
 
+def _names_a_later_part(params: Mapping[str, Any]) -> bool:
+    part = params.get(registry.PART)
+    return part is not None and str(part).strip().isdigit() and int(str(part).strip()) > 1
+
+
 def _snapshot_targets(parsed: Any) -> tuple[Any, ...]:
     if isinstance(parsed, Content | Author):
         return (parsed,)
@@ -833,6 +857,10 @@ def _result_payload(
         # out, and the MCP surface hides it from agents entirely. Confirming a
         # value the caller supplied is a different act from disclosing one.
         meta["identity_id"] = result.identity_id
+    if result.guest_fallback:
+        # Only when true. A guest's page looks complete, so this flag is the
+        # one way a caller learns the newest items may be missing from it.
+        meta["guest_fallback"] = True
     data = result.payload
     if isinstance(data, dict) and "items" in data and "has_more" in data:
         meta["cursor"] = {"next": data.get("cursor"), "has_more": bool(data.get("has_more"))}

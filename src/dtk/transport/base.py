@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from dtk.core.errors import DtkError, ErrorCode
@@ -100,6 +100,12 @@ class Fingerprint:
     #: and Safari, which is why it is optional rather than defaulted: a value
     #: invented for a browser that does not report one is a contradiction.
     device_memory: int | None = None
+    #: The device id the platform issued this session - TikTok's ``wid``, read
+    #: off one of its own pages - which the query sends back as ``device_id``.
+    #: TikTok binds a video link to it and the session's tt_chain_token
+    #: together: asked with any other device id, the API answered with links no
+    #: cookie would open (#831, measured 2026-11-20). None until it is read.
+    device_id: str | None = None
 
     @property
     def emulatable(self) -> bool:
@@ -142,6 +148,17 @@ class RawResponse:
     body: bytes = b""
     final_url: str = ""
     elapsed_ms: int = 0
+    #: Cookies the platform set on this response and did not delete, by name.
+    #:
+    #: Handed back rather than written anywhere by the transport, because the
+    #: transport has no database session and the one it could open would wait on
+    #: the caller's: the request's own transaction has already written the
+    #: identity's row (its device id, its last use) and holds that row until it
+    #: commits, after this response is returned. A sink with a session of its
+    #: own was the first design; it was never wired, and wiring it would have
+    #: deadlocked on exactly that row. Kept out of ``repr`` because the values
+    #: are credentials.
+    set_cookies: Mapping[str, str] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         if any(name != name.lower() for name in self.headers):
@@ -299,15 +316,20 @@ class TransportIdentity:
         )
 
 
-class CookieSink(Protocol):
-    """Receives cookies the platform set during a request.
+def with_signed_cookies(
+    identity: TransportIdentity, cookies: Mapping[str, str] | None
+) -> TransportIdentity:
+    """``identity`` sending ``cookies`` in place of its own values for those names.
 
-    The transport does not persist anything itself: it has no database session
-    and no encryption key. Rotating `ttwid` or `msToken` values have to reach the
-    identity record or the next request replays a stale jar.
+    For the cookies a signature was computed under: a browser page seals its own
+    ``msToken``, and a request whose Cookie header names another one describes
+    two sessions at once. The identity's record is not touched - the override
+    lasts one request, and whatever the platform rotates in reply goes back to
+    the pool the usual way.
     """
-
-    async def __call__(self, identity_id: str, cookies: Mapping[str, str]) -> None: ...
+    if not cookies:
+        return identity
+    return replace(identity, cookies={**identity.cookies, **cookies})
 
 
 class Transport(Protocol):
@@ -337,7 +359,6 @@ __all__ = [
     "DEFAULT_CHARSET",
     "MAX_TIMEOUT_SECONDS",
     "REDACTED_PROXY",
-    "CookieSink",
     "Fingerprint",
     "IdentityLike",
     "RawResponse",
@@ -347,4 +368,5 @@ __all__ = [
     "TransportIdentity",
     "mask_proxy_url",
     "scrub_url",
+    "with_signed_cookies",
 ]

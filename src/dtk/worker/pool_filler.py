@@ -26,7 +26,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Final
 
 from dtk.core.config import Config
 from dtk.core.crypto import Cipher
@@ -36,7 +36,12 @@ from dtk.core.redis import run_script
 from dtk.core.types import IdentitySource, IdentityState, Platform
 from dtk.identity import mint_log
 from dtk.identity.marks import pool_marks
-from dtk.identity.minting import BrowserRpcClient, BrowserRpcUnavailable
+from dtk.identity.minting import (
+    BrowserRpcClient,
+    BrowserRpcUnavailable,
+    NativeMinter,
+    NativeMintFailed,
+)
 from dtk.identity.pool import IdentityPool
 from dtk.worker.alerts import Alerter, NotifyEvent, raise_alert
 
@@ -58,6 +63,21 @@ return 0
 """
 
 SessionFactory = Callable[[], Any]
+
+
+#: The two ways an identity is minted; see :meth:`PoolFiller._route`.
+_BROWSER: Final = "browser"
+_NATIVE: Final = "native"
+
+#: Reasons a sweep passes a platform over without an attempt. Recorded apart
+#: from the attempts (:func:`mint_log.skipped`); the other reasons
+#: :meth:`PoolFiller._pick_proxy` gives are a mint that could not go ahead.
+_SKIPS: Final = frozenset({"no_free_proxy"})
+
+#: How many sweeps a skip record outlives the last skip by. More than one,
+#: because the survey picks the neediest platform and may pass this one by for
+#: a tick or two while it is still stuck.
+_SKIP_SWEEPS: Final = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,9 +117,11 @@ class PoolFiller:
         clock: Callable[[], float] = time.monotonic,
         distributed_lock: bool = True,
         alerter: Alerter | None = None,
+        native: NativeMinter | None = None,
     ) -> None:
         self._pool = pool
         self._rpc = rpc
+        self._native = native
         self._cipher = cipher
         self._alerter = alerter
         self._config: Callable[[], Config] = config if callable(config) else (lambda: config)
@@ -108,8 +130,12 @@ class PoolFiller:
         self._now = clock
         self._distributed_lock = distributed_lock
         self._local_lock = asyncio.Lock()
-        self._failures = 0
-        self._blocked_until = 0.0
+        # Per route - the browser, or plain HTTP - because the two fail for
+        # unrelated reasons. One counter for both meant a browser container
+        # that was down stopped the Bilibili pool from refilling, though
+        # nothing about minting a Bilibili guest touches the browser.
+        self._failures: dict[str, int] = {}
+        self._blocked_until: dict[str, float] = {}
         #: Platforms currently being refilled. Entered below ``min_size`` and
         #: left at ``target_size``, so the pool is not re-triggered every tick
         #: while it sits one identity under the mark.
@@ -119,16 +145,52 @@ class PoolFiller:
 
     @property
     def enabled(self) -> bool:
-        """False when no browser-rpc is configured: manual imports only."""
+        """Whether any platform can be minted here at all.
+
+        Not the same as "browser-rpc is configured" any more: Bilibili guests
+        are minted over plain HTTP (:mod:`dtk.identity.minting.native`), so an
+        install with no browser container still refills that pool.
+        """
+        return self._rpc_configured or self._native is not None
+
+    @property
+    def _rpc_configured(self) -> bool:
         return self._rpc is not None and self._rpc.configured
+
+    def can_mint(self, platform: Platform) -> bool:
+        """Whether this filler can mint ``platform``: natively, or by browser."""
+        if self._native is not None and self._native.supports(platform):
+            return True
+        return self._rpc_configured
+
+    def _route(self, platform: Platform) -> str:
+        """How ``platform`` is minted here, which is what a failure says
+        something about."""
+        if self._native is not None and self._native.supports(platform):
+            return _NATIVE
+        return _BROWSER
 
     @property
     def failures(self) -> int:
-        return self._failures
+        """Consecutive failures, summed over both routes."""
+        return sum(self._failures.values())
 
     @property
     def backing_off(self) -> bool:
-        return self._now() < self._blocked_until
+        """Whether either route is resting after failures."""
+        now = self._now()
+        return any(now < until for until in self._blocked_until.values())
+
+    def _route_backing_off(self, platform: Platform) -> bool:
+        return self._now() < self._blocked_until.get(self._route(platform), 0.0)
+
+    def _route_platforms(self, route: str) -> tuple[Platform, ...]:
+        """Every platform minted by ``route``: what one of its failures rests."""
+        return tuple(platform for platform in Platform if self._route(platform) == route)
+
+    @property
+    def _skip_ttl(self) -> int:
+        return max(1, int(self._options.interval_seconds * _SKIP_SWEEPS))
 
     # -- one tick ----------------------------------------------------------
 
@@ -141,10 +203,10 @@ class PoolFiller:
         target = await self.survey()
         if not self.enabled:
             return FillResult(platform=target, reason="disabled")
-        if self.backing_off:
-            return FillResult(platform=target, reason="backoff")
         if target is None:
-            return FillResult(reason="satisfied")
+            # Nothing it could mint now. Either every pool is at its mark, or
+            # the ones that are not are minted by a route that is resting.
+            return FillResult(reason="backoff" if self.backing_off else "satisfied")
         return await self.top_up_once(target)
 
     async def survey(self) -> Platform | None:
@@ -207,6 +269,11 @@ class PoolFiller:
                     self._filling.discard(platform)
                 if platform not in self._filling:
                     continue
+                # Below the mark and still alerted on above, but not chosen:
+                # with no browser, a Douyin pool cannot be refilled here, and
+                # choosing it every tick would starve the one that can be.
+                if not self.can_mint(platform) or self._route_backing_off(platform):
+                    continue
                 if worst is None or usable < worst[0]:
                     worst = (usable, platform)
 
@@ -243,7 +310,7 @@ class PoolFiller:
         browser that is down should not silence automatic refill for an hour,
         which is where the shared counter takes it.
         """
-        if not self.enabled:
+        if not self.can_mint(platform):
             return FillResult(platform=platform, reason="disabled")
         if not await self._take_local_lock(wait_seconds):
             return FillResult(platform=platform, reason="busy")
@@ -279,15 +346,24 @@ class PoolFiller:
         proxy_id: uuid.UUID | None = None,
         shared_backoff: bool = True,
     ) -> FillResult:
-        assert self._rpc is not None  # guarded by `enabled`
+        native = (
+            self._native if self._native is not None and self._native.supports(platform) else None
+        )
+        minter: BrowserRpcClient | NativeMinter | None = native or self._rpc
+        assert minter is not None  # guarded by `can_mint`
         async with self._session_factory() as session:
             proxy, reason = await self._pick_proxy(session, platform, proxy_id=proxy_id)
             if reason is not None:
                 log.info("worker.mint.skipped", platform=platform.value, reason=reason)
                 # A skip is an outcome an operator has to be able to see. A
-                # pool that will not refill because every proxy is down looks
-                # exactly like one nobody asked to refill, otherwise.
-                await mint_log.finished(platform, ok=False, reason=reason)
+                # pool that will not refill because every proxy is taken looks
+                # exactly like one nobody asked to refill, otherwise. But it is
+                # not a failed attempt, and recorded as one it read as a pool
+                # failing twenty times in a row (#807).
+                if reason in _SKIPS:
+                    await mint_log.skipped(platform, reason=reason, ttl=self._skip_ttl)
+                else:
+                    await mint_log.finished(platform, ok=False, reason=reason)
                 return FillResult(platform=platform, reason=reason)
 
             proxy_url = None
@@ -312,7 +388,7 @@ class PoolFiller:
             # stale "minting..." for seconds rather than until someone notices.
             await mint_log.started(platform, ttl=self._options.lock_ttl_seconds)
             try:
-                result = await self._rpc.mint(platform, proxy_url=proxy_url, geo_hint=geo_hint)
+                result = await minter.mint(platform, proxy_url=proxy_url, geo_hint=geo_hint)
                 identity_id = await self._pool.add(
                     session,
                     platform=platform,
@@ -325,6 +401,10 @@ class PoolFiller:
                 return await self._failed(
                     platform, "rpc_unavailable", exc, shared_backoff=shared_backoff
                 )
+            except NativeMintFailed as exc:
+                return await self._failed(
+                    platform, "mint_refused", exc, shared_backoff=shared_backoff
+                )
             except ValueError as exc:
                 # A fingerprint with no inferable browser. Doc 02: refuse it
                 # rather than pair a default UA with an unknown TLS profile.
@@ -332,8 +412,9 @@ class PoolFiller:
                     platform, "unusable_fingerprint", exc, shared_backoff=shared_backoff
                 )
 
-        self._failures = 0
-        self._blocked_until = 0.0
+        route = self._route(platform)
+        self._failures.pop(route, None)
+        self._blocked_until.pop(route, None)
         log.info(
             "worker.mint.succeeded",
             platform=platform.value,
@@ -341,7 +422,7 @@ class PoolFiller:
             proxy_id=str(proxy.id) if proxy is not None else None,
         )
         await mint_log.finished(platform, ok=True, reason="minted", identity_id=identity_id)
-        await mint_log.recovered()
+        await mint_log.recovered(self._route_platforms(route))
         return FillResult(
             platform=platform,
             identity_id=identity_id,
@@ -374,22 +455,27 @@ class PoolFiller:
             await mint_log.finished(platform, ok=False, reason=reason, error=str(exc))
             return FillResult(platform=platform, reason=reason)
 
-        self._failures += 1
+        route = self._route(platform)
+        failures = self._failures.get(route, 0) + 1
+        self._failures[route] = failures
         delay = min(
-            self._options.backoff_initial_seconds * (2 ** (self._failures - 1)),
+            self._options.backoff_initial_seconds * (2 ** (failures - 1)),
             self._options.backoff_max_seconds,
         )
-        self._blocked_until = self._now() + delay
+        self._blocked_until[route] = self._now() + delay
         log.warning(
             "worker.mint.failed",
             platform=platform.value,
             reason=reason,
-            consecutive_failures=self._failures,
+            route=route,
+            consecutive_failures=failures,
             backoff_seconds=int(delay),
             error=str(exc)[:200],
         )
         await mint_log.finished(platform, ok=False, reason=reason, error=str(exc))
-        await mint_log.backing_off(failures=self._failures, seconds=delay)
+        await mint_log.backing_off(
+            self._route_platforms(route), route=route, failures=failures, seconds=delay
+        )
         return FillResult(platform=platform, reason=reason)
 
     # -- proxies -----------------------------------------------------------
@@ -400,9 +486,16 @@ class PoolFiller:
         """Choose an egress no live identity of this platform already uses.
 
         Two identities behind one exit address is the recombination doc 02
-        forbids, so when every proxy is taken this job waits rather than
+        forbids, so when every exit is taken this job waits rather than
         doubling up. A deployment with no proxies at all mints on the direct
         egress, which is what a user without proxies asked for.
+
+        With proxies, the direct egress is one more exit, tried after them and
+        held to one identity like each of them (``pool.<platform>.direct_egress``).
+        It used to drop out the moment a proxy was added, which made adding
+        one proxy shrink the pool to a single identity per platform (#807).
+        None for the proxy with no reason is how "mint on the direct egress"
+        is spelled.
 
         A named ``proxy_id`` overrides that search rather than being checked
         against it: the operator chose this exit deliberately, and a one-proxy
@@ -419,7 +512,13 @@ class PoolFiller:
             return free[0], None
         if not await proxies.list_all():
             return None, None
+        if self._direct_counts(platform) and await proxies.direct_unbound(platform):
+            return None, None
         return None, "no_free_proxy"
+
+    def _direct_counts(self, platform: Platform) -> bool:
+        """Whether the direct egress is an exit for ``platform`` beside the proxies."""
+        return bool(self._config().get(f"pool.{platform.value}.direct_egress"))
 
     def _decrypt(self, proxy: Any) -> str | None:
         if self._cipher is None:

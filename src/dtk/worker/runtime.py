@@ -16,7 +16,7 @@ import contextlib
 import signal
 import uuid
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -24,7 +24,7 @@ import httpx
 
 from dtk.core.config import BootstrapSettings, Config
 from dtk.core.crypto import Cipher
-from dtk.core.db import dispose_engine, init_engine, session_scope
+from dtk.core.db import connection_budget, dispose_engine, init_engine, session_scope
 from dtk.core.logging import configure, get_logger
 from dtk.core.redis import close_redis, get_redis, init_redis
 from dtk.core.types import Platform
@@ -120,14 +120,16 @@ async def build_runtime(
     channels - and those still need a restart. The ones passed as
     ``config_source`` follow the database.
     """
-    from dtk.identity.minting import BrowserRpcClient
+    from dtk.identity.minting import BrowserRpcClient, NativeMinter
     from dtk.media import DownloaderClient
     from dtk.ops.notify import notifier_from_config, signing_alert_hook
+    from dtk.platforms.base import RequestSpec as PlatformRequestSpec
     from dtk.scheduler.circuit import circuit_config
     from dtk.scheduler.scheduler import Scheduler, SchedulerConfig
     from dtk.signing import NativeSigner, RpcSigner, SignerRegistry, native_signers
     from dtk.signing.base import RequestSpec as SigningRequestSpec
     from dtk.signing.base import SignedParams, SigningSession, StaticFingerprint
+    from dtk.transcriber import TranscriberClient
     from dtk.transport import TransportIdentity, WreqTransport
     from dtk.worker.maintenance import Maintenance, MaintenanceConfig
     from dtk.worker.pool_filler import FillerConfig, PoolFiller
@@ -158,6 +160,11 @@ async def build_runtime(
             circuit=circuit_config(current),
         ),
         alerter=notifier,
+        # Read per request from the live source, so flipping it on the
+        # scheduler page takes effect without restarting the worker.
+        guests_first=lambda platform: bool(
+            config_source().get(f"pool.{platform.value}.guests_first")
+        ),
     )
     transport = WreqTransport()
 
@@ -188,7 +195,7 @@ async def build_runtime(
     )
 
     async def sign(
-        platform: Platform, url: str, params: dict[str, Any], sender: TransportIdentity
+        platform: Platform, spec: PlatformRequestSpec, sender: TransportIdentity
     ) -> SignedParams:
         # Returned whole rather than as a bare parameter dict: `.signer` is a
         # request_log column the Logs page renders, and unwrapping here is what
@@ -200,7 +207,9 @@ async def build_runtime(
         # `screen_width` the same request echoes in its query string. The ops
         # path already did this correctly through the same helper.
         return await signer_registry.sign(
-            SigningRequestSpec.get(url, {k: str(v) for k, v in params.items()}),
+            # Method, headers and body too: a_bogus hashes the body of a POST,
+            # and reads the Content-Type to decide whether it can.
+            SigningRequestSpec.of(spec),
             StaticFingerprint.of(sender.fingerprint),
             # The identity's own session, so the browser signs in a page holding
             # exactly the cookies this request will be sent with.
@@ -228,10 +237,28 @@ async def build_runtime(
     downloader: DownloaderClient | None = None
     if settings.downloader_url:
         downloader = DownloaderClient(settings.downloader_url, token=settings.downloader_token)
+    transcriber: TranscriberClient | None = None
+    if settings.transcriber_url:
+        transcriber = TranscriberClient(
+            settings.transcriber_url,
+            token=settings.transcriber_token,
+            timeout_seconds=settings.transcriber_timeout_seconds,
+        )
 
     filler_options = FillerConfig()
     prober_options = ProberConfig()
     maintenance_options = MaintenanceConfig()
+    if transcriber is not None:
+        # Its own stale window: the op holds its task for up to the transcriber
+        # timeout, and is only an orphan once it has outlived that by as much
+        # as any other task is given.
+        maintenance_options = replace(
+            maintenance_options,
+            long_task_seconds={
+                "media.transcribe": int(transcriber.timeout_seconds)
+                + maintenance_options.stale_task_seconds,
+            },
+        )
     watcher_options = WatcherConfig()
     filler = PoolFiller(
         pool=pool,
@@ -240,6 +267,9 @@ async def build_runtime(
         config=config_source,
         options=filler_options,
         alerter=notifier,
+        # Bilibili guests are plain HTTP, minted through the same transport the
+        # identity will then use; no browser container needed for them.
+        native=NativeMinter(transport),
     )
     prober = ProxyProber(
         cipher=cipher,
@@ -273,7 +303,9 @@ async def build_runtime(
             notifier=notifier,
             rpc=rpc_client,
             downloader=downloader,
+            transcriber=transcriber,
             fetch=fetch,
+            connection_budget=connection_budget(settings.db_pool_size, settings.db_max_overflow),
         ),
         session_factory=session_scope,
     )
@@ -308,6 +340,8 @@ async def build_runtime(
     closers: list[Callable[[], Any]] = [transport.close, prober.aclose, notifier.aclose]
     if downloader is not None:
         closers.append(downloader.aclose)
+    if transcriber is not None:
+        closers.append(transcriber.aclose)
     if rpc_http is not None:
         # The client was injected, so browser-rpc will not close it for us.
         closers.append(rpc_http.aclose)
@@ -333,7 +367,11 @@ async def _process_scope(
     settings: BootstrapSettings,
 ) -> AsyncIterator[Callable[[], Config]]:  # pragma: no cover - process wiring
     configure(level=settings.log_level, json_output=settings.log_json)
-    init_engine(settings.database_url)
+    init_engine(
+        settings.database_url,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+    )
     init_redis(settings.redis_url)
     from dtk.services.settings_store import load_config, start_watcher, stop_watcher
 

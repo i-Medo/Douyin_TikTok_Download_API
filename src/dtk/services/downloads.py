@@ -31,15 +31,16 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 
-from sqlalchemy import delete, func, select, tuple_, update
+from sqlalchemy import delete, func, literal, or_, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dtk.core.logging import get_logger
-from dtk.core.types import Platform
+from dtk.core.types import ContentKind, Platform
 from dtk.db.base import affected
-from dtk.db.models import ArchivedContent, MediaDownload
+from dtk.db.models import ArchivedContent, MediaDownload, Transcription
 from dtk.media import domains
 from dtk.media import plan as planner
+from dtk.services.archive import LIKE_ESCAPE, escape_like
 
 log = get_logger(__name__)
 
@@ -63,6 +64,9 @@ class DownloadFilter:
     pinned: bool | None = None
     #: True lists only what is still on disk, False only what has been evicted.
     on_disk: bool | None = None
+    #: A substring of the post's title or author as the archive holds them, or
+    #: of its content id. The download row itself has neither name.
+    query: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +81,16 @@ def mirrors_are_stale(row: ArchivedContent, *, max_age_seconds: int) -> bool:
     stored yesterday answered 403 on 2026-09-08. Douyin's lasted longer. Rather
     than encode a per-platform guess, the age of the observation decides, and
     the window is a setting.
+
+    A video whose archived media has no video in it is stale however fresh it
+    is. Bilibili's lists - the popular boards, an uploader's posts - carry a
+    cover and no stream, and a post archived from one and downloaded inside
+    the window used to be planned from that row: the download finished
+    "done" with the cover and nothing else (measured 2026-10-19).
     """
     if max_age_seconds <= 0:
+        return True
+    if lacks_its_video(row) or predates_live_clips(row):
         return True
     seen = row.last_seen_at
     if seen is None:
@@ -86,6 +98,28 @@ def mirrors_are_stale(row: ArchivedContent, *, max_age_seconds: int) -> bool:
     if seen.tzinfo is None:
         seen = seen.replace(tzinfo=UTC)
     return datetime.now(UTC) - seen > timedelta(seconds=max_age_seconds)
+
+
+def lacks_its_video(row: Any) -> bool:
+    """Whether a video post's archived media has no video stream in it."""
+    media = row.media if isinstance(getattr(row, "media", None), dict) else {}
+    return getattr(row, "kind", None) == ContentKind.VIDEO.value and not media.get("video")
+
+
+def predates_live_clips(row: Any) -> bool:
+    """Whether an album was archived by a parser that dropped live photo clips.
+
+    Every slide archived since #792 states ``video``, as ``null`` on a still,
+    so a slide with no such key at all was written before. Planned from it, a
+    live photo album would store its stills and call the download done - the
+    same half answer a video post without its stream gets. One re-parse writes
+    the key, and the question does not come up for that post again.
+    """
+    media = row.media if isinstance(getattr(row, "media", None), dict) else {}
+    images = media.get("images")
+    if getattr(row, "kind", None) != ContentKind.IMAGE_ALBUM.value or not isinstance(images, list):
+        return False
+    return any(isinstance(image, dict) and "video" not in image for image in images)
 
 
 def plan_for(row: ArchivedContent, *, max_file_bytes: int) -> planner.Plan:
@@ -98,25 +132,51 @@ def job_payload(
     download: MediaDownload,
     row: ArchivedContent,
     plan: planner.Plan,
+    *,
+    cookies: Sequence[Mapping[str, str]] = (),
 ) -> dict[str, Any]:
     """The submission the sidecar receives.
 
-    Note what is not in it: no cookie, no proxy, no key, no database address.
-    The sidecar is given mirrors, the host allowlist it may reach for this one
-    platform, and a ceiling. Sending the union of both platforms' domains would
-    make "a Douyin post reaching a TikTok CDN" indistinguishable from a normal
-    job, so the allowlist is narrowed to the platform the post came from.
+    Note what is not in it: no proxy, no key, no database address, and no
+    cookie but the ones :data:`dtk.media.plan.BOUND_COOKIES` names - for TikTok
+    the single anonymous token its CDN binds a video link to. The sidecar is
+    given mirrors, the host allowlist it may reach for this one platform, and a
+    ceiling. Sending the union of both platforms' domains would make "a Douyin
+    post reaching a TikTok CDN" indistinguishable from a normal job, so the
+    allowlist is narrowed to the platform the post came from.
     """
     platform = Platform(row.platform)
+    meta = planner.sidecar(row, plan)
+    if download.part:
+        meta["part"] = download.part
+    payload = _payload(download, row, plan, platform, meta)
+    allowed = {cookie.name for cookie in planner.BOUND_COOKIES.get(platform, ())}
+    carried = [dict(cookie) for cookie in cookies if cookie.get("name") in allowed]
+    # Absent rather than empty when there is none, so a Douyin job reads
+    # exactly as it did before TikTok needed this.
+    if carried:
+        payload["cookies"] = carried
+    return payload
+
+
+def _payload(
+    download: MediaDownload,
+    row: ArchivedContent,
+    plan: planner.Plan,
+    platform: Platform,
+    meta: dict[str, Any],
+) -> dict[str, Any]:
     return {
         "id": download.id.hex,
         "platform": row.platform,
         "author_uid": row.author_uid,
-        "content_id": row.content_id,
+        # The last path segment, which is how the sidecar names the directory
+        # - so a later part has to be spelt here the way `directory_of` does.
+        "content_id": _segment(row.content_id, download.part),
         "domains": sorted(domains.MEDIA_DOMAINS_BY_PLATFORM.get(platform, frozenset())),
         "user_agent": planner.USER_AGENT,
         "referer": planner.REFERER.get(platform, ""),
-        "meta": planner.sidecar(row, plan),
+        "meta": meta,
         "items": [item.as_payload() for item in plan.items],
     }
 
@@ -128,12 +188,27 @@ def job_payload(
 PENDING_AUTHOR: Final = "_pending"
 
 
-def directory_of(row: ArchivedContent) -> str:
-    return f"{row.platform}/{row.author_uid}/{row.content_id}"
+def _segment(content_id: str, part: int | None) -> str:
+    """A post's directory name, or a later part's beside it.
+
+    Beside, not inside: the sidecar removes a directory recursively, so a part
+    nested under the post's own would go whenever the first part's files did.
+    """
+    return f"{content_id}-p{part}" if part else content_id
 
 
-def pending_directory(platform: str, content_id: str) -> str:
-    return f"{platform}/{PENDING_AUTHOR}/{content_id}"
+def directory_of(row: ArchivedContent, part: int | None = None) -> str:
+    return f"{row.platform}/{row.author_uid}/{_segment(row.content_id, part)}"
+
+
+def pending_directory(platform: str, content_id: str, part: int | None = None) -> str:
+    return f"{platform}/{PENDING_AUTHOR}/{_segment(content_id, part)}"
+
+
+def _same_part(part: int | None) -> Any:
+    """The rows for this part - NULL being the first, which every row was
+    before parts existed."""
+    return MediaDownload.part.is_(None) if part is None else MediaDownload.part == part
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +217,7 @@ def pending_directory(platform: str, content_id: str) -> str:
 
 
 async def existing_for(
-    session: AsyncSession, platform: str, content_id: str
+    session: AsyncSession, platform: str, content_id: str, part: int | None = None
 ) -> tuple[MediaDownload | None, MediaDownload | None]:
     """The live download for this post, and the newest stored one.
 
@@ -160,6 +235,9 @@ async def existing_for(
     than a hazard - re-downloading is how you refresh a post - so the caller
     decides, and the caller that wants it most is a feed being re-run for the
     handful of posts an author has added since last time.
+
+    Both questions are asked of one part. Another part of the same post writes
+    into its own directory and is a different set of bytes.
     """
     rows = (
         (
@@ -168,6 +246,7 @@ async def existing_for(
                 .where(
                     MediaDownload.platform == platform,
                     MediaDownload.content_id == content_id,
+                    _same_part(part),
                 )
                 .order_by(MediaDownload.created_at.desc())
             )
@@ -186,6 +265,7 @@ async def create(
     session: AsyncSession,
     row: ArchivedContent,
     *,
+    part: int | None = None,
     requested_by: uuid.UUID | None = None,
 ) -> MediaDownload:
     """Record the intent to download, before anything is fetched.
@@ -196,9 +276,10 @@ async def create(
     download = MediaDownload(
         platform=row.platform,
         content_id=row.content_id,
+        part=part,
         author_uid=row.author_uid,
         state="queued",
-        directory=directory_of(row),
+        directory=directory_of(row, part),
         requested_by=requested_by,
     )
     session.add(download)
@@ -219,6 +300,7 @@ async def create_pending(
     *,
     platform: str,
     content_id: str,
+    part: int | None = None,
     requested_by: uuid.UUID | None = None,
 ) -> MediaDownload:
     """The same, for a post this instance has never seen.
@@ -232,9 +314,10 @@ async def create_pending(
     download = MediaDownload(
         platform=platform,
         content_id=content_id,
+        part=part,
         author_uid="",
         state="queued",
-        directory=pending_directory(platform, content_id),
+        directory=pending_directory(platform, content_id, part),
         requested_by=requested_by,
     )
     session.add(download)
@@ -252,7 +335,7 @@ async def adopt(session: AsyncSession, download: MediaDownload, row: ArchivedCon
     if download.author_uid:
         return
     download.author_uid = row.author_uid
-    download.directory = directory_of(row)
+    download.directory = directory_of(row, download.part)
     await session.flush()
 
 
@@ -337,6 +420,17 @@ async def set_pinned(session: AsyncSession, download_id: uuid.UUID, pinned: bool
     return bool(affected(result))
 
 
+async def sharing_directory(session: AsyncSession, directory: str) -> list[MediaDownload]:
+    """Every download of one post that writes to the same directory.
+
+    Removing files is a directory operation, so whatever acts on one download's
+    files acts on all of these: each one has to be allowed to lose them, and
+    each one has to be marked afterwards.
+    """
+    rows = await session.execute(select(MediaDownload).where(MediaDownload.directory == directory))
+    return list(rows.scalars().all())
+
+
 async def mark_evicted(session: AsyncSession, ids: Sequence[uuid.UUID]) -> int:
     """Record that the bytes are gone while keeping everything else.
 
@@ -387,7 +481,37 @@ def _apply(statement: Any, spec: DownloadFilter) -> Any:
         statement = statement.where(MediaDownload.files_removed_at.is_(None))
     if spec.on_disk is False:
         statement = statement.where(MediaDownload.files_removed_at.is_not(None))
+    if spec.query and spec.query.strip():
+        statement = statement.where(_search_clause(spec.query.strip()))
     return statement
+
+
+def _search_clause(term: str) -> Any:
+    """Match a search term against what a person calls a download.
+
+    The row knows a content id and nothing a person would type, so the title
+    and the author come from the archive, the same place :func:`titles_for`
+    reads them for display - a search that matched something other than what
+    the table shows would find rows nobody can see why it found. EXISTS rather
+    than a join, because a join would also have to be added to the count.
+
+    Escaped and substring-matched for the archive's reasons: the caller typed
+    text rather than a pattern, and Chinese has no word boundaries to match on.
+    """
+    pattern = f"%{escape_like(term)}%"
+    return or_(
+        MediaDownload.content_id.ilike(pattern, escape=LIKE_ESCAPE),
+        select(literal(1))
+        .where(
+            ArchivedContent.platform == MediaDownload.platform,
+            ArchivedContent.content_id == MediaDownload.content_id,
+            or_(
+                ArchivedContent.title.ilike(pattern, escape=LIKE_ESCAPE),
+                ArchivedContent.author_nickname.ilike(pattern, escape=LIKE_ESCAPE),
+            ),
+        )
+        .exists(),
+    )
 
 
 async def search(
@@ -439,7 +563,8 @@ async def stored_for(
 
     Keyed by (platform, content_id) because that is what the archive has; the
     newest live download per key wins, since re-downloading a post leaves the
-    older rows behind.
+    older rows behind. Only the first part counts: it is what the post's link
+    plays, and a stored part 7 is not "this post's video".
     """
     if not keys:
         return {}
@@ -449,6 +574,7 @@ async def stored_for(
                 select(MediaDownload)
                 .where(
                     tuple_(MediaDownload.platform, MediaDownload.content_id).in_(list(keys)),
+                    MediaDownload.part.is_(None),
                     MediaDownload.files_removed_at.is_(None),
                     MediaDownload.state == "done",
                 )
@@ -463,19 +589,38 @@ async def stored_for(
         key = (row.platform, row.content_id)
         if key in found:
             continue
-        files = [_file_row(item) for item in (row.files or [])]
-        found[key] = {
-            "download_id": str(row.id),
-            "bytes_total": int(row.bytes_total or 0),
-            "video": next(
-                (f["name"] for f in files if f["kind"] == "video" and f["state"] == "done"), None
-            ),
-            "cover": next(
-                (f["name"] for f in files if f["kind"] == "cover" and f["state"] == "done"), None
-            ),
-            "images": [f["name"] for f in files if f["kind"] == "image" and f["state"] == "done"],
-        }
+        found[key] = stored_entry(row)
     return found
+
+
+def stored_entry(row: MediaDownload) -> dict[str, Any]:
+    """One stored download, as the library card reads it.
+
+    ``saved_at`` is when the files landed, which is what "group by the day it
+    was saved" means. The library used to group by the post's `last_seen_at`
+    instead, and that moves every time the post is parsed or re-checked - so a
+    video saved a month ago jumped into today's group after a recheck.
+    """
+    files = [_file_row(item) for item in (row.files or [])]
+    saved = row.finished_at or row.created_at
+    return {
+        "download_id": str(row.id),
+        "bytes_total": int(row.bytes_total or 0),
+        "saved_at": saved.isoformat() if saved else None,
+        "video": next(
+            (f["name"] for f in files if f["kind"] == "video" and f["state"] == "done"), None
+        ),
+        "cover": next(
+            (f["name"] for f in files if f["kind"] == "cover" and f["state"] == "done"), None
+        ),
+        "images": [f["name"] for f in files if f["kind"] == "image" and f["state"] == "done"],
+        # The clips of an album's live photos, each named after its slide.
+        "live_videos": [
+            f["name"]
+            for f in files
+            if f["kind"] == planner.LIVE_VIDEO_KIND and f["state"] == "done"
+        ],
+    }
 
 
 async def directories_for(
@@ -568,12 +713,13 @@ async def find_duplicates(session: AsyncSession) -> list[Duplicate]:
         .all()
     )
 
-    by_post: dict[tuple[str, str], list[MediaDownload]] = {}
+    # Per part: two parts of one post are two different files, not a copy.
+    by_post: dict[tuple[str, str, int | None], list[MediaDownload]] = {}
     for row in rows:
-        by_post.setdefault((row.platform, row.content_id), []).append(row)
+        by_post.setdefault((row.platform, row.content_id, row.part), []).append(row)
 
     duplicates: list[Duplicate] = []
-    for (platform, content_id), copies in by_post.items():
+    for (platform, content_id, _part), copies in by_post.items():
         if len(copies) < 2:
             continue
         keeper = next((row for row in copies if row.files_removed_at is None), copies[0])
@@ -759,7 +905,24 @@ async def plan_eviction(session: AsyncSession, *, total_bytes: int, ceiling_byte
         .scalars()
         .all()
     )
-    return choose_evictions(list(rows), over_by=total_bytes - ceiling_bytes)
+    protected = set(
+        (
+            await session.execute(
+                select(Transcription.download_id).where(
+                    Transcription.download_id.is_not(None),
+                    Transcription.state.in_(("queued", "running")),
+                )
+            )
+        ).scalars()
+    )
+    # Several download rows can own the same directory. Protect the directory,
+    # not just the source row, or an older duplicate could still schedule the
+    # active transcription's files for recursive deletion.
+    protected_directories = {row.directory for row in rows if row.id in protected}
+    return choose_evictions(
+        [row for row in rows if row.directory not in protected_directories],
+        over_by=total_bytes - ceiling_bytes,
+    )
 
 
 async def titles_for(
@@ -822,8 +985,10 @@ def _with_export_name(row: MediaDownload, item: Any) -> Any:
         return item
     return {
         **item,
+        # A later part's files are named for the part, or two parts of one
+        # post saved to the same folder would overwrite each other.
         "export_name": planner.export_name(
-            str(row.platform), str(row.content_id), str(item["name"])
+            str(row.platform), _segment(str(row.content_id), row.part), str(item["name"])
         ),
     }
 
@@ -834,6 +999,7 @@ def as_dict(row: MediaDownload) -> dict[str, Any]:
         "id": str(row.id),
         "platform": row.platform,
         "content_id": row.content_id,
+        "part": row.part,
         "author_uid": row.author_uid,
         "state": row.state,
         "directory": row.directory,
@@ -883,7 +1049,9 @@ __all__ = [
     "plan_for",
     "search",
     "set_pinned",
+    "sharing_directory",
     "stats",
+    "stored_entry",
     "stored_for",
     "titles_for",
 ]

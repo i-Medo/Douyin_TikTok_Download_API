@@ -22,22 +22,33 @@ lenient parser would keep working while quietly mapping half the fields to
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+import re
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any, Final
+from urllib.parse import quote
 
-from dtk.core.errors import UpstreamRiskControl
+from dtk.core.errors import MediaWithheld, UpstreamRiskControl
 from dtk.core.types import ContentKind, Platform
 from dtk.models import (
+    AlbumImage,
     Author,
     AuthorStats,
     Collection,
     Comment,
     Content,
     ContentStats,
+    Hashtag,
     Image,
+    LiveRoom,
+    LiveStatus,
+    LiveStream,
     Media,
+    MediaAccess,
+    Mix,
     Music,
+    MusicDetail,
     Page,
     VideoStream,
 )
@@ -53,11 +64,19 @@ from dtk.platforms.common import (
     seconds_to_ms,
     split_title,
 )
+from dtk.platforms.tiktok.params import SEARCH_CURSOR
 
 _PLATFORM: Final = Platform.TIKTOK
 _NAME: Final = _PLATFORM.value
 
 WEB_DOMAIN: Final = "https://www.tiktok.com"
+
+#: Covers and album slides are served to anyone who sends the Referer.
+ACCESS: Final = MediaAccess(referer=f"{WEB_DOMAIN}/")
+#: A video's links say `tk=tt_chain_token`: the CDN serves them only with the
+#: tt_chain_token cookie of the session that fetched them, and that cookie is
+#: an identity's, not the caller's (#831).
+VIDEO_ACCESS: Final = MediaAccess(referer=f"{WEB_DOMAIN}/", session_bound=True)
 
 #: Status codes seen on risk-control responses rather than on data.
 #:
@@ -67,6 +86,37 @@ WEB_DOMAIN: Final = "https://www.tiktok.com"
 #: are classified above this layer, and misfiling one as risk control would
 #: cool down a healthy identity every time somebody looks up a deleted video.
 RISK_STATUS_CODES: Final[frozenset[int]] = frozenset({10000, 10101})
+
+#: Where a session's device id is read: any page of the web app states it, and
+#: the home page is the one a visitor opens first.
+DEVICE_ID_PAGE: Final = f"{WEB_DOMAIN}/"
+
+#: The page's own state, embedded for the client to pick up.
+_REHYDRATION: Final = re.compile(
+    r'<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', re.S
+)
+
+
+def read_device_id(page: str) -> str | None:
+    """The device id a web app page states for the session that opened it.
+
+    ``webapp.app-context.wid``: what TikTok's own client sends as ``device_id``.
+    It follows the session's tt_chain_token - the same 19 digits on every page,
+    a different number for every identity (measured 2026-11-20) - and the video
+    links the API hands out open only for that pair (#831).
+    """
+    match = _REHYDRATION.search(page)
+    if match is None:
+        return None
+    try:
+        state = json.loads(match.group(1))
+    except ValueError:
+        return None
+    scope = state.get("__DEFAULT_SCOPE__") if isinstance(state, dict) else None
+    context = scope.get("webapp.app-context") if isinstance(scope, dict) else None
+    wid = context.get("wid") if isinstance(context, dict) else None
+    text = str(wid) if isinstance(wid, str | int) else ""
+    return text if text.isdigit() else None
 
 
 def detect_risk_control(payload: Mapping[str, Any]) -> str | None:
@@ -120,16 +170,33 @@ def _first_stated(node: Node, *keys: str) -> int | None:
     return None
 
 
-def _web_author_stats(node: Node | None) -> AuthorStats | None:
-    if node is None:
+def _web_author_stats(*sources: Node | None) -> AuthorStats | None:
+    """Read an author's counters from the first source that states each one.
+
+    Callers pass ``statsV2`` first and ``stats`` second, field by field rather
+    than block by block. Choosing a whole block once - ``stats or statsV2`` -
+    meant the exact copy was never read whenever the numeric one was present,
+    which is always (#804); posts and hashtags had already been switched to
+    ``statsV2`` after it was measured to be the accurate one.
+    """
+    present = [node for node in sources if node is not None]
+    if not present:
         return None
+
+    def metric(*keys: str) -> int | None:
+        for node in present:
+            value = _first_stated(node, *keys)
+            if value is not None:
+                return value
+        return None
+
     stats = AuthorStats(
-        follower_count=optional_int(node.get("followerCount")),
-        following_count=optional_int(node.get("followingCount")),
-        content_count=optional_int(node.get("videoCount")),
+        follower_count=metric("followerCount"),
+        following_count=metric("followingCount"),
+        content_count=metric("videoCount"),
         # ``heartCount`` is likes received; ``diggCount`` is likes given. The
         # fallback is on absence, not on falsiness: a stated 0 is a measurement.
-        total_digg=_first_stated(node, "heartCount", "heart"),
+        total_digg=metric("heartCount", "heart"),
     )
     return None if stats == AuthorStats() else stats
 
@@ -138,9 +205,13 @@ def author_from_web_node(
     node: Node,
     *,
     stats: Node | None = None,
+    stats_v2: Node | None = None,
     include_raw: bool = False,
 ) -> Author:
-    """Build an :class:`Author` from the camelCase web user object."""
+    """Build an :class:`Author` from the camelCase web user object.
+
+    ``stats_v2`` is read before ``stats``, one counter at a time.
+    """
     unique_id = node.id("uniqueId")
     return Author(
         platform=_PLATFORM,
@@ -158,7 +229,7 @@ def author_from_web_node(
         ),
         web_url=author_web_url(unique_id),
         verified=optional_bool(node.get("verified")),
-        stats=_web_author_stats(stats),
+        stats=_web_author_stats(stats_v2, stats),
         raw=node.raw() if include_raw else None,
     )
 
@@ -280,18 +351,20 @@ def _image_from_url_holder(node: Node | None) -> Image | None:
     return image_from_urls(holder.get("urlList"))
 
 
-def _album_images(image_post: Node) -> list[Image]:
-    images: list[Image] = []
+def _album_images(image_post: Node) -> list[AlbumImage]:
+    images: list[AlbumImage] = []
     for item in image_post.children("images"):
         image = _image_from_url_holder(item)
         if image is None:
             raise item.missing("imageURL")
+        # `video` stays None: the slides of a photo post here carry an
+        # `imageURL` and no clip, unlike a Douyin live photo's.
         images.append(
-            image.model_copy(
-                update={
-                    "width": optional_int(item.get("imageWidth")) or image.width,
-                    "height": optional_int(item.get("imageHeight")) or image.height,
-                }
+            AlbumImage(
+                url=image.url,
+                urls=image.urls,
+                width=optional_int(item.get("imageWidth")) or image.width,
+                height=optional_int(item.get("imageHeight")) or image.height,
             )
         )
     return images
@@ -311,7 +384,7 @@ def _media(
         images = _album_images(image_post) if image_post is not None else []
         if require_media and not images:
             raise item.missing("imagePost")
-        return Media(covers=covers, video=None, streams=[], images=images)
+        return Media(covers=covers, video=None, streams=[], images=images, access=ACCESS)
 
     main: VideoStream | None = None
     streams: list[VideoStream] = []
@@ -333,7 +406,8 @@ def _media(
         if video is None:
             raise item.missing("video")
         raise video.missing("playAddr")
-    return Media(covers=covers, video=main, streams=streams, images=[])
+    access = VIDEO_ACCESS if main is not None or streams else ACCESS
+    return Media(covers=covers, video=main, streams=streams, images=[], access=access)
 
 
 def _tags(item: Node) -> list[str]:
@@ -349,17 +423,21 @@ def _tags(item: Node) -> list[str]:
     return tags
 
 
-def content_from_node(item: Node, *, fetched_at: datetime) -> Content:
+def content_from_node(item: Node, *, fetched_at: datetime, media_optional: bool = False) -> Content:
     """Build a :class:`Content` from one ``itemStruct``.
 
     Shared by the detail endpoint and the post list, which return identical
-    objects.
+    objects. ``media_optional`` is for the lists, through :func:`_page_items`.
     """
     content_id = item.id("id")
     title, description = split_title(item.text("desc"))
 
     author_node = item.child("author")
-    author = author_from_web_node(author_node, stats=item.opt_child("authorStats"))
+    author = author_from_web_node(
+        author_node,
+        stats=item.opt_child("authorStats"),
+        stats_v2=item.opt_child("authorStatsV2"),
+    )
 
     # ``takeDown`` only: ``itemMute`` means the audio track was muted, which
     # happens to plenty of live posts. Folding it in here would both report a
@@ -374,7 +452,16 @@ def content_from_node(item: Node, *, fetched_at: datetime) -> Content:
 
     video = item.opt_child("video")
     # A taken-down or private post keeps its metadata but drops its media URLs.
-    media = _media(item, kind, video, image_post, require_media=not (is_deleted or is_private))
+    expect_media = not (media_optional or is_deleted or is_private)
+    if expect_media and _shop_video(item):
+        media = _media(item, kind, video, image_post, require_media=False)
+        if not (media.video or media.images):
+            raise MediaWithheld(
+                "TikTok's web API does not hand out the media of a TikTok Shop video",
+                details={"content_id": content_id, "reason": "shop_video"},
+            )
+    else:
+        media = _media(item, kind, video, image_post, require_media=expect_media)
 
     duration_ms = None
     if kind is ContentKind.VIDEO and video is not None:
@@ -420,7 +507,8 @@ def parse_author(payload: Mapping[str, Any]) -> Author:
     user_info = root.child("userInfo")
     return author_from_web_node(
         user_info.child("user"),
-        stats=user_info.opt_child("stats") or user_info.opt_child("statsV2"),
+        stats=user_info.opt_child("stats"),
+        stats_v2=user_info.opt_child("statsV2"),
         include_raw=True,
     )
 
@@ -440,14 +528,16 @@ def parse_author_list(payload: Mapping[str, Any]) -> Page[Author]:
     # An empty result omits `userList` entirely rather than sending `[]`, which
     # is what a hidden following list looks like - measured 2026-09-08, where
     # the same account returned 30 followers and no `userList` key at all for
-    # the following side. Absent is therefore an empty page; a list that IS
-    # present stays strict, so a malformed entry is still reported rather than
-    # silently dropped.
-    entries = root.children("userList") if root.has("userList") else []
+    # the following side. Absent is therefore an empty page, and so is null,
+    # which platforms send for an empty list as often as they drop the key; a
+    # list that IS present stays strict, so a malformed entry is still
+    # reported rather than silently dropped.
+    entries = root.listed_children("userList")
     items = [
         author_from_web_node(
             entry.child("user"),
-            stats=entry.opt_child("stats") or entry.opt_child("statsV2"),
+            stats=entry.opt_child("stats"),
+            stats_v2=entry.opt_child("statsV2"),
         )
         for entry in entries
     ]
@@ -458,6 +548,48 @@ def parse_author_list(payload: Mapping[str, Any]) -> Page[Author]:
     return Page(items=items, cursor=cursor, has_more=has_more)
 
 
+def _has_media(content: Content) -> bool:
+    return content.media.video is not None or bool(content.media.images)
+
+
+def _shop_video(item: Node) -> bool:
+    """A TikTok Shop video, which the web API sends without its media."""
+    return bool(optional_int(item.get("isECVideo")))
+
+
+def _page_items(nodes: Sequence[Node], *, fetched_at: datetime) -> list[Content]:
+    """The posts of one list page, where one post's missing media is not fatal.
+
+    TikTok sends some posts with ``playAddr: ""`` and nothing beside it - no
+    ``downloadAddr``, no ``bitrateInfo`` - among posts that have all three.
+    Parsed strictly, as the detail endpoint parses, the first such post failed
+    the page: HTTP 502, UPSTREAM_CHANGED asking for a report, and every other
+    post gone with it (#819, for an author's posts and for a search). Such a
+    post now comes back with its metadata and no streams.
+
+    Which posts: measured 2026-11-08 on the account in #819, six of eight came
+    bare to a guest, every one of them ``isECVideo: 1``, and the two that were
+    not shop videos had all their streams. A signed-in account was sent the
+    same shop videos just as bare, here and on the detail endpoint, where such
+    a post is MEDIA_WITHHELD rather than a half-filled model.
+
+    A page on which no post has media is still a schema change - a renamed
+    field empties every post, not some - and raises the error the first post
+    would have raised alone. Posts that never carry media are not counted
+    either way: taken down, private, or a shop video, so that a seller's page
+    of nothing but shop videos is not read as one.
+    """
+    items = [content_from_node(node, fetched_at=fetched_at, media_optional=True) for node in nodes]
+    expected = [
+        node
+        for node, content in zip(nodes, items, strict=True)
+        if not (content.is_deleted or content.is_private or _shop_video(node))
+    ]
+    if expected and not any(_has_media(content) for content in items):
+        content_from_node(expected[0], fetched_at=fetched_at)
+    return items
+
+
 def parse_author_posts(payload: Mapping[str, Any], *, fetched_at: datetime) -> Page[Content]:
     """Parse ``/api/post/item_list/``.
 
@@ -465,9 +597,7 @@ def parse_author_posts(payload: Mapping[str, Any], *, fetched_at: datetime) -> P
     that is an empty page, not an upstream change.
     """
     root = _guard(payload)
-    if not root.has("itemList"):
-        return Page(items=[], cursor=None, has_more=False)
-    items = [content_from_node(item, fetched_at=fetched_at) for item in root.children("itemList")]
+    items = _page_items(root.listed_children("itemList"), fetched_at=fetched_at)
     has_more = optional_bool(root.present("hasMore"))
     cursor = optional_id(root.get("cursor")) if has_more else None
     if has_more and cursor is None:
@@ -488,10 +618,373 @@ def parse_author_stories(payload: Mapping[str, Any], *, fetched_at: datetime) ->
     root = _guard(payload)
     if not root.has("itemList"):
         return Page(items=[], cursor=None, has_more=False)
-    items = [content_from_node(item, fetched_at=fetched_at) for item in root.children("itemList")]
+    items = _page_items(root.children("itemList"), fetched_at=fetched_at)
     has_more = optional_bool(root.present("HasMoreAfter"))
     cursor = optional_id(root.get("MaxCursor")) if has_more else None
     return Page(items=items, cursor=cursor, has_more=has_more)
+
+
+def parse_related_posts(payload: Mapping[str, Any], *, fetched_at: datetime) -> Page[Content]:
+    """Parse ``/api/related/item_list/``: one batch, with ``cursor: -1``."""
+    root = _guard(payload)
+    items = _page_items(root.children("itemList"), fetched_at=fetched_at)
+    return Page(items=items, cursor=None, has_more=False)
+
+
+_SLUG_JUNK: Final = re.compile(r"[^0-9A-Za-z]+")
+
+
+def music_web_url(music_id: str, title: str | None) -> str:
+    """``/music/<title>-<id>``, as the site links a sound.
+
+    Only the id is read: ``original-sound-<id>``, ``x-<id>`` and ``-<id>``
+    all served the same page on 2026-10-20. The title is there because it is
+    what the site's own links carry, reduced to the characters they use.
+    """
+    slug = _SLUG_JUNK.sub("-", title or "").strip("-").lower()
+    return f"{WEB_DOMAIN}/music/{slug}-{music_id}"
+
+
+def parse_music_detail(payload: Mapping[str, Any]) -> MusicDetail:
+    """Parse ``/api/music/detail/``.
+
+    The sound, its counters and its publisher arrive as three siblings under
+    ``musicInfo``. ``author`` is absent for a library track rather than empty,
+    and the sound then has no owner.
+    """
+    info = _guard(payload).child("musicInfo")
+    node = info.child("music")
+    music_id = node.id("id")
+    base = _music(node) or Music()
+    stats = info.opt_child("stats")
+    owner = info.opt_child("author")
+    return MusicDetail(
+        **base.model_dump(exclude={"music_id"}),
+        music_id=music_id,
+        platform=_PLATFORM,
+        web_url=music_web_url(music_id, base.title),
+        content_count=optional_int(stats.get("videoCount")) if stats is not None else None,
+        is_original=optional_bool(node.get("original")) if node.has("original") else None,
+        owner=author_from_web_node(owner) if owner is not None else None,
+        raw=info.raw(),
+    )
+
+
+def parse_music_posts(payload: Mapping[str, Any], *, fetched_at: datetime) -> Page[Content]:
+    """Parse ``/api/music/item_list/``, the shared item_list envelope."""
+    return parse_author_posts(payload, fetched_at=fetched_at)
+
+
+def hashtag_web_url(name: str) -> str:
+    return f"{WEB_DOMAIN}/tag/{quote(name, safe='')}"
+
+
+def parse_hashtag_detail(payload: Mapping[str, Any]) -> Hashtag:
+    """Parse ``/api/challenge/detail/``.
+
+    The counters are read from ``statsV2``, as a post's are: measured
+    2026-10-20, ``stats.videoCount`` was 0 beside a ``statsV2.videoCount`` of
+    194388, and ``stats.viewCount`` a rounded 5200000000 beside the exact
+    figure. ``stats`` is the fallback, for an answer that has nothing else.
+    """
+    info = _guard(payload).child("challengeInfo")
+    node = info.child("challenge")
+    primary = info.opt_child("statsV2")
+    secondary = info.opt_child("stats") or node.opt_child("stats")
+
+    def metric(name: str) -> int | None:
+        for source in (primary, secondary):
+            value = optional_int(source.get(name)) if source is not None else None
+            if value is not None:
+                return value
+        return None
+
+    name = node.text("title")
+    return Hashtag(
+        platform=_PLATFORM,
+        hashtag_id=node.id("id"),
+        name=name,
+        description=optional_str(node.get("desc")),
+        cover=image_from_urls(
+            node.get("coverLarger"),
+            node.get("coverMedium"),
+            node.get("profileLarger"),
+            node.get("profileMedium"),
+        ),
+        web_url=hashtag_web_url(name),
+        content_count=metric("videoCount"),
+        view_count=metric("viewCount"),
+        raw=info.raw(),
+    )
+
+
+def parse_hashtag_posts(payload: Mapping[str, Any], *, fetched_at: datetime) -> Page[Content]:
+    """Parse ``/api/challenge/item_list/``, the shared item_list envelope."""
+    return parse_author_posts(payload, fetched_at=fetched_at)
+
+
+def parse_search_posts(payload: Mapping[str, Any], *, fetched_at: datetime) -> Page[Content]:
+    """Parse ``/api/search/item/full/``.
+
+    The items are ordinary ``itemStruct`` objects; the envelope is snake_case
+    - ``item_list``, ``has_more`` as 0 or 1, a numeric ``cursor`` - and drops
+    ``item_list`` altogether on a page with nothing in it.
+
+    The cursor handed out is ``<offset>:<log_pb.impr_id>``: the next page is
+    only answered to a request naming the search it continues, see
+    :func:`~dtk.platforms.tiktok.params.search_posts_params`. An id that could
+    not be sent back as it stands is left off, and the offset goes alone.
+    """
+    root = _guard(payload)
+    items = _page_items(root.listed_children("item_list"), fetched_at=fetched_at)
+    has_more = optional_bool(root.get("has_more")) and bool(items)
+    offset = optional_id(root.get("cursor")) if has_more else None
+    if has_more and offset is None:
+        raise root.missing("cursor")
+    cursor = offset
+    log_pb = root.opt_child("log_pb")
+    search_id = optional_str(log_pb.get("impr_id")) if log_pb is not None else None
+    if offset is not None and search_id is not None:
+        candidate = f"{offset}:{search_id}"
+        if SEARCH_CURSOR.fullmatch(candidate):
+            cursor = candidate
+    return Page(items=items, cursor=cursor, has_more=has_more)
+
+
+def author_from_search_node(node: Node) -> Author:
+    """An account as the user search lists it: the comment endpoints' snake_case
+    user object, with the counters beside the name rather than in a block."""
+    author = author_from_comment_node(node)
+    stats = AuthorStats(
+        follower_count=optional_int(node.get("follower_count")),
+        following_count=optional_int(node.get("following_count")),
+        content_count=optional_int(node.get("aweme_count")),
+        total_digg=optional_int(node.get("total_favorited")),
+    )
+    return author.model_copy(update={"stats": None if stats == AuthorStats() else stats})
+
+
+def parse_search_authors(payload: Mapping[str, Any]) -> Page[Author]:
+    """Parse ``/api/search/user/full/``: ``user_list`` of ``{user_info, ...}``."""
+    root = _guard(payload)
+    entries = root.listed_children("user_list")
+    items = [author_from_search_node(entry.child("user_info")) for entry in entries]
+    has_more = optional_bool(root.get("has_more")) and bool(items)
+    cursor = optional_id(root.get("cursor")) if has_more else None
+    if has_more and cursor is None:
+        raise root.missing("cursor")
+    return Page(items=items, cursor=cursor, has_more=has_more)
+
+
+def playlist_web_url(unique_id: str, name: str, mix_id: str) -> str:
+    """``/@<handle>/playlist/<name>-<id>``, as the profile links a playlist.
+
+    The name is reduced the way :func:`music_web_url` reduces a title; only
+    the id after the last hyphen is what the URL layer reads back.
+    """
+    slug = _SLUG_JUNK.sub("-", name).strip("-")
+    return f"{WEB_DOMAIN}/@{unique_id}/playlist/{slug}-{mix_id}"
+
+
+def parse_author_mixes(payload: Mapping[str, Any]) -> Page[Mix]:
+    """Parse ``/api/user/playlist/``.
+
+    Each entry names itself twice - ``id``/``mixId``, ``name``/``mixName`` -
+    and was the same both times on every playlist measured; the first of each
+    is read. An author with none answers no ``playList`` key at all.
+    """
+    root = _guard(payload)
+    items: list[Mix] = []
+    for entry in root.listed_children("playList"):
+        mix_id = optional_id(entry.get("id")) or entry.id("mixId")
+        name = optional_str(entry.get("name")) or entry.text("mixName")
+        creator = entry.opt_child("creator")
+        handle = optional_str(creator.get("uniqueId")) if creator else None
+        items.append(
+            Mix(
+                platform=_PLATFORM,
+                mix_id=mix_id,
+                name=name,
+                cover=image_from_urls(entry.get("cover")),
+                item_count=optional_int(entry.get("videoCount")),
+                web_url=playlist_web_url(handle, name, mix_id) if handle else None,
+                owner_id=optional_str(creator.get("secUid")) if creator else None,
+                owner_name=handle,
+                raw=entry.raw(),
+            )
+        )
+    has_more = optional_bool(root.present("hasMore"))
+    cursor = optional_id(root.get("cursor")) if has_more else None
+    if has_more and cursor is None:
+        raise root.missing("cursor")
+    return Page(items=items, cursor=cursor, has_more=has_more)
+
+
+#: A room's ``status`` while it broadcasts; 4 is ended, measured 2026-10-20.
+_LIVE_STATUS_ON: Final = 2
+
+#: The pull URL keys of one quality, in the order a player would try them.
+#: ``cmaf``, ``lls`` and the rest are left out: a player needs to know about
+#: them, and the two here are what every player and recorder takes.
+_LIVE_FORMATS: Final[tuple[str, ...]] = ("flv", "hls")
+
+
+def live_web_url(unique_id: str) -> str:
+    return f"{WEB_DOMAIN}/@{unique_id}/live"
+
+
+def _live_streams(pull: Node | None) -> list[LiveStream]:
+    """The pull URLs, from a ``pull_data.stream_data``.
+
+    That field is a JSON document inside a string, keyed by quality (``origin``,
+    ``hd``, ``sd``, ...), each with ``main.flv`` and ``main.hls``. A string
+    that will not decode is a stream the page could not play either, and
+    gives no streams rather than failing the room. The web app's room answer
+    keeps it under ``streamData``, the webcast host's under
+    ``stream_url.live_core_sdk_data``; the document inside is the same.
+    """
+    text = pull.get("stream_data") if pull else None
+    if not isinstance(text, str) or not text:
+        return []
+    try:
+        decoded = json.loads(text)
+    except ValueError:
+        return []
+    qualities = decoded.get("data") if isinstance(decoded, dict) else None
+    if not isinstance(qualities, dict):
+        return []
+    streams: list[LiveStream] = []
+    for quality, entry in qualities.items():
+        main = entry.get("main") if isinstance(entry, dict) else None
+        if not isinstance(main, dict):
+            continue
+        for fmt in _LIVE_FORMATS:
+            url = main.get(fmt)
+            if isinstance(url, str) and url:
+                streams.append(LiveStream(url=url, format=fmt, quality=str(quality)))
+    return streams
+
+
+def parse_live_room(payload: Mapping[str, Any], *, room_id: str | None = None) -> LiveRoom:
+    """Parse ``/api-live/user/room/``: ``data.user`` and ``data.liveRoom``.
+
+    The broadcast's own id is the user's ``roomId``, not anything under
+    ``liveRoom``, whose ``streamId`` is the stream's.
+    """
+    data = _guard(payload).child("data")
+    user = data.child("user")
+    room = data.child("liveRoom")
+    author = author_from_web_node(user)
+    is_live = optional_int(room.get("status")) == _LIVE_STATUS_ON
+    stats = room.opt_child("liveRoomStats")
+    handle = author.unique_id or room_id or ""
+    stream = room.opt_child("streamData")
+    return LiveRoom(
+        platform=_PLATFORM,
+        room_id=handle,
+        live_id=optional_id(user.get("roomId")) if is_live else None,
+        is_live=is_live,
+        title=optional_str(room.get("title")),
+        cover=image_from_urls(room.get("coverUrl"), room.get("squareCoverImg")),
+        web_url=live_web_url(handle) if handle else None,
+        viewer_count=optional_int(stats.get("userCount")) if stats and is_live else None,
+        started_at=epoch_to_datetime(room.get("startTime")) if is_live else None,
+        author=author,
+        streams=_live_streams(stream.opt_child("pull_data") if stream else None) if is_live else [],
+        raw=data.raw(),
+    )
+
+
+def _webcast_author(owner: Node) -> Author:
+    """The broadcaster as the webcast host describes one: snake_case, with
+    the @handle as ``display_id`` and the numeric id as ``id_str``."""
+    handle = optional_str(owner.get("display_id"))
+    return Author(
+        platform=_PLATFORM,
+        uid=owner.id("id_str"),
+        sec_uid=optional_str(owner.get("sec_uid")),
+        unique_id=handle,
+        nickname=owner.text("nickname"),
+        avatar=image_from_url_list(owner.get("avatar_large"))
+        or image_from_url_list(owner.get("avatar_thumb")),
+        web_url=author_web_url(handle) if handle else None,
+        verified=optional_bool(owner.get("verified")),
+    )
+
+
+def parse_live_room_by_id(payload: Mapping[str, Any]) -> LiveRoom:
+    """Parse ``webcast.tiktok.com/webcast/room/info/``: the room is ``data``.
+
+    The same room ``/api-live/user/room/`` describes, in the webcast host's own
+    spelling, so it is normalised onto the same model: ``room_id`` is still
+    the owner's @handle (``owner.display_id``), which is what a room is asked
+    for by again once this broadcast is over. Measured 2026-10-26 on one room
+    asked both ways: ``user_count`` here equalled ``liveRoomStats.userCount``
+    there, and ``create_time`` here equalled ``startTime`` there, so they are
+    the viewer count and the start. ``start_time`` beside it was 0.
+
+    A ``room_id`` nobody has is ``status_code: 10011``, "Request params error".
+    """
+    room = _guard(payload).child("data")
+    owner = room.opt_child("owner")
+    author = _webcast_author(owner) if owner is not None else None
+    is_live = optional_int(room.get("status")) == _LIVE_STATUS_ON
+    handle = author.unique_id if author is not None else None
+    stream = room.opt_child("stream_url")
+    sdk = stream.opt_child("live_core_sdk_data") if stream else None
+    return LiveRoom(
+        platform=_PLATFORM,
+        # A room whose owner's handle did not come back is still this room;
+        # its own id is the only name left for it.
+        room_id=handle or room.id("id_str"),
+        live_id=room.id("id_str") if is_live else None,
+        is_live=is_live,
+        title=optional_str(room.get("title")),
+        cover=image_from_url_list(room.get("cover")),
+        web_url=live_web_url(handle) if handle else None,
+        viewer_count=optional_int(room.get("user_count")) if is_live else None,
+        # No like_count: it was 0 on a room of 249 viewers, beside a
+        # stats.digg_count of 0, and the handle answer has no count to check
+        # either against (2026-10-26).
+        started_at=epoch_to_datetime(room.get("create_time")) if is_live else None,
+        author=author,
+        streams=_live_streams(sdk.opt_child("pull_data") if sdk else None) if is_live else [],
+        raw=room.raw(),
+    )
+
+
+def parse_live_status(
+    payload: Mapping[str, Any], *, live_ids: Sequence[str] = ()
+) -> Page[LiveStatus]:
+    """Parse ``webcast.tiktok.com/webcast/room/check_alive/``.
+
+    ``data`` is a list with one ``{alive, room_id, room_id_str}`` per id asked,
+    in the order asked. ``room_id`` is a JSON number past the safe integer
+    range, so the id is read from ``room_id_str``. A broadcast nobody has is
+    ``alive: false`` like one that has ended: the platform does not tell the
+    two apart, and neither can this.
+
+    The page still follows ``live_ids`` rather than ``data``: Douyin's answer
+    leaves out an id that never was a broadcast, and should this one start to,
+    the page keeps answering every id asked instead of coming back short.
+    """
+    answered = {
+        entry.id("room_id_str"): _alive(entry) for entry in _guard(payload).children("data")
+    }
+    items = [
+        LiveStatus(platform=_PLATFORM, live_id=live_id, is_live=answered.get(live_id, False))
+        for live_id in live_ids or answered
+    ]
+    return Page(items=items, cursor=None, has_more=False)
+
+
+def _alive(entry: Node) -> bool:
+    """``alive`` as the platform sent it. Absent is a changed answer, not a
+    "no": reading it as False would report every room off the day it moved."""
+    value = entry.present("alive")
+    if not isinstance(value, bool):
+        raise entry.missing("alive")
+    return value
 
 
 #: The ``status`` value on a collection node that means "anyone can open this".
@@ -549,7 +1042,7 @@ def parse_author_collections(payload: Mapping[str, Any]) -> Page[Collection]:
     parser. Each entry says which it is; see :func:`_is_public`.
     """
     root = _guard(payload)
-    entries = root.children("collectionList") if root.has("collectionList") else []
+    entries = root.listed_children("collectionList")
     items = [_collection_from_node(entry) for entry in entries]
     has_more = optional_bool(root.present("hasMore"))
     cursor = optional_id(root.get("cursor")) if has_more else None
@@ -656,17 +1149,33 @@ __all__ = [
     "RISK_STATUS_CODES",
     "WEB_DOMAIN",
     "author_from_comment_node",
+    "author_from_search_node",
     "author_from_web_node",
     "author_web_url",
     "comment_from_node",
     "content_from_node",
     "content_web_url",
     "detect_risk_control",
+    "hashtag_web_url",
+    "live_web_url",
+    "music_web_url",
     "parse_author",
     "parse_author_collections",
+    "parse_author_mixes",
     "parse_author_posts",
     "parse_comment_replies",
     "parse_comments",
     "parse_content",
+    "parse_hashtag_detail",
+    "parse_hashtag_posts",
+    "parse_live_room",
+    "parse_live_room_by_id",
+    "parse_live_status",
+    "parse_music_detail",
+    "parse_music_posts",
+    "parse_related_posts",
     "parse_reply_previews",
+    "parse_search_authors",
+    "parse_search_posts",
+    "playlist_web_url",
 ]

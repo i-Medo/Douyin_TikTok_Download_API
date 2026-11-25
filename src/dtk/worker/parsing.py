@@ -36,6 +36,7 @@ from dtk.core.errors import (
     UnsupportedContent,
 )
 from dtk.core.logging import get_logger
+from dtk.core.types import Platform
 from dtk.db.models import Proxy
 from dtk.db.repositories import ProxyRepository
 from dtk.urls import (
@@ -84,6 +85,35 @@ _ENDPOINT_BY_RESOURCE: dict[ResourceKind, str] = {
     # own series is the same word. Nothing produces a Douyin COLLECTION, so
     # nothing reaches douyin.collection_detail, which does not exist.
     ResourceKind.COLLECTION: "collection_detail",
+    ResourceKind.MUSIC: "music_detail",
+    ResourceKind.CHALLENGE: "hashtag_detail",
+    ResourceKind.LIVE: "live_room",
+    # A reflow link, which is what a Douyin app share link expands to: it
+    # names the broadcast, not the room's web_rid.
+    ResourceKind.LIVE_ROOM: "live_room_by_id",
+}
+
+#: The kinds of link /parse turns into a call. `dtk fetch` reads it too, so the
+#: two entry points refuse the same links rather than each keeping a list.
+LINKED_RESOURCES: Final[frozenset[ResourceKind]] = frozenset(_ENDPOINT_BY_RESOURCE)
+
+#: Where a platform answers a kind of link with a different call. Bilibili has
+#: no folder detail - its folder list already carries the name, cover and size -
+#: so a folder link is answered with the folder's first page of videos. It used
+#: to map onto bilibili.collection_detail, which does not exist, and /parse
+#: refused every Bilibili folder link with INVALID_PARAM.
+_ENDPOINT_OVERRIDES: Final[Mapping[tuple[Platform, ResourceKind], str]] = {
+    (Platform.BILIBILI, ResourceKind.COLLECTION): "collection_posts",
+}
+
+#: Links whose "id" is a name, and the parameter that takes the name.
+#:
+#: A TikTok tag link is ``/tag/<name>``. Handing that name over as the hashtag
+#: id sent ``#2024`` to TikTok as hashtag number 2024 - a different hashtag, or
+#: none - because the only way left to tell the two apart was whether the text
+#: was all digits. The link already says which it is, so it is read here.
+NAMED_BY_LINK: Final[Mapping[tuple[Platform, ResourceKind], str]] = {
+    (Platform.TIKTOK, ResourceKind.CHALLENGE): registry.HASHTAG_NAME,
 }
 
 #: The canonical parameter each endpoint expects the resolved id under.
@@ -91,6 +121,13 @@ _PARAM_BY_RESOURCE: dict[ResourceKind, str] = {
     ResourceKind.VIDEO: "content_id",
     ResourceKind.USER: "author_id",
     ResourceKind.COLLECTION: "collection_id",
+    ResourceKind.MUSIC: "music_id",
+    # A TikTok tag link carries the name, not a number; see HASHTAG_ID.
+    ResourceKind.CHALLENGE: "hashtag_id",
+    # A TikTok /@handle/live link carries the handle, which is what its room
+    # is asked by.
+    ResourceKind.LIVE: "room_id",
+    ResourceKind.LIVE_ROOM: registry.LIVE_ID,
 }
 
 
@@ -264,7 +301,7 @@ async def resolve_link(
     identified = await resolve(url, fetcher, max_hops=MAX_REDIRECTS, extra_hosts=extra_hosts)
     if identified.platform is None:
         raise InvalidUrl(
-            "the URL was not recognized as a supported Douyin or TikTok link",
+            "the URL was not recognized as a supported Douyin, TikTok or Bilibili link",
             details={"url": url},
         )
     if identified.resource not in _ENDPOINT_BY_RESOURCE:
@@ -285,8 +322,12 @@ def to_call(identified: UrlKind) -> tuple[str, dict[str, Any]]:
     platform = identified.platform
     if platform is None:  # pragma: no cover - resolve_link already refused this
         raise InvalidUrl("the link carries no platform", details={"url": identified.original})
-    capability = _ENDPOINT_BY_RESOURCE[identified.resource]
-    param = _PARAM_BY_RESOURCE[identified.resource]
+    capability = _ENDPOINT_OVERRIDES.get(
+        (platform, identified.resource), _ENDPOINT_BY_RESOURCE[identified.resource]
+    )
+    param = NAMED_BY_LINK.get(
+        (platform, identified.resource), _PARAM_BY_RESOURCE[identified.resource]
+    )
     return f"{platform.value}.{capability}", {param: identified.resource_id}
 
 
@@ -316,7 +357,23 @@ async def plan(
 #: comment; only the post has a link, so only the post is here.
 _RESOURCE_BY_PARAM: Final[dict[str, ResourceKind]] = {
     registry.CONTENT_ID: ResourceKind.VIDEO,
+    registry.MUSIC_ID: ResourceKind.MUSIC,
+    registry.HASHTAG_ID: ResourceKind.CHALLENGE,
+    registry.ROOM_ID: ResourceKind.LIVE,
+    registry.LIVE_ID: ResourceKind.LIVE_ROOM,
     registry.AUTHOR_ID: ResourceKind.USER,
+}
+
+
+#: A link that turns out, once followed, to name what a sibling endpoint is
+#: asked by. ``/douyin/live?url=<v.douyin.com link>`` is the case: the route
+#: cannot know before the hop whether the share link opens a room by its
+#: web_rid or a broadcast by its own id, and an app's share link is the second
+#: - refusing it as "not a live room" would refuse the link the app hands out.
+_ANSWERED_BY_SIBLING: Final[
+    Mapping[tuple[registry.Capability, ResourceKind], registry.Capability]
+] = {
+    (registry.Capability.LIVE_ROOM, ResourceKind.LIVE_ROOM): registry.Capability.LIVE_ROOM_BY_ID,
 }
 
 
@@ -334,7 +391,7 @@ async def complete(
     fetcher: RedirectFetcher,
     *,
     extra_hosts: frozenset[str] = frozenset(),
-) -> dict[str, Any]:
+) -> tuple[str, dict[str, Any]]:
     """Fill in the id ``endpoint`` keys on from the link it was handed instead.
 
     The content routes accept ``url`` in place of an id, and a short link gives
@@ -349,12 +406,15 @@ async def complete(
 
     A caller's own id wins over the link, as it does at the route. A full link
     is identified without a request; only a short link costs one.
+
+    Returns the endpoint with the parameters, because the link can decide the
+    endpoint too: see ``_ANSWERED_BY_SIBLING``.
     """
     definition = registry.definition_for(endpoint)
     url = str(params.get("url") or "").strip()
     wanted = next((name for name in _RESOURCE_BY_PARAM if name in definition.accepts), None)
     if not url or wanted is None or _holds(params, wanted):
-        return dict(params)
+        return endpoint, dict(params)
 
     identified = await resolve(url, fetcher, max_hops=MAX_REDIRECTS, extra_hosts=extra_hosts)
     if identified.platform is not definition.platform:
@@ -367,6 +427,17 @@ async def complete(
             },
         )
     expected = _RESOURCE_BY_PARAM[wanted]
+    sibling = _ANSWERED_BY_SIBLING.get((definition.capability, identified.resource))
+    if sibling is not None and identified.resource_id:
+        other = registry.endpoint_name(definition.platform, sibling)
+        rest = {
+            key: value
+            for key, value in params.items()
+            if key != "url" and registry.ALIASES.get(key, key) != wanted
+        }
+        rest[_PARAM_BY_RESOURCE[identified.resource]] = identified.resource_id
+        log.info("parse.completed", endpoint=other, resource=identified.resource.value)
+        return other, rest
     if identified.resource is not expected:
         # Used to surface as the same "missing content_id", which told the
         # caller their id was wrong when it was the link that was.
@@ -386,20 +457,30 @@ async def complete(
             details={"url": url, "resource": identified.resource.value},
         )
 
+    named = NAMED_BY_LINK.get((definition.platform, identified.resource))
+    if named is not None and named not in definition.accepts:
+        # A short link to a TikTok tag reached an endpoint that lists by number.
+        raise InvalidParam(
+            f"the link names the {identified.resource.value} rather than numbering it, "
+            f"and {endpoint} takes the number; look it up by name first",
+            details={"field": "url", "reason": "named_resource", "name": identified.resource_id},
+        )
     filled = {
         key: value
         for key, value in params.items()
         if key != "url" and registry.ALIASES.get(key, key) != wanted
     }
-    filled[wanted] = identified.resource_id
+    filled[named or wanted] = identified.resource_id
     log.info("parse.completed", endpoint=endpoint, resource=identified.resource.value)
-    return filled
+    return endpoint, filled
 
 
 __all__ = [
     "EXPAND_HEADERS",
     "EXPAND_RETRY_AFTER_SECONDS",
     "EXPAND_TIMEOUT_SECONDS",
+    "LINKED_RESOURCES",
+    "NAMED_BY_LINK",
     "PoolEgress",
     "ProxySource",
     "complete",

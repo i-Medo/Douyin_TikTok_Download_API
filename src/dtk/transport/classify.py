@@ -34,6 +34,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Final
+from urllib.parse import parse_qs, urlsplit
 
 from dtk.core.types import Outcome
 from dtk.transport.base import RawResponse, TransportFailure
@@ -43,8 +44,10 @@ from dtk.transport.base import RawResponse, TransportFailure
 #: text sits far deeper than this.
 MARKER_SCAN_CHARS: Final[int] = 4096
 
-#: Body keys that carry the platform's own return code.
-ENVELOPE_STATUS_KEYS: Final[tuple[str, ...]] = ("status_code", "statusCode", "error_code")
+#: Body keys that carry the platform's own return code. ``code`` is
+#: Bilibili's, and last: neither other platform sends it at the top level, and
+#: :attr:`ResponseView.envelope_status` prefers a non-zero value anyway.
+ENVELOPE_STATUS_KEYS: Final[tuple[str, ...]] = ("status_code", "statusCode", "error_code", "code")
 
 #: Body keys that carry the platform's own message.
 ENVELOPE_MESSAGE_KEYS: Final[tuple[str, ...]] = ("status_msg", "statusMsg", "message")
@@ -116,6 +119,14 @@ BUSINESS_STATUS_CODES: Final[frozenset[int]] = frozenset({400, 404, 410, 451})
 RISK_STATUS_VALUES: Final[MappingProxyType[int, str]] = MappingProxyType(
     {
         10000: "verification required",
+        # Bilibili, all as HTTP 200 with a JSON envelope. -352 "risk check
+        # failed" is what an uploader's space answers without the dm_img
+        # report, measured 2026-10-18; -412 "request intercepted" is its JSON
+        # twin of the HTML 412 page; -509 and -799 are "too frequent".
+        -352: "risk check failed",
+        -412: "request intercepted",
+        -509: "too many requests",
+        -799: "too many requests",
     }
 )
 
@@ -144,8 +155,38 @@ BUSINESS_STATUS_VALUES: Final[MappingProxyType[int, str]] = MappingProxyType(
         # empty `userInfo`. Without the status key fix above this one read as
         # risk control, because the empty payload is all that was left to see.
         100002: "user not found",
+        # Bilibili, measured 2026-10-18: a video that does not exist, an author
+        # nobody has, comments on nothing and a `playurl` for a part that is
+        # not there all answer 200 with `code: -404` and "nothing here".
+        -404: "not found",
+        # Bilibili: a video hidden, under review, or shown to its uploader only;
+        # an author whose space is private; comments closed; a comment gone.
+        62002: "video not visible",
+        62004: "video under review",
+        62012: "video visible to its uploader only",
+        53013: "this user's space is private",
+        12002: "comments are closed",
+        12006: "no such comment",
     }
 )
+
+#: Body-level status codes that mean "this request needs a signed-in identity".
+#: A business answer - the guest that met it did nothing wrong, it is the wrong
+#: kind of identity - but not "nothing is there", which is what the generic
+#: `envelope.nonzero` reading turned it into.
+LOGIN_STATUS_VALUES: Final[MappingProxyType[int, str]] = MappingProxyType(
+    {
+        # TikTok, `search_posts` with a guest, measured 2026-11-02: HTTP 200,
+        # 125 bytes, "Please login your account first". On 2026-10-20 a guest
+        # still had a thin first page; the caller was told the search target
+        # did not exist.
+        2483: "login required",
+    }
+)
+
+#: The rule that names a login wall. :mod:`dtk.services.fetch` answers it with
+#: IDENTITY_LOGIN_REQUIRED rather than NOT_FOUND.
+LOGIN_REQUIRED_RULE: Final = "envelope.login_required"
 
 #: Lowercased substrings that identify a challenge or verification interstitial.
 #: Kept tight on purpose: every false positive here cools a healthy identity.
@@ -210,10 +251,32 @@ EMPTY_PAYLOAD_KEYS: Final[tuple[str, ...]] = (
 #: also wrote a sentence for a human is a UI decision on their side, not a
 #: signal about ours.
 #:
+#: Nor does it have to give a reason at all. Measured 2026-10-21 for issue
+#: #795, a deleted image post (`/note/7697962930159039461`, which Douyin's own
+#: page calls nonexistent) answered::
+#:
+#:     200, 165 bytes, {"status_code": 0, "aweme_detail": null,
+#:                      "filter_detail": {"aweme_id": "7697962930159039461",
+#:                                        "filter_reason": ""}}
+#:
+#: while the same identity, a moment apart, got another post in full (51 KB),
+#: and a genuinely refused request - a broken signature, or no cookies - got a
+#: 403. Read as withholding, every such post cooled a healthy identity and was
+#: reported as UPSTREAM_RISK_CONTROL. So a container naming THE POST THE
+#: REQUEST ASKED FOR is an answer even when the reason is blank: the platform
+#: looked the post up and said, about that post, that there is nothing to see.
+#:
 #: What still reads as withholding is `aweme_detail` empty with no
-#: `filter_detail` at all - the payload gone with nothing said about it, which
-#: is what :func:`_withheld_payload` fires on.
+#: `filter_detail` at all, or with one that names no post or another one - the
+#: payload gone with nothing said about it, which is what
+#: :func:`_withheld_payload` fires on.
 PAYLOAD_REASON_KEYS: Final[tuple[str, ...]] = ("filter_detail",)
+#: The field in that container naming the post, and the query parameter the
+#: request named it by. Compared, never trusted alone: an id that is not the
+#: one asked for says nothing about this request.
+PAYLOAD_REASON_ID_PARAMS: Final[Mapping[str, str]] = MappingProxyType({"aweme_id": "aweme_id"})
+#: The detail reported for that case, so a log line says which one it was.
+PAYLOAD_REASON_UNGIVEN: Final = "no reason given"
 #: The field naming why, as a machine code. Observed: "core_dep" (no such post)
 #: and "status_self_see" (owner-only).
 PAYLOAD_REASON_CODE_KEYS: Final[tuple[str, ...]] = ("filter_reason",)
@@ -400,6 +463,13 @@ def _business_envelope_status(view: ResponseView) -> RuleResult:
     return False
 
 
+def _login_envelope_status(view: ResponseView) -> RuleResult:
+    status = view.envelope_status
+    if status is not None and status in LOGIN_STATUS_VALUES:
+        return f"{status}: {LOGIN_STATUS_VALUES[status]}"
+    return False
+
+
 def _challenge_marker(view: ResponseView) -> RuleResult:
     envelope_status = view.envelope_status
     if view.envelope is not None and envelope_status == 0:
@@ -540,12 +610,28 @@ def _explained_absence(view: ResponseView) -> RuleResult:
         message = _first_text(reason, PAYLOAD_REASON_MESSAGE_KEYS)
         # Either half is the platform speaking about this post. A code with no
         # sentence is the ordinary case for a post that does not exist; a
-        # sentence with no code is what a withheld one carries. An empty
-        # container says nothing and is left to `payload.withheld`.
+        # sentence with no code is what a withheld one carries. Neither, but
+        # the post the request asked for named by id, is a deleted post as
+        # Douyin answers it now. Anything less is left to `payload.withheld`.
         if code and message:
             return f"{code}: {message}"
         if code or message:
             return code or message or False
+        if _names_the_requested_post(reason, view.response.final_url):
+            return PAYLOAD_REASON_UNGIVEN
+    return False
+
+
+def _names_the_requested_post(reason: Mapping[str, Any], url: str) -> bool:
+    """Whether ``reason`` names, by id, the post ``url`` asked for."""
+    if not url:
+        return False
+    asked = parse_qs(urlsplit(url).query)
+    for field, param in PAYLOAD_REASON_ID_PARAMS.items():
+        named = reason.get(field)
+        wanted = asked.get(param)
+        if isinstance(named, str) and named and wanted and wanted[0] == named:
+            return True
     return False
 
 
@@ -625,6 +711,7 @@ DEFAULT_RULES: Final[tuple[ClassificationRule, ...]] = (
     ClassificationRule("http.network_status", Outcome.NETWORK_ERROR, _network_status),
     ClassificationRule("envelope.risk_code", Outcome.RISK_CONTROL, _risk_envelope_status),
     ClassificationRule("envelope.business_code", Outcome.BUSINESS_ERROR, _business_envelope_status),
+    ClassificationRule(LOGIN_REQUIRED_RULE, Outcome.BUSINESS_ERROR, _login_envelope_status),
     ClassificationRule("body.challenge_marker", Outcome.RISK_CONTROL, _challenge_marker),
     ClassificationRule("signature.refused", Outcome.RISK_CONTROL, _signature_refused),
     ClassificationRule("http.risk_status", Outcome.RISK_CONTROL, _risk_status),
@@ -747,6 +834,8 @@ __all__ = [
     "DEFAULT_RULES",
     "EMPTY_PAYLOAD_KEYS",
     "ENVELOPE_STATUS_KEYS",
+    "LOGIN_REQUIRED_RULE",
+    "LOGIN_STATUS_VALUES",
     "MARKER_SCAN_CHARS",
     "NETWORK_EXCEPTION_NAMES",
     "NETWORK_STATUS_CODES",

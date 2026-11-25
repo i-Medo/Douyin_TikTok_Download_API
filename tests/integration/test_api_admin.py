@@ -17,7 +17,7 @@ from sqlalchemy import delete, select
 
 from dtk.core.db import session_scope
 from dtk.core.types import IdentityState, Platform, Scope, UserRole
-from dtk.db.models import ApiKey, AuditLog, Identity, IdentityEvent, Proxy, Setting
+from dtk.db.models import ApiKey, AuditLog, Identity, IdentityEvent, Proxy, Setting, Task
 from dtk.ops import backup
 from tests.integration import test_api_support as support
 from tests.integration.test_api_support import (
@@ -342,6 +342,87 @@ async def test_deleting_a_proxy_retires_the_identities_behind_it(client: Any) ->
         assert await session.get(Proxy, uuid.UUID(proxy["id"])) is None
 
 
+async def test_the_proxy_list_counts_identities_and_says_why_one_failed(client: Any) -> None:
+    """Both were missing, and together they are the diagnosis in #781: a proxy
+    with no identity behind it, and the one line saying it answered CONNECT
+    with 400."""
+    await signed_in(client)
+    used = envelope(await client.post("/api/v1/admin/proxies", json={"url": PROXY_URL}))["data"]
+    idle = envelope(
+        await client.post("/api/v1/admin/proxies", json={"url": "http://203.0.113.9:3128"})
+    )["data"]
+    await client.post(
+        "/api/v1/admin/identities/import",
+        json={
+            "platform": Platform.DOUYIN.value,
+            "cookies": COOKIE_BLOB,
+            "user_agent": CHROME_UA,
+            "proxy_id": used["id"],
+        },
+    )
+    async with session_scope() as session:
+        row = await session.get(Proxy, uuid.UUID(idle["id"]))
+        assert row is not None
+        row.healthy = False
+        row.last_error = "ProxyError: 400 Bad Request"
+
+    listed = {row["id"]: row for row in envelope(await client.get("/api/v1/admin/proxies"))["data"]}
+
+    assert listed[used["id"]]["identity_count"] == 1
+    assert listed[idle["id"]]["identity_count"] == 0
+    assert listed[idle["id"]]["last_error"] == "ProxyError: 400 Bad Request"
+    assert listed[used["id"]]["last_error"] is None
+
+
+async def test_one_proxy_lists_the_identities_a_delete_would_retire(client: Any) -> None:
+    """The count says how many; the drawer before a delete needs which."""
+    await signed_in(client)
+    proxy = envelope(await client.post("/api/v1/admin/proxies", json={"url": PROXY_URL}))["data"]
+    imported = envelope(
+        await client.post(
+            "/api/v1/admin/identities/import",
+            json={
+                "platform": Platform.DOUYIN.value,
+                "cookies": COOKIE_BLOB,
+                "user_agent": CHROME_UA,
+                "proxy_id": proxy["id"],
+            },
+        )
+    )["data"]
+
+    response = await client.get(f"/api/v1/admin/proxies/{proxy['id']}")
+
+    detail = envelope(response)["data"]
+    assert detail["id"] == proxy["id"]
+    assert detail["identity_count"] == 1
+    assert [row["id"] for row in detail["identities"]] == [imported["identity_id"]]
+    assert detail["identities"][0]["platform"] == Platform.DOUYIN.value
+    # Masked like the list, and the jar never: this is the health view.
+    assert "sup3rsecret" not in response.text
+    assert "0123456789abcdef" not in response.text
+
+
+async def test_reading_a_missing_proxy_is_not_found(client: Any) -> None:
+    await signed_in(client)
+
+    response = await client.get(f"/api/v1/admin/proxies/{uuid.uuid4()}")
+
+    assert error_code(response) == "NOT_FOUND"
+
+
+async def test_a_viewer_may_read_a_proxy_but_not_delete_it(client: Any) -> None:
+    """The console hides the delete from a viewer; the server is what refuses it."""
+    await signed_in(client)
+    proxy = envelope(await client.post("/api/v1/admin/proxies", json={"url": PROXY_URL}))["data"]
+    await client.post("/api/v1/auth/logout")
+    await signed_in(client, username="watcher", role=UserRole.VIEWER)
+
+    assert (await client.get(f"/api/v1/admin/proxies/{proxy['id']}")).status_code == 200
+    assert error_code(await client.delete(f"/api/v1/admin/proxies/{proxy['id']}")) == (
+        "FORBIDDEN_SCOPE"
+    )
+
+
 async def test_updating_a_proxy_re_encrypts_under_its_own_id(client: Any) -> None:
     await signed_in(client)
     proxy = envelope(await client.post("/api/v1/admin/proxies", json={"url": PROXY_URL}))["data"]
@@ -464,6 +545,112 @@ async def test_a_new_key_is_shown_once_and_then_never_again(client: Any, api_app
         )
     assert denied.status_code == 401
     assert {"api_key.created", "api_key.revoked"} <= set(await audit_actions())
+
+
+async def test_an_edited_key_keeps_working_with_its_new_scopes(client: Any, api_app: Any) -> None:
+    """The 5.1.6 notes tell operators to edit a key to add `bilibili:read`.
+
+    There was no edit: the only way to widen a key was to mint another and hand
+    it to every script that held the first. The key itself must not change, or
+    an edit is a re-mint with extra steps.
+    """
+    await signed_in(client)
+    created = envelope(
+        await client.post(
+            "/api/v1/admin/api-keys",
+            json={"name": "scripts", "scopes": [Scope.DOUYIN_READ.value]},
+        )
+    )["data"]
+    headers = {"Authorization": f"Bearer {created['key']}"}
+
+    async with anonymous_client(api_app) as caller:
+        before = await caller.get("/api/v1/archive/stats", headers=headers)
+        assert before.status_code == 403
+
+        response = await client.patch(
+            f"/api/v1/admin/api-keys/{created['id']}",
+            json={
+                "name": "nightly scripts",
+                "scopes": [Scope.DOUYIN_READ.value, Scope.ARCHIVE_READ.value],
+            },
+        )
+        assert response.status_code == 200, response.text
+        row = envelope(response)["data"]
+        assert row["name"] == "nightly scripts"
+        assert set(row["scopes"]) == {Scope.DOUYIN_READ.value, Scope.ARCHIVE_READ.value}
+        assert row["prefix"] == created["prefix"]
+        assert created["key"] not in response.text
+
+        after = await caller.get("/api/v1/archive/stats", headers=headers)
+        assert after.status_code == 200
+
+    async with session_scope() as session:
+        audit = (
+            await session.scalars(select(AuditLog).where(AuditLog.action == "api_key.updated"))
+        ).one()
+    assert audit.target_id == created["id"]
+    assert set(audit.detail["fields"]) == {"name", "scopes"}
+    assert audit.detail["from"]["scopes"] == [Scope.DOUYIN_READ.value]
+
+
+async def test_an_edit_with_nothing_in_it_is_refused(client: Any) -> None:
+    user_id = await signed_in(client)
+    await make_api_key(user_id)
+    key_id = envelope(await client.get("/api/v1/admin/api-keys"))["data"][0]["id"]
+    response = await client.patch(f"/api/v1/admin/api-keys/{key_id}", json={})
+    assert error_code(response) == "INVALID_PARAM"
+
+
+async def test_editing_a_key_that_does_not_exist_is_a_404(client: Any) -> None:
+    await signed_in(client)
+    response = await client.patch(f"/api/v1/admin/api-keys/{uuid.uuid4()}", json={"name": "x"})
+    assert response.status_code == 404
+
+
+async def test_a_revoked_key_cannot_be_edited(client: Any) -> None:
+    """Nothing can use it again; widening it would only make the audit trail
+    claim a key had a reach it never exercised."""
+    user_id = await signed_in(client)
+    await make_api_key(user_id)
+    key_id = envelope(await client.get("/api/v1/admin/api-keys"))["data"][0]["id"]
+    assert (await client.delete(f"/api/v1/admin/api-keys/{key_id}")).status_code == 200
+
+    response = await client.patch(
+        f"/api/v1/admin/api-keys/{key_id}", json={"scopes": [Scope.BILIBILI_READ.value]}
+    )
+    assert error_code(response) == "INVALID_PARAM"
+    assert envelope(response)["error"]["details"]["status"] == "revoked"
+
+
+async def test_a_key_cannot_edit_another_past_its_own_scopes(api_app: Any) -> None:
+    """The escalation the create route closed, reopened by an edit if the edit
+    did not run the same check."""
+    user_id = await make_user()
+    await make_api_key(user_id, scopes=(Scope.DOUYIN_READ,), name="target")
+    caller = await make_api_key(user_id, scopes=(Scope.IDENTITY_MANAGE,), name="caller")
+    async with session_scope() as session:
+        target_id = (await session.scalars(select(ApiKey.id).where(ApiKey.name == "target"))).one()
+
+    async with anonymous_client(api_app) as http:
+        response = await http.patch(
+            f"/api/v1/admin/api-keys/{target_id}",
+            json={"scopes": [Scope.ADMIN.value]},
+            headers={"Authorization": f"Bearer {caller}"},
+        )
+    assert response.status_code == 403
+    async with session_scope() as session:
+        stored = await session.get(ApiKey, target_id)
+        assert stored is not None
+        assert stored.scopes == [Scope.DOUYIN_READ.value]
+
+
+async def test_a_viewer_cannot_edit_a_key(client: Any) -> None:
+    owner = await make_user(username="owner")
+    await make_api_key(owner)
+    await signed_in(client, username="watcher", role=UserRole.VIEWER)
+    key_id = envelope(await client.get("/api/v1/admin/api-keys"))["data"][0]["id"]
+    response = await client.patch(f"/api/v1/admin/api-keys/{key_id}", json={"name": "mine now"})
+    assert response.status_code == 403
 
 
 async def test_key_creation_rejects_a_past_expiry(client: Any) -> None:
@@ -1012,6 +1199,29 @@ async def test_maintenance_jobs_are_queued(client: Any) -> None:
         response = await client.post(path, json=body)
         assert response.status_code == 202, path
         assert envelope(response)["data"]["task_id"]
+
+
+async def test_the_self_check_carries_the_platform_it_was_asked_for(client: Any) -> None:
+    """Chosen, it reaches the worker; unchosen, it is absent so the worker picks."""
+    await signed_in(client)
+
+    chosen = await client.post(
+        "/api/v1/admin/diagnose", json={"include_smoke_test": True, "platform": "bilibili"}
+    )
+    unchosen = await client.post("/api/v1/admin/diagnose", json={"include_smoke_test": True})
+
+    async with session_scope() as session:
+        params = {str(row.id): row.params for row in (await session.scalars(select(Task))).all()}
+    assert params[envelope(chosen)["data"]["task_id"]]["platform"] == "bilibili"
+    assert "platform" not in params[envelope(unchosen)["data"]["task_id"]]
+
+
+async def test_the_self_check_refuses_a_platform_it_does_not_know(client: Any) -> None:
+    await signed_in(client)
+
+    response = await client.post("/api/v1/admin/diagnose", json={"platform": "kuaishou"})
+
+    assert error_code(response) == "INVALID_PARAM"
 
 
 async def test_backup_is_administrator_only(client: Any) -> None:

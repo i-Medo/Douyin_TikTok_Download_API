@@ -18,10 +18,10 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from dtk.core.errors import ErrorCode, TaskNotFound
+from dtk.core.errors import ErrorCode, QueueFull, TaskNotFound
 from dtk.core.logging import get_logger
 from dtk.core.redis import get_redis
-from dtk.core.types import TaskState
+from dtk.core.types import RejectReason, TaskState
 from dtk.db.models import Task
 
 log = get_logger(__name__)
@@ -43,6 +43,11 @@ class TaskView:
     error: dict[str, Any] | None
     created_at: datetime
     finished_at: datetime | None
+    is_demo: bool = False
+    #: Sent as one named identity, so its result is what that session can see
+    #: - a logged-in account's bookmarks, likes, private folders. Reading it
+    #: back costs what naming the identity cost.
+    pinned: bool = False
 
 
 async def create(
@@ -101,6 +106,34 @@ async def enqueue(task_id: uuid.UUID, *, endpoint: str = "") -> None:
     log.info("task.submitted", task_id=str(task_id), endpoint=endpoint)
 
 
+async def refuse_when_queue_full(config: Any, *, endpoint: str) -> None:
+    """Shed load rather than accept work nobody will get to.
+
+    ``sched.queue_max`` was a setting the console exposed and nothing read, and
+    RejectReason.QUEUE_FULL was defined and never raised - so the queue grew
+    without bound and every caller waited instead of being told to come back.
+    Doc 03 is explicit that rejecting early beats queueing: a caller left
+    hanging is worse off than one that gets a Retry-After immediately.
+
+    Lives here rather than beside the route that first needed it because the
+    download and transcription starts are services shared with MCP, and a copy
+    of this check in each had already drifted from the original by one log line.
+    """
+    ceiling = int(config.get("sched.queue_max"))
+    if ceiling <= 0:
+        return
+    depth = int(await get_redis().llen(QUEUE_KEY))
+    if depth < ceiling:
+        return
+    retry_after = max(1, int(config.get("sched.max_wait_seconds")))
+    log.warning("task.queue_full", endpoint=endpoint, depth=depth, ceiling=ceiling)
+    raise QueueFull(
+        f"{depth} tasks are already queued, at the configured ceiling of {ceiling}",
+        retry_after=retry_after,
+        details={"reject_reason": RejectReason.QUEUE_FULL.value, "queued": depth},
+    )
+
+
 async def submit_now(
     endpoint: str,
     params: dict[str, Any],
@@ -155,8 +188,46 @@ async def finish(
     task.error = error
     task.finished_at = datetime.now(UTC)
     await session.flush()
-    await _signal(task_id)
     log.info("task.finished", task_id=str(task_id), state=task.state)
+
+
+async def wake_waiters(task_id: uuid.UUID) -> None:
+    """Tell anyone long-polling this task to read it again.
+
+    Call it after the commit that made the task final, never before. It used to
+    be the last step of :func:`finish`, which runs inside the caller's
+    transaction: a waiter woke, read the row before that commit landed, saw it
+    still running, and went back to a blocking wait of up to five seconds - so
+    a request refused in milliseconds answered five seconds later.
+    """
+    await _signal(task_id)
+
+
+async def settle_unpublished(session: AsyncSession, task_id: uuid.UUID, reason: str) -> None:
+    """Fail a committed task whose id never reached the queue, as far as possible.
+
+    Called when the publish failed, which almost always means Redis is down -
+    and waking the waiters goes through Redis. So the row is committed first
+    and the wake-up attempted after, on its own; if even the commit fails, the
+    task stays queued and the orphan sweep picks it up, which is a delay rather
+    than a loss.
+    """
+    from dtk.core.errors import Internal
+    from dtk.worker import serialize_error
+
+    try:
+        await finish(session, task_id, error=serialize_error(Internal(reason)))
+    except Exception as exc:
+        log.warning("task.settle_finish_failed", task_id=str(task_id), error=type(exc).__name__)
+    try:
+        await session.commit()
+    except Exception as exc:
+        log.warning("task.settle_commit_failed", task_id=str(task_id), error=type(exc).__name__)
+        return
+    try:
+        await wake_waiters(task_id)
+    except Exception as exc:
+        log.warning("task.settle_signal_failed", task_id=str(task_id), error=type(exc).__name__)
 
 
 async def _signal(task_id: uuid.UUID) -> None:
@@ -193,7 +264,8 @@ async def cancel(session: AsyncSession, task_id: uuid.UUID) -> str:
     task.error = {"code": ErrorCode.CANCELLED.value, "message": "cancelled by the caller"}
     task.finished_at = datetime.now(UTC)
     await session.flush()
-    await _signal(task_id)
+    # No wake-up here, for the reason wake_waiters gives: the caller commits,
+    # then wakes.
     log.info("task.cancelled", task_id=str(task_id))
     return TaskState.FAILED.value
 
@@ -210,6 +282,8 @@ async def get(session: AsyncSession, task_id: uuid.UUID) -> TaskView:
         error=task.error,
         created_at=task.created_at,
         finished_at=task.finished_at,
+        is_demo=task.is_demo,
+        pinned=bool((task.params or {}).get("identity")),
     )
 
 
@@ -288,7 +362,10 @@ __all__ = [
     "finish",
     "get",
     "mark_running",
+    "refuse_when_queue_full",
     "serialize",
+    "settle_unpublished",
     "submit_now",
     "wait_for",
+    "wake_waiters",
 ]
