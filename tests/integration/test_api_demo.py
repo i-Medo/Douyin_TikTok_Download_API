@@ -10,14 +10,15 @@ behind.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from sqlalchemy import func, select
 
 from dtk.core.db import session_scope
-from dtk.core.types import Outcome, Platform, Scope, UserRole
-from dtk.db.models import ApiKey, RequestLog, Task, User
+from dtk.core.types import PLATFORM_READ_SCOPES, Outcome, Platform, Scope, UserRole
+from dtk.db.models import ApiKey, Identity, RequestLog, Task, User
 from dtk.services import demo
 from tests.integration import test_api_support as support
 from tests.integration.test_api_support import (
@@ -71,13 +72,13 @@ def _set_demo(app: Any, enabled: bool) -> None:
 # --------------------------------------------------------------------------
 
 
-async def test_provisioning_creates_one_account_with_the_two_read_scopes(api_app: Any) -> None:
+async def test_provisioning_creates_one_account_with_the_platform_read_scopes(api_app: Any) -> None:
     credentials = await _provision(api_app)
 
     assert credentials.username == demo.DEMO_USERNAME
     assert credentials.password
     assert credentials.api_key and credentials.api_key.startswith("dtk_")
-    assert set(credentials.scopes) == {Scope.DOUYIN_READ.value, Scope.TIKTOK_READ.value}
+    assert set(credentials.scopes) == {scope.value for scope in PLATFORM_READ_SCOPES}
 
     async with session_scope() as session:
         users = await session.scalar(
@@ -173,6 +174,7 @@ async def test_the_published_key_stops_working_when_the_switch_goes_off(api_app:
     "path",
     [
         "/api/v1/admin/identities",
+        "/api/v1/admin/identities/coverage",
         "/api/v1/admin/proxies",
         "/api/v1/admin/users",
         "/api/v1/admin/settings",
@@ -194,6 +196,95 @@ async def test_the_demo_console_cannot_read_the_credential_pages(
 
     response = await client.get(path)
     assert response.status_code == 403, f"{path} answered {response.status_code}"
+
+
+async def test_the_demo_cannot_read_transcriptions_even_with_a_known_id(
+    api_app: Any, client: Any
+) -> None:
+    credentials = await _provision(api_app)
+    _set_demo(api_app, True)
+    await login(client, demo.DEMO_USERNAME, credentials.password or "")
+    transcription_id = uuid.uuid4()
+
+    response = await client.get(f"/api/v1/transcriptions/{transcription_id}")
+    assert response.status_code == 403
+
+    await signed_in(client, username="transcription-viewer", role=UserRole.VIEWER)
+    response = await client.get(f"/api/v1/transcriptions/{transcription_id}")
+    assert response.status_code == 404
+
+
+async def test_the_demo_can_read_only_demo_task_results(api_app: Any, client: Any) -> None:
+    from datetime import UTC, datetime
+
+    from dtk.core.types import TaskState
+
+    real_task_id = uuid.uuid4()
+    demo_task_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    async with session_scope() as session:
+        for task_id, is_demo in ((real_task_id, False), (demo_task_id, True)):
+            session.add(
+                Task(
+                    id=task_id,
+                    endpoint="douyin.content_detail",
+                    params={},
+                    state=TaskState.DONE.value,
+                    result={"secret": "result"},
+                    created_at=now,
+                    finished_at=now,
+                    is_demo=is_demo,
+                )
+            )
+
+    credentials = await _provision(api_app)
+    _set_demo(api_app, True)
+    await login(client, demo.DEMO_USERNAME, credentials.password or "")
+
+    assert (await client.get(f"/api/v1/tasks/{real_task_id}")).status_code == 403
+    assert (await client.get(f"/api/v1/tasks/{real_task_id}/events")).status_code == 403
+    allowed = await client.get(f"/api/v1/tasks/{demo_task_id}")
+    assert allowed.status_code == 200
+    assert envelope(allowed)["data"]["data"] == {"secret": "result"}
+
+
+async def test_the_demo_reads_the_request_log_without_identity_notes(
+    api_app: Any, client: Any
+) -> None:
+    """A note is where somebody writes whose account a login is."""
+    identity_id = uuid.uuid4()
+    async with session_scope() as session:
+        session.add(
+            Identity(
+                id=identity_id,
+                platform="douyin",
+                state="active",
+                cookies_encrypted=b"ciphertext",
+                fingerprint={},
+                source="imported",
+                note="phone 13800000000",
+            )
+        )
+        session.add(
+            RequestLog(
+                ts=datetime.now(UTC),
+                request_id=uuid.uuid4(),
+                platform="douyin",
+                endpoint="douyin.content_detail",
+                identity_id=identity_id,
+                outcome="ok",
+                duration_ms=100,
+            )
+        )
+    credentials = await _provision(api_app)
+    _set_demo(api_app, True)
+    await login(client, demo.DEMO_USERNAME, credentials.password or "")
+
+    response = await client.get("/api/v1/admin/logs/requests")
+
+    assert response.status_code == 200, response.text
+    assert [row["identity_note"] for row in envelope(response)["data"]] == [None]
+    assert "13800000000" not in response.text
 
 
 @pytest.mark.parametrize(
@@ -359,6 +450,141 @@ async def test_the_demo_role_cannot_be_assigned_by_hand(api_app: Any, client: An
     assert error_code(response) == "INVALID_PARAM"
 
 
+@pytest.mark.parametrize("role", ["admin", "operator", "viewer"])
+async def test_the_demo_account_cannot_be_promoted(api_app: Any, client: Any, role: str) -> None:
+    """Only *assigning* the demo role was refused, so the reverse went through.
+
+    The Users page saves a role the moment its picker changes, which made one
+    stray click enough to turn the account whose password the login page prints
+    for strangers into an administrator.
+    """
+    await _provision(api_app)
+    await signed_in(client)
+    async with session_scope() as session:
+        account = await demo.find_user(session)
+        assert account is not None
+        account_id = account.id
+
+    response = await client.put(f"/api/v1/admin/users/{account_id}", json={"role": role})
+    assert error_code(response) == "INVALID_PARAM"
+    async with session_scope() as session:
+        stored = await session.get(User, account_id)
+        assert stored is not None
+        assert stored.role == UserRole.DEMO.value
+
+
+async def test_the_demo_password_is_not_reset_by_hand(api_app: Any, client: Any) -> None:
+    """The login page shows a stored copy of it, which a reset would leave
+    behind: the published password would stop working while still printed."""
+    credentials = await _provision(api_app)
+    _set_demo(api_app, True)
+    async with anonymous_client(api_app) as admin:
+        await signed_in(admin)
+        async with session_scope() as session:
+            account = await demo.find_user(session)
+            assert account is not None
+        response = await admin.put(
+            f"/api/v1/admin/users/{account.id}", json={"password": "chosen by an admin"}
+        )
+    assert error_code(response) == "INVALID_PARAM"
+    assert (await login(client, demo.DEMO_USERNAME, credentials.password or "")).status_code == 200
+
+
+async def test_the_demo_account_cannot_be_deleted(api_app: Any, client: Any) -> None:
+    """Switching it off is how it is withdrawn; deleting it leaves the switch on
+    with nothing behind it."""
+    await _provision(api_app)
+    await signed_in(client)
+    async with session_scope() as session:
+        account = await demo.find_user(session)
+        assert account is not None
+
+    response = await client.delete(f"/api/v1/admin/users/{account.id}")
+    assert error_code(response) == "INVALID_PARAM"
+    async with session_scope() as session:
+        assert await demo.find_user(session) is not None
+
+
+# --------------------------------------------------------------------------
+# Who sees the demo's state
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("role", [UserRole.OPERATOR, UserRole.VIEWER])
+async def test_every_console_reader_sees_whether_the_demo_runs(
+    api_app: Any, client: Any, role: UserRole
+) -> None:
+    """The Settings card read a 403 here as "off" and showed a running demo as
+    switched off to everyone below administrator."""
+    await _provision(api_app)
+    _set_demo(api_app, True)
+    await signed_in(client, username="reader", role=role)
+
+    response = await client.get("/api/v1/admin/demo")
+    assert response.status_code == 200, response.text
+    data = envelope(response)["data"]
+    assert data["enabled"] is True
+    assert data["provisioned"] is True
+    assert data["password"] is None
+    assert data["api_key"] is None
+
+
+async def test_only_an_administrator_reissues_the_demo(api_app: Any, client: Any) -> None:
+    await _provision(api_app)
+    _set_demo(api_app, True)
+    await signed_in(client, username="op", role=UserRole.OPERATOR)
+    assert (await client.post("/api/v1/admin/demo/rotate")).status_code == 403
+
+
+async def test_the_demo_console_still_cannot_read_the_demo_state(api_app: Any, client: Any) -> None:
+    credentials = await _provision(api_app)
+    _set_demo(api_app, True)
+    await login(client, demo.DEMO_USERNAME, credentials.password or "")
+    assert (await client.get("/api/v1/admin/demo")).status_code == 403
+
+
+async def test_a_key_minted_by_an_older_release_is_reported_as_missing_scopes(
+    api_app: Any, client: Any
+) -> None:
+    """A demo published before 5.1.6 kept refusing Bilibili, and nothing on
+    the console said a reissue would fix it."""
+    await _provision(api_app)
+    _set_demo(api_app, True)
+    async with session_scope() as session:
+        account = await demo.find_user(session)
+        assert account is not None
+        key = await demo.find_key(session, account.id)
+        assert key is not None
+        key.scopes = [Scope.DOUYIN_READ.value, Scope.TIKTOK_READ.value]
+    await signed_in(client)
+
+    stale = envelope(await client.get("/api/v1/admin/demo"))["data"]
+    assert stale["missing_scopes"] == [Scope.BILIBILI_READ.value]
+
+    rotated = envelope(await client.post("/api/v1/admin/demo/rotate"))["data"]
+    assert rotated["missing_scopes"] == []
+    fresh = envelope(await client.get("/api/v1/admin/demo"))["data"]
+    assert fresh["missing_scopes"] == []
+
+
+async def test_the_demo_key_cannot_be_widened_by_an_edit(api_app: Any, client: Any) -> None:
+    """Its scopes are what the demo service publishes to strangers. An edit
+    route that let an operator add `archive:export` to it would publish a copy
+    of the database."""
+    await _provision(api_app)
+    _set_demo(api_app, True)
+    await signed_in(client)
+    rows = envelope(await client.get("/api/v1/admin/api-keys"))["data"]
+    published = next(row for row in rows if row["name"] == demo.DEMO_KEY_NAME)
+
+    response = await client.patch(
+        f"/api/v1/admin/api-keys/{published['id']}",
+        json={"scopes": [Scope.ARCHIVE_EXPORT.value]},
+    )
+    assert error_code(response) == "INVALID_PARAM"
+    assert envelope(response)["error"]["details"]["setting"] == demo.SETTING_KEY
+
+
 # --------------------------------------------------------------------------
 # The published pair, which is readable on purpose
 # --------------------------------------------------------------------------
@@ -410,6 +636,7 @@ async def test_the_demo_key_is_listed_in_full_and_others_are_not(api_app: Any, c
     ordinary = by_name["an operator's key"]
     assert ordinary["demo"] is False
     assert ordinary["secret"] is None
+    assert ordinary["demo_owned"] is False
 
 
 async def test_the_demo_key_stops_being_readable_when_the_demo_is_off(
@@ -423,6 +650,35 @@ async def test_the_demo_key_stops_being_readable_when_the_demo_is_off(
     published = next(row for row in rows if row["name"] == demo.DEMO_KEY_NAME)
     assert published["secret"] is None
     assert published["demo"] is False
+    # Still the demo's, which is what keeps the console from offering an edit
+    # the server refuses.
+    assert published["demo_owned"] is True
+
+
+async def test_a_rotation_logs_the_demo_out_and_nobody_else(api_app: Any) -> None:
+    """Rotating answered 500 on any instance where anybody had logged in.
+
+    Every session keeps a ``session:meta:{token}`` hash beside its
+    ``session:{token}`` string, under the same prefix the demo's logout used to
+    scan, and GET on a hash raises WRONGTYPE. So the reissue the 5.1.6 upgrade
+    notes ask for failed and rolled back, and turning the switch off left the
+    demo's sessions alive behind a logged error.
+    """
+    credentials = await _provision(api_app)
+    _set_demo(api_app, True)
+    async with anonymous_client(api_app) as admin, anonymous_client(api_app) as visitor:
+        await signed_in(admin)
+        assert (
+            await login(visitor, demo.DEMO_USERNAME, credentials.password or "")
+        ).status_code == 200
+        assert (await visitor.get("/api/v1/system/status")).status_code == 200
+
+        rotated = await admin.post("/api/v1/admin/demo/rotate")
+        assert rotated.status_code == 200, rotated.text
+        assert envelope(rotated)["data"]["password"] != credentials.password
+
+        assert (await visitor.get("/api/v1/system/status")).status_code == 401
+        assert (await admin.get("/api/v1/system/status")).status_code == 200
 
 
 async def test_a_rotation_changes_what_the_login_page_offers(api_app: Any) -> None:

@@ -8,7 +8,9 @@ between a convention and its slow erosion.
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 from typing import ClassVar
 
@@ -16,6 +18,8 @@ import pytest
 
 from dtk.signing.native.abogus import structure_error
 from tests.support.marks import is_project_mark as _is_project_mark
+from tests.support.shell_code import differences as _installer_differences
+from tests.support.shell_code import skeleton as _shell_skeleton
 
 REPO = Path(__file__).resolve().parents[2]
 SRC = REPO / "src" / "dtk"
@@ -710,6 +714,79 @@ def test_the_heaviest_service_is_bounded_below_the_host() -> None:
     assert float(browser["cpus"]) <= 4.0
 
 
+def _dockerfile_lines(dockerfile: str) -> list[str]:
+    return (REPO / "docker" / dockerfile).read_text(encoding="utf-8").splitlines()
+
+
+def _declared_args(dockerfile: str) -> set[str]:
+    return {
+        match.group(1)
+        for line in _dockerfile_lines(dockerfile)
+        if (match := re.match(r"ARG ([A-Za-z_][A-Za-z0-9_]*)", line))
+    }
+
+
+def test_every_build_arg_compose_passes_is_declared_where_it_lands() -> None:
+    """Docker drops an undeclared build argument with one warning and builds on.
+
+    A misspelt or forgotten one therefore looks set in `.env` and changes
+    nothing - for a mirror, a build that still times out against the server
+    the operator believes they routed around.
+    """
+    import yaml
+
+    compose = yaml.safe_load(_compose_source())
+    for name, service in (compose.get("services") or {}).items():
+        build = service.get("build")
+        if not isinstance(build, dict):
+            continue
+        dockerfile = Path(build["dockerfile"]).name
+        declared = _declared_args(dockerfile)
+        for arg in build.get("args") or {}:
+            assert arg in declared, f"{name} passes {arg}, which {dockerfile} never declares"
+
+
+#: The images an install builds on its own machine, and the package mirrors each
+#: build reads from `.env` (issue 817). The app image is absent on purpose:
+#: `uv sync --frozen` downloads from the URLs uv.lock recorded whatever index is
+#: configured - checked against uv 0.9.18 with an unreachable index, which it
+#: never contacted - so a PyPI mirror there would be a switch that does nothing.
+#: That image is published; a mainland install pulls it through a registry mirror.
+LOCAL_BUILD_MIRRORS = {
+    "browser-rpc": ("Dockerfile.browser", ("APT_MIRROR", "PYPI_MIRROR")),
+    "transcriber": ("Dockerfile.transcriber", ("PYPI_MIRROR",)),
+}
+
+
+@pytest.mark.parametrize("service", sorted(LOCAL_BUILD_MIRRORS))
+def test_a_locally_built_image_reads_its_mirrors_from_env(service: str) -> None:
+    import yaml
+
+    dockerfile, mirrors = LOCAL_BUILD_MIRRORS[service]
+    args = yaml.safe_load(_compose_source())["services"][service]["build"].get("args") or {}
+    for mirror in mirrors:
+        # Unset means the official servers. Not `${X}`: compose warns about
+        # every unset variable, on every command, to every operator.
+        assert args.get(mirror) == f"${{{mirror}:-}}", f"{service} does not pass {mirror}"
+        assert mirror in _declared_args(dockerfile)
+
+
+@pytest.mark.parametrize("service", sorted(LOCAL_BUILD_MIRRORS))
+def test_the_mirrors_are_in_place_before_the_first_install(service: str) -> None:
+    """A mirror applied after `apt-get` or `pip install` has already run is no mirror."""
+    dockerfile, _ = LOCAL_BUILD_MIRRORS[service]
+    lines = _dockerfile_lines(dockerfile)
+    applied = [i for i, line in enumerate(lines) if "package-mirrors.sh" in line]
+    installs = [
+        i
+        for i, line in enumerate(lines)
+        if not line.lstrip().startswith("#") and re.search(r"apt-get|pip install", line)
+    ]
+    assert applied, f"{dockerfile} never runs docker/package-mirrors.sh"
+    assert installs, f"{dockerfile} installs nothing; drop it from LOCAL_BUILD_MIRRORS"
+    assert min(applied) < min(installs), f"{dockerfile} installs before it applies the mirrors"
+
+
 def test_the_integration_suite_clears_every_table() -> None:
     """A table missing from TABLES leaks rows between tests.
 
@@ -784,29 +861,11 @@ class TestInstallScripts:
 
     @classmethod
     def _signature(cls, path):
-        lines: list[str] = []
-        in_heredoc = False
-        tag = ""
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if in_heredoc:
-                # A heredoc body is prose for the reader, not code, and the
-                # English one contains words like "for" and "then".
-                if line.strip() == tag:
-                    in_heredoc = False
-                continue
-            opened = re.search(r"<<-?\s*([A-Za-z_]\w*)", line)
-            if opened:
-                in_heredoc, tag = True, opened.group(1)
-                lines.append(line[: opened.start()])
-                continue
-            if line.strip().startswith("#"):
-                continue
-            lines.append(line)
-        body = "\n".join(lines)
-        body = re.sub(r'"(?:[^"\\]|\\.)*"', '""', body, flags=re.S)
-        body = re.sub(r"'(?:[^'\\]|\\.)*'", "''", body, flags=re.S)
+        # Strings emptied by a reader that knows `$( )` and quotes nest inside
+        # them: a regex over quote pairs lost its place at the first
+        # "$(printf '%s' "$x" | tr ...)" and read prose as code from there on.
         signature: list[str] = []
-        for line in body.splitlines():
+        for line in _shell_skeleton(path).splitlines():
             named = re.match(r"^(\w+)\(\)", line)
             if named:
                 signature.append(f"fn:{named.group(1)}")
@@ -823,6 +882,19 @@ class TestInstallScripts:
         assert english == chinese, (
             "install.sh and install.zh.sh have diverged. They are a translation "
             "of each other: a change to one belongs in the other."
+        )
+
+    def test_the_two_installers_run_the_same_code(self):
+        """Every line that does something, and every string in it.
+
+        The structure above is control-flow words only, and a copy with
+        ``MEM_MIB / 9`` made ``/ 2`` or ``--ff-only`` made ``--no-ff`` still
+        matched it. Here a string has to be the same on both sides or
+        translated; only comments and the lines that print are free.
+        """
+        found = _installer_differences(*self.SCRIPTS)
+        assert not found, "install.zh.sh does something install.sh does not:\n" + "\n".join(
+            found[:20]
         )
 
     @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
@@ -854,16 +926,181 @@ class TestInstallScripts:
         # Blank out every string literal first, including the multi-line ones:
         # the scripts *document* the `curl … | bash` form inside their own help
         # text, and quoting it is not running it.
-        body = script.read_text(encoding="utf-8")
-        body = "\n".join(line for line in body.splitlines() if not line.strip().startswith("#"))
-        body = re.sub(r'"(?:[^"\\]|\\.)*"', '""', body, flags=re.S)
-        body = re.sub(r"'(?:[^'\\]|\\.)*'", "''", body, flags=re.S)
+        body = _shell_skeleton(script)
         offenders = [
             f"{script.name}: {line.strip()[:80]}"
             for line in body.splitlines()
             if re.search(r"(curl|wget)[^|#]*\|\s*(sudo\s+)?(ba)?sh\b", line)
         ]
         assert not offenders, "pipes remote code into a shell:\n" + "\n".join(offenders)
+
+    @staticmethod
+    def _function(script, name):
+        body = script.read_text(encoding="utf-8")
+        found = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", body, flags=re.M | re.S)
+        assert found, f"{script.name} has no {name}"
+        return found.group(0)
+
+    @staticmethod
+    def _help(script, prefix):
+        return subprocess.run(
+            ["bash", str(script), "--help"],
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": "/nonexistent",
+                "DTK_GH_PROXY": prefix,
+            },
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+        )
+
+    @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "http://mirror.example/",
+            "mirror.example/",
+            "https://",
+            " https://mirror.example/",
+            "https://mirror.example/$(id)/",
+            'https://mirror.example/"/',
+        ],
+    )
+    def test_a_mirror_prefix_is_https_and_nothing_else(self, script, prefix):
+        """DTK_GH_PROXY carries the whole install, and lands in dtkctl.
+
+        Over plain http so does anybody on the path. Without a scheme it got as
+        far as git, as "protocol 'gh-proxy.com/https' is not supported". And
+        REPO_RAW, which it prefixes, is written into a double-quoted string in
+        the generated dtkctl, where a `$(` would run.
+        """
+        result = self._help(script, prefix)
+        assert result.returncode == 1, f"{script.name} took DTK_GH_PROXY={prefix!r}"
+        assert "DTK_GH_PROXY" in result.stderr
+
+    @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
+    @pytest.mark.parametrize(
+        "prefix",
+        ["", "https://mirror.example", "https://mirror.example///", "https://m.example:8443/gh/"],
+    )
+    def test_an_https_mirror_prefix_is_taken(self, script, prefix):
+        result = self._help(script, prefix)
+        assert result.returncode == 0, result.stderr
+
+    @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
+    @pytest.mark.parametrize(
+        ("repo_url", "assume_yes", "typed", "goes_ahead"),
+        [
+            ("github", "0", "", True),
+            ("mirror", "1", "", True),
+            ("mirror", "0", "\n", False),
+            ("mirror", "0", "y\n", True),
+        ],
+        ids=["github-never-asks", "mirror-under-yes", "mirror-enter-stops", "mirror-agreed"],
+    )
+    def test_a_mirror_is_agreed_to_before_the_clone(
+        self, script, tmp_path, repo_url, assume_yes, typed, goes_ahead
+    ):
+        """GitHub is the default; anything else is said in full and asked.
+
+        A mirror hands over all of the code and every upgrade after it, so a
+        bare Enter stops rather than clones. Under --yes the variable that named
+        it is the answer, as DTK_ENABLE_BROWSER=1 is.
+        """
+        github = "https://github.com/Evil0ctal/Douyin_TikTok_Download_API.git"
+        mirror = f"https://mirror.example/{github}"
+        answers = tmp_path / "tty"
+        answers.write_text(typed, encoding="utf-8")
+        functions = "\n".join(
+            self._function(script, name) for name in ("read_line", "ask_yes_no", "confirm_mirror")
+        )
+        prelude = (
+            "warn() { printf '%s\\n' \"$*\" >&2; }\ninfo() { printf '%s\\n' \"$*\"; }\n"
+            "dim() { printf '%s\\n' \"$*\"; }\nstep() { printf '%s\\n' \"$*\"; }\n"
+            "die() { printf '%s\\n' \"$*\" >&2; exit 1; }\n"
+        )
+        result = subprocess.run(
+            ["bash", "-c", f"set -euo pipefail\n{prelude}{functions}\nconfirm_mirror"],
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "GITHUB_REPO_URL": github,
+                "REPO_URL": github if repo_url == "github" else mirror,
+                "ASSUME_YES": assume_yes,
+                "TTY_IN": str(answers),
+                "INSTALL_DIR": "/opt/dtk",
+            },
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+        )
+        assert (result.returncode == 0) is goes_ahead, result.stdout + result.stderr
+        if repo_url == "github":
+            assert not result.stdout and not result.stderr, "asked about GitHub itself"
+        else:
+            assert mirror in result.stdout + result.stderr, "never said which mirror"
+
+    @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
+    def test_a_mirror_is_agreed_to_before_anything_is_fetched_from_it(self, script):
+        # resolve_target already reads the release tags from the clone address.
+        body = self._function(script, "prepare_directory")
+        assert "confirm_mirror" in body, f"{script.name} clones without asking about a mirror"
+        assert body.index("confirm_mirror") < body.index("resolve_target") < body.index("git clone")
+
+    def test_the_browser_pin_is_one_value(self):
+        """The CloakBrowser commit and the Playwright it needs move together.
+
+        docker/compose.yml's default is the commit the browser image installs,
+        and requirements.txt pins what that commit was verified with. The
+        installers read the commit out of the checkout rather than carrying
+        their own copy, so the test runs their reader: if compose.yml's line
+        changes shape, an upgrade must not silently stop finding it. When the
+        commit lived in .env instead, it stayed put while the requirements
+        moved: an install kept CloakBrowser 0.5.10 on top of the Playwright 1.64
+        that 0.6.3 was released to fix.
+        """
+        compose = (REPO / "docker" / "compose.yml").read_text(encoding="utf-8")
+        defaults = re.findall(
+            r"CLOAKBROWSER_COMMIT: \$\{CLOAKBROWSER_COMMIT:-([0-9a-f]{40})\}", compose
+        )
+        assert len(defaults) == 1, "docker/compose.yml has to default CLOAKBROWSER_COMMIT once"
+        requirements = (REPO / "docker" / "browser_rpc" / "requirements.txt").read_text(
+            encoding="utf-8"
+        )
+        verified = re.findall(r"^# verified-with: ([0-9a-f]{40})$", requirements, flags=re.M)
+        assert verified == defaults, (
+            "requirements.txt's verified-with line names another commit than "
+            "docker/compose.yml defaults to - move them together"
+        )
+        for script in self.SCRIPTS:
+            body = script.read_text(encoding="utf-8")
+            reader = re.search(r"^compose_browser_pin\(\) \{\n.*?^\}$", body, flags=re.M | re.S)
+            assert reader, f"{script.name} has no compose_browser_pin"
+            result = subprocess.run(
+                ["bash", "-c", f"set -euo pipefail\n{reader.group(0)}\ncompose_browser_pin"],
+                env={"INSTALL_DIR": str(REPO), "PATH": os.environ.get("PATH", "")},
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            assert result.stdout.strip() == defaults[0], (
+                f"{script.name}'s compose_browser_pin does not read docker/compose.yml's default"
+            )
+            assert "CLOAKBROWSER_PIN=" not in body, (
+                f"{script.name} carries its own CloakBrowser commit again; read the checkout's"
+            )
+
+    def test_nothing_freezes_the_browser_pin_into_an_env_file(self):
+        """A pin in .env outlives the requirements it was verified with.
+
+        .env.example is what a manual install copies, so an active line there
+        is the same freeze the installers used to write.
+        """
+        example = (REPO / ".env.example").read_text(encoding="utf-8")
+        assert not re.search(r"^CLOAKBROWSER_COMMIT=\S", example, flags=re.M), (
+            ".env.example sets CLOAKBROWSER_COMMIT; leave it commented so "
+            "docker/compose.yml's default applies"
+        )
 
 
 def test_the_mark_alphabet_is_the_same_on_both_sides():

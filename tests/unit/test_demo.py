@@ -16,7 +16,7 @@ import pytest
 from dtk.api import demo_readonly
 from dtk.api.deps import Principal
 from dtk.api.routes.support import ROLE_RANK
-from dtk.core.types import Scope, UserRole
+from dtk.core.types import PLATFORM_READ_SCOPES, Scope, UserRole
 from dtk.services import demo
 
 WRITE_METHODS = ("post", "put", "patch", "delete")
@@ -82,6 +82,9 @@ class TestReadOnlyRule:
         "route",
         [
             "/api/v1/downloads",
+            # Minutes of the operator's CPU per video, so a public demo would be
+            # the cheapest way there is to keep somebody else's server busy.
+            "/api/v1/transcriptions",
             "/api/v1/auth/password",
             "/api/v1/tools/identity",
             "/api/v1/admin/users",
@@ -130,11 +133,17 @@ class TestReadOnlyRule:
 
 class TestPublishedKey:
     def test_the_key_reads_the_platforms_and_nothing_else(self):
-        assert set(demo.DEMO_KEY_SCOPES) == {Scope.DOUYIN_READ, Scope.TIKTOK_READ}
+        assert set(demo.DEMO_KEY_SCOPES) == set(PLATFORM_READ_SCOPES)
 
     @pytest.mark.parametrize(
         "forbidden",
-        [Scope.ADMIN, Scope.IDENTITY_MANAGE, Scope.ARCHIVE_EXPORT, Scope.MEDIA_WRITE],
+        [
+            Scope.ADMIN,
+            Scope.IDENTITY_MANAGE,
+            Scope.ARCHIVE_EXPORT,
+            Scope.MEDIA_WRITE,
+            Scope.TRANSCRIPTION_WRITE,
+        ],
     )
     def test_the_key_cannot_reach_the_dangerous_scopes(self, forbidden: Scope):
         principal = _key_principal(demo.DEMO_KEY_SCOPES)
@@ -194,3 +203,14 @@ def _session_principal() -> Principal:
         api_key_id=None,
         rate_limit_per_min=None,
     )
+
+
+def test_the_demo_logout_reads_the_session_store_s_own_keys():
+    """The demo's logout walks the session store from a service, which does not
+    import the API layer, so it carries its own copy of the key names."""
+    from dtk.api import deps
+    from dtk.api.routes import sessions
+
+    assert demo._SESSION_KEY == deps.SESSION_KEY
+    assert demo._SESSION_META_KEY == sessions.SESSION_META_KEY
+    assert demo._SESSION_INDEX_KEY == sessions.SESSION_INDEX_KEY

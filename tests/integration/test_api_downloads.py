@@ -12,11 +12,13 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from sqlalchemy import select, update
 
+from dtk import media
 from dtk.core.db import session_scope
 from dtk.core.types import Scope
 from dtk.db.models import ArchivedContent, MediaDownload
@@ -133,6 +135,49 @@ async def test_a_post_that_was_never_archived_is_fetched_first(api_app, db_engin
     # fetch says who the author is.
     assert body["planned"] == []
     assert downloads.PENDING_AUTHOR in body["directory"]
+
+
+async def test_a_failed_publish_fails_the_download_too(
+    api_app, db_engine, redis_client, monkeypatch
+):
+    """A download left `queued` behind a failed task held its post for two hours.
+
+    Redis is down for the task's finish as well as the publish: that is what a
+    failed publish means, and finishing a task wakes its waiters through Redis.
+    """
+    from dtk.core.config import Config
+    from dtk.core.db import session_scope
+    from dtk.core.types import Platform
+    from dtk.db.models import MediaDownload
+    from dtk.services import download_requests, tasks
+
+    async def unreachable(*_args, **_kwargs):
+        raise ConnectionError("redis went away")
+
+    monkeypatch.setattr(tasks, "enqueue", unreachable)
+    monkeypatch.setattr(tasks, "_signal", unreachable)
+    with pytest.raises(ConnectionError):
+        async with session_scope() as session:
+            await download_requests.start(
+                session,
+                config=Config.defaults(),
+                downloader_configured=True,
+                url=None,
+                platform=Platform.DOUYIN,
+                content_id=CONTENT_ID,
+            )
+
+    async with session_scope() as session:
+        states = (
+            (
+                await session.execute(
+                    select(MediaDownload.state).where(MediaDownload.content_id == CONTENT_ID)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert states == ["failed"]
 
 
 async def test_a_download_can_be_started_from_a_link(api_app, db_engine, redis_client):
@@ -839,6 +884,7 @@ async def _record(
     state: str = "done",
     evicted: bool = False,
     bytes_total: int = 1024,
+    pinned: bool = False,
 ) -> uuid.UUID:
     download_id = uuid.uuid4()
     async with session_scope() as session:
@@ -854,6 +900,7 @@ async def _record(
                 file_count=1,
                 created_at=created,
                 files_removed_at=created if evicted else None,
+                pinned=pinned,
             )
         )
     return download_id
@@ -1010,6 +1057,200 @@ async def test_a_download_that_cannot_be_fetched_ends_as_failed(api_app, db_engi
         assert settled is not None
         assert settled.state == "failed"
         assert settled.error == "nothing to fetch"
+
+
+@pytest.mark.parametrize("archived", [True, False])
+async def test_a_post_whose_media_is_withheld_fails_with_that_reason(
+    api_app, db_engine, redis_client, archived: bool
+):
+    """A TikTok Shop video: its detail parses to MEDIA_WITHHELD, every time.
+
+    The re-parse swallowed every error and fell back to the archived row, so an
+    archived post without its video failed as "retry the download" - which never
+    helps - and one never archived as "this instance has not archived that
+    post", which says nothing about why.
+    """
+    from dtk.core.config import Config
+    from dtk.core.errors import MediaWithheld
+    from dtk.worker.ops import OperationDeps, media_download
+
+    if archived:
+        # What a list leaves behind for a shop video: metadata and a cover.
+        await archive_a_post(media={"covers": [{"url": COVER}]})
+    async with session_scope() as session:
+        if archived:
+            row = (await session.scalars(select(ArchivedContent))).one()
+            download = await downloads.create(session, row)
+        else:
+            download = await downloads.create_pending(
+                session, platform="douyin", content_id=CONTENT_ID
+            )
+        download_id = download.id
+        await session.commit()
+
+    class WithheldFetch:
+        async def fetch(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise MediaWithheld(
+                "the platform does not give out this post's media",
+                details={"content_id": CONTENT_ID, "reason": "shop_video"},
+            )
+
+    deps = OperationDeps(
+        config=Config.defaults,
+        cipher=object(),  # type: ignore[arg-type]
+        secret_key="unused",
+        pool=object(),  # type: ignore[arg-type]
+        transport=object(),  # type: ignore[arg-type]
+        signers=object(),  # type: ignore[arg-type]
+        downloader=SimpleNamespace(configured=True),  # type: ignore[arg-type]
+        fetch=WithheldFetch(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(MediaWithheld):
+        async with session_scope() as session:
+            await media_download.run(deps, session, {"download_id": str(download_id)})
+
+    async with session_scope() as session:
+        settled = await session.get(MediaDownload, download_id)
+        assert settled is not None
+        assert settled.state == "failed"
+        assert settled.error == "the platform does not give out this post's media"
+
+
+async def test_a_tiktok_download_refetches_and_carries_only_that_identity_s_chain_token(
+    api_app, db_engine, redis_client
+):
+    """#831: a TikTok video link is served only with the tt_chain_token of the
+    session that fetched it.
+
+    So the archived links are not used however fresh they are - nobody recorded
+    which identity fetched them - and the job carries the token of the identity
+    that fetched them now, read after the fetch, and nothing else from its jar.
+    """
+    import json
+
+    from dtk.core.config import Config
+    from dtk.worker.ops import OperationDeps, media_download
+    from tests.replay.support import load
+
+    content_id = "7100000000000000001"
+    now = datetime.now(UTC)
+    async with session_scope() as session:
+        session.add(
+            ArchivedContent(
+                platform="tiktok",
+                content_id=content_id,
+                kind="video",
+                web_url=f"https://www.tiktok.com/@a/video/{content_id}",
+                title="a post",
+                description="a post",
+                author_uid="6900000000000000001",
+                author_nickname="someone",
+                tags=[],
+                media={"video": {"url": "https://v16-webapp-prime.tiktok.com/archived"}},
+                first_seen_at=now,
+                last_seen_at=now,
+            )
+        )
+        await session.commit()
+    async with session_scope() as session:
+        row = (await session.scalars(select(ArchivedContent))).one()
+        download = await downloads.create(session, row)
+        download_id = download.id
+        await session.commit()
+
+    fetched: list[str] = []
+    loaded: list[str] = []
+    submitted: list[dict[str, Any]] = []
+
+    class Fetch:
+        async def fetch(self, *_args: Any, parse: Any, **_kwargs: Any) -> Any:
+            fetched.append("detail")
+            # The fixture's hosts are deliberately unroutable; these are the
+            # hosts the allowlist knows.
+            raw = json.dumps(load("tiktok", "video_normal"))
+            parse(json.loads(raw.replace("example-cdn.invalid", "tiktok.com")))
+            return SimpleNamespace(identity_id="identity-that-fetched")
+
+    class Pool:
+        async def load(self, _session: Any, identity_id: str, **_kwargs: Any) -> Any:
+            loaded.append(identity_id)
+            return SimpleNamespace(
+                cookies={"tt_chain_token": "chain-value", "sessionid": "login-value"}
+            )
+
+    class Downloader:
+        configured = True
+
+        async def submit(self, payload: dict[str, Any]) -> None:
+            submitted.append(payload)
+
+        async def job(self, _job_id: str) -> dict[str, Any]:
+            return {"state": "done", "bytes_total": 0, "items": []}
+
+    deps = OperationDeps(
+        config=Config.defaults,
+        cipher=object(),  # type: ignore[arg-type]
+        secret_key="unused",
+        pool=Pool(),  # type: ignore[arg-type]
+        transport=object(),  # type: ignore[arg-type]
+        signers=object(),  # type: ignore[arg-type]
+        downloader=Downloader(),  # type: ignore[arg-type]
+        fetch=Fetch(),  # type: ignore[arg-type]
+    )
+    async with session_scope() as session:
+        await media_download.run(deps, session, {"download_id": str(download_id)})
+
+    assert fetched == ["detail"], "fresh archived TikTok links were used as they were"
+    assert loaded == ["identity-that-fetched"]
+    (payload,) = submitted
+    assert payload["cookies"] == [
+        {"name": "tt_chain_token", "value": "chain-value", "domain": "tiktok.com"}
+    ]
+    assert "login-value" not in json.dumps(payload)
+    # Planned from what was just fetched, not from the archived link.
+    assert all("archived" not in url for item in payload["items"] for url in item["mirrors"])
+
+
+async def test_a_fresh_douyin_post_is_not_refetched_and_carries_no_cookie(
+    api_app, db_engine, redis_client
+):
+    from dtk.core.config import Config
+    from dtk.worker.ops import OperationDeps, media_download
+
+    await archive_a_post()
+    async with session_scope() as session:
+        row = (await session.scalars(select(ArchivedContent))).one()
+        download = await downloads.create(session, row)
+        download_id = download.id
+        await session.commit()
+
+    submitted: list[dict[str, Any]] = []
+
+    class Downloader:
+        configured = True
+
+        async def submit(self, payload: dict[str, Any]) -> None:
+            submitted.append(payload)
+
+        async def job(self, _job_id: str) -> dict[str, Any]:
+            return {"state": "done", "bytes_total": 0, "items": []}
+
+    deps = OperationDeps(
+        config=Config.defaults,
+        cipher=object(),  # type: ignore[arg-type]
+        secret_key="unused",
+        pool=object(),  # type: ignore[arg-type]
+        transport=object(),  # type: ignore[arg-type]
+        signers=object(),  # type: ignore[arg-type]
+        downloader=Downloader(),  # type: ignore[arg-type]
+        fetch=None,
+    )
+    async with session_scope() as session:
+        await media_download.run(deps, session, {"download_id": str(download_id)})
+
+    (payload,) = submitted
+    assert "cookies" not in payload
+    assert payload["referer"] == "https://www.douyin.com/"
 
 
 # --------------------------------------------------------------------------
@@ -1312,3 +1553,356 @@ async def test_the_listing_carries_a_progress_slot(api_app, db_engine, redis_cli
     assert rows
     assert all("progress" in row for row in rows)
     assert rows[0]["progress"] is None
+
+
+# --------------------------------------------------------------------------
+# Deleting a download's files
+# --------------------------------------------------------------------------
+
+
+class Sidecar:
+    """The downloader the files route builds for itself, as a recording stub."""
+
+    def __init__(self) -> None:
+        self.asked: list[list[str]] = []
+        self.confirms = True
+        self.answers = True
+
+    def client(self, *_args: Any, **_kwargs: Any) -> Any:
+        sidecar = self
+
+        class Client:
+            async def delete(self, paths: list[str]) -> dict[str, Any]:
+                sidecar.asked.append(list(paths))
+                if not sidecar.answers:
+                    raise media.DownloaderUnavailable("downloader /files/delete failed")
+                return {"freed_bytes": 2048, "removed": paths if sidecar.confirms else []}
+
+            async def health(self) -> Any:
+                # The storage panel probes the same client before it answers.
+                return SimpleNamespace(
+                    available=True,
+                    version="stub",
+                    workers=1,
+                    queued=0,
+                    running=0,
+                    total_bytes=0,
+                    detail=None,
+                )
+
+            async def aclose(self) -> None:
+                return None
+
+        return Client()
+
+
+@pytest.fixture
+def sidecar(api_app: Any, monkeypatch: pytest.MonkeyPatch) -> Sidecar:
+    stub = Sidecar()
+    monkeypatch.setattr(media, "DownloaderClient", stub.client)
+    api_app.state.settings = api_app.state.settings.model_copy(
+        update={"downloader_url": "http://downloader.invalid:9100"}
+    )
+    return stub
+
+
+async def _delete_files(api_app: Any, key: str, download_id: uuid.UUID) -> Any:
+    async with anonymous_client(api_app) as caller:
+        return await caller.delete(
+            f"/api/v1/downloads/{download_id}/files", headers={"X-API-Key": key}
+        )
+
+
+async def _removed_at(*ids: uuid.UUID) -> list[datetime | None]:
+    async with session_scope() as session:
+        rows = [await session.get(MediaDownload, download_id) for download_id in ids]
+    return [row.files_removed_at if row else None for row in rows]
+
+
+async def test_deleting_files_keeps_the_record_and_counts_as_cleaned_up(
+    api_app, db_engine, redis_client, sidecar
+):
+    """What the console's Delete promised, and until now did not do.
+
+    It was wired to the cancel route, which leaves a finished download as it
+    is: the console said "deleted", the files stayed, and the only other place
+    to remove them took the records too - so the cleaned-up count never moved.
+    """
+    user_id = await make_user()
+    key = await media_key(user_id)
+    now = datetime.now(UTC)
+    older = await _record(CONTENT_ID, directory="d/a/1", created=now - timedelta(hours=1))
+    newer = await _record(CONTENT_ID, directory="d/a/1", created=now)
+    elsewhere = await _record("7408915107113127221", directory="d/a/2", created=now)
+
+    body = envelope(await _delete_files(api_app, key, newer))["data"]
+
+    # One directory, so both records that live in it lose their files together.
+    assert sidecar.asked == [["d/a/1"]]
+    assert body == {"download_id": str(newer), "downloads": 2, "freed_bytes": 2048}
+    marked = await _removed_at(older, newer, elsewhere)
+    assert marked[0] is not None and marked[1] is not None
+    assert marked[2] is None
+    async with session_scope() as session:
+        kept = await session.get(MediaDownload, newer)
+        assert kept is not None and kept.bytes_total == 0 and kept.file_count == 1
+
+    async with anonymous_client(api_app) as caller:
+        storage = envelope(
+            await caller.get("/api/v1/downloads/storage", headers={"X-API-Key": key})
+        )["data"]
+    assert storage["downloads"] == 3
+    assert storage["evicted"] == 2
+
+
+async def test_files_already_gone_are_not_asked_for_again(
+    api_app, db_engine, redis_client, sidecar
+):
+    user_id = await make_user()
+    key = await media_key(user_id)
+    gone = await _record(CONTENT_ID, directory="d/a/1", created=datetime.now(UTC), evicted=True)
+
+    body = envelope(await _delete_files(api_app, key, gone))["data"]
+
+    assert body == {"download_id": str(gone), "downloads": 0, "freed_bytes": 0}
+    assert sidecar.asked == []
+
+
+async def test_a_running_download_of_the_post_blocks_it(api_app, db_engine, redis_client, sidecar):
+    """It is writing into the directory that would be removed."""
+    user_id = await make_user()
+    key = await media_key(user_id)
+    now = datetime.now(UTC)
+    done = await _record(CONTENT_ID, directory="d/a/1", created=now - timedelta(hours=1))
+    running = await _record(CONTENT_ID, directory="d/a/1", created=now, state="running")
+
+    response = await _delete_files(api_app, key, done)
+
+    assert response.status_code == 400
+    assert error_code(response) == "INVALID_PARAM"
+    assert envelope(response)["error"]["details"]["running"] == [str(running)]
+    assert sidecar.asked == []
+    assert await _removed_at(done, running) == [None, None]
+
+
+async def test_a_pinned_post_keeps_its_files(api_app, db_engine, redis_client, sidecar):
+    user_id = await make_user()
+    key = await media_key(user_id)
+    now = datetime.now(UTC)
+    unpinned = await _record(CONTENT_ID, directory="d/a/1", created=now - timedelta(hours=1))
+    pinned = await _record(CONTENT_ID, directory="d/a/1", created=now, pinned=True)
+
+    response = await _delete_files(api_app, key, unpinned)
+
+    # The pin on the other copy holds: they share the one directory.
+    assert response.status_code == 400
+    assert envelope(response)["error"]["details"]["pinned"] == [str(pinned)]
+    assert sidecar.asked == []
+    assert await _removed_at(unpinned) == [None]
+
+
+async def test_nothing_is_marked_unless_the_sidecar_confirms(
+    api_app, db_engine, redis_client, sidecar
+):
+    """A record saying its files are gone while they are on disk is never reclaimed."""
+    user_id = await make_user()
+    key = await media_key(user_id)
+    download_id = await _record(CONTENT_ID, directory="d/a/1", created=datetime.now(UTC))
+    sidecar.confirms = False
+
+    response = await _delete_files(api_app, key, download_id)
+
+    assert response.status_code == 503
+    assert error_code(response) == "DOWNLOADER_UNAVAILABLE"
+    assert await _removed_at(download_id) == [None]
+
+
+async def test_an_unreachable_sidecar_changes_nothing(api_app, db_engine, redis_client, sidecar):
+    user_id = await make_user()
+    key = await media_key(user_id)
+    download_id = await _record(CONTENT_ID, directory="d/a/1", created=datetime.now(UTC))
+    sidecar.answers = False
+
+    response = await _delete_files(api_app, key, download_id)
+
+    assert response.status_code == 503
+    assert await _removed_at(download_id) == [None]
+
+
+async def test_without_a_downloader_the_files_cannot_be_reached(api_app, db_engine, redis_client):
+    api_app.state.settings = api_app.state.settings.model_copy(update={"downloader_url": ""})
+    user_id = await make_user()
+    key = await media_key(user_id)
+    download_id = await _record(CONTENT_ID, directory="d/a/1", created=datetime.now(UTC))
+
+    response = await _delete_files(api_app, key, download_id)
+
+    assert response.status_code == 501
+    assert error_code(response) == "NOT_CONFIGURED"
+    assert await _removed_at(download_id) == [None]
+
+
+async def test_deleting_files_needs_media_write(api_app, db_engine, redis_client, sidecar):
+    user_id = await make_user()
+    key = await media_key(user_id, Scope.MEDIA_READ)
+    download_id = await _record(CONTENT_ID, directory="d/a/1", created=datetime.now(UTC))
+
+    response = await _delete_files(api_app, key, download_id)
+
+    assert response.status_code == 403
+    assert error_code(response) == "FORBIDDEN_SCOPE"
+    assert sidecar.asked == []
+
+
+async def test_deleting_the_files_of_nothing_is_a_404(api_app, db_engine, redis_client, sidecar):
+    user_id = await make_user()
+    key = await media_key(user_id)
+
+    response = await _delete_files(api_app, key, uuid.uuid4())
+
+    assert response.status_code == 404
+    assert error_code(response) == "NOT_FOUND"
+
+
+async def test_cancelling_still_leaves_a_finished_download_alone(
+    api_app, db_engine, redis_client, sidecar
+):
+    """The route the console used to call. Its contract does not change."""
+    user_id = await make_user()
+    key = await media_key(user_id)
+    download_id = await _record(CONTENT_ID, directory="d/a/1", created=datetime.now(UTC))
+
+    async with anonymous_client(api_app) as caller:
+        body = envelope(
+            await caller.delete(f"/api/v1/downloads/{download_id}", headers={"X-API-Key": key})
+        )["data"]
+
+    assert body["state"] == "done"
+    assert sidecar.asked == []
+    assert await _removed_at(download_id) == [None]
+
+
+# --------------------------------------------------------------------------
+# Parts of a video uploaded in several
+# --------------------------------------------------------------------------
+
+
+BILIBILI_ID = "BV1xx411c7mD"
+
+
+async def _start(api_app: Any, key: str, body: dict[str, Any]) -> Any:
+    async with anonymous_client(api_app) as caller:
+        return await caller.post("/api/v1/downloads", json=body, headers={"X-API-Key": key})
+
+
+async def test_a_later_part_is_its_own_download_in_its_own_directory(
+    api_app, db_engine, redis_client
+):
+    user_id = await make_user()
+    key = await media_key(user_id)
+
+    response = await _start(
+        api_app, key, {"platform": "bilibili", "content_id": BILIBILI_ID, "part": 3}
+    )
+
+    assert response.status_code == 202, response.text
+    body = envelope(response)["data"]
+    assert body["part"] == 3
+    assert body["directory"].endswith(f"/{BILIBILI_ID}-p3")
+    async with session_scope() as session:
+        row = (await session.scalars(select(MediaDownload))).one()
+    assert row.part == 3
+
+
+async def test_two_parts_of_one_post_download_side_by_side(api_app, db_engine, redis_client):
+    """One live download per post was the rule because two wrote into one
+    directory. Two parts do not, so neither waits for - or joins - the other."""
+    user_id = await make_user()
+    key = await media_key(user_id)
+
+    first = await _start(api_app, key, {"platform": "bilibili", "content_id": BILIBILI_ID})
+    third = await _start(
+        api_app, key, {"platform": "bilibili", "content_id": BILIBILI_ID, "part": 3}
+    )
+    again = await _start(
+        api_app, key, {"platform": "bilibili", "content_id": BILIBILI_ID, "part": 3}
+    )
+
+    assert first.status_code == third.status_code == 202
+    assert envelope(again)["data"]["reused"] == "in_flight"
+    assert envelope(again)["data"]["download_id"] == envelope(third)["data"]["download_id"]
+    async with session_scope() as session:
+        assert len((await session.scalars(select(MediaDownload))).all()) == 2
+
+
+async def test_part_one_is_the_post_s_own_download(api_app, db_engine, redis_client):
+    """Spelt either way it is the first part, which every download made before
+    parts existed is - so it joins the same in-flight download."""
+    user_id = await make_user()
+    key = await media_key(user_id)
+
+    plain = await _start(api_app, key, {"platform": "bilibili", "content_id": BILIBILI_ID})
+    one = await _start(api_app, key, {"platform": "bilibili", "content_id": BILIBILI_ID, "part": 1})
+
+    assert envelope(plain)["data"]["part"] is None
+    assert envelope(one)["data"]["reused"] == "in_flight"
+
+
+async def test_a_link_s_part_is_the_part_downloaded(api_app, db_engine, redis_client):
+    """Pasting the link a player is on downloads what that player plays."""
+    user_id = await make_user()
+    key = await media_key(user_id)
+
+    response = await _start(
+        api_app, key, {"url": f"https://www.bilibili.com/video/{BILIBILI_ID}/?p=2&vd_source=x"}
+    )
+
+    assert envelope(response)["data"]["part"] == 2
+
+
+async def test_a_link_and_a_part_that_disagree_are_refused(api_app, db_engine, redis_client):
+    user_id = await make_user()
+    key = await media_key(user_id)
+
+    response = await _start(
+        api_app, key, {"url": f"https://www.bilibili.com/video/{BILIBILI_ID}?p=2", "part": 3}
+    )
+
+    assert error_code(response) == "INVALID_PARAM"
+    assert envelope(response)["error"]["details"]["field"] == "part"
+
+
+async def test_a_part_of_a_douyin_post_is_refused(api_app, db_engine, redis_client):
+    user_id = await make_user()
+    key = await media_key(user_id)
+
+    response = await _start(
+        api_app, key, {"platform": "douyin", "content_id": CONTENT_ID, "part": 2}
+    )
+
+    assert error_code(response) == "INVALID_PARAM"
+    async with session_scope() as session:
+        assert (await session.scalars(select(MediaDownload))).all() == []
+
+
+async def test_a_stored_part_is_not_the_post_s_media_in_the_library(
+    api_app, db_engine, redis_client
+):
+    """The library shows what the post's link plays. Part 7 stored alone is not that."""
+    now = datetime.now(UTC)
+    async with session_scope() as session:
+        session.add(
+            MediaDownload(
+                platform="bilibili",
+                content_id=BILIBILI_ID,
+                part=7,
+                author_uid="9",
+                state="done",
+                directory=f"bilibili/9/{BILIBILI_ID}-p7",
+                files=[{"name": "video.mp4", "kind": "video", "bytes": 1}],
+                created_at=now,
+                finished_at=now,
+            )
+        )
+    async with session_scope() as session:
+        assert await downloads.stored_for(session, [("bilibili", BILIBILI_ID)]) == {}

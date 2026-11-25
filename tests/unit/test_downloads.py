@@ -15,8 +15,12 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
 
 from dtk.core.types import Platform
+from dtk.db.models import MediaDownload
+from dtk.media import plan as planner
 from dtk.services import downloads
 
 MB = 1024 * 1024
@@ -51,6 +55,35 @@ class TestStaleness:
         # answered 403, because the link carries expire=.
         old = SimpleNamespace(last_seen_at=datetime.now(UTC) - timedelta(days=1))
         assert downloads.mirrors_are_stale(old, max_age_seconds=600) is True
+
+    def test_a_video_archived_without_its_stream_is_stale_however_fresh(self):
+        """Bilibili's lists carry a cover and no stream; planned from such a
+        row, a download finished "done" with only the cover."""
+        listed = SimpleNamespace(
+            last_seen_at=datetime.now(UTC), kind="video", media={"covers": [{"url": "x"}]}
+        )
+        assert downloads.mirrors_are_stale(listed, max_age_seconds=600) is True
+
+    def test_an_album_without_a_video_is_not_missing_one(self):
+        album = SimpleNamespace(
+            last_seen_at=datetime.now(UTC),
+            kind="image_album",
+            media={"images": [{"url": "x", "video": None}]},
+        )
+        assert downloads.mirrors_are_stale(album, max_age_seconds=600) is False
+
+    def test_an_album_archived_before_live_clips_were_kept_is_stale(self):
+        """#792: a slide with no `video` key at all was archived by the parser
+        that dropped the clip, and planning from it stores the stills alone."""
+        before = SimpleNamespace(
+            last_seen_at=datetime.now(UTC), kind="image_album", media={"images": [{"url": "x"}]}
+        )
+        assert downloads.mirrors_are_stale(before, max_age_seconds=600) is True
+        # A video post's manifest has no slides, and its own rule applies.
+        video = SimpleNamespace(
+            last_seen_at=datetime.now(UTC), kind="video", media={"video": {"url": "x"}}
+        )
+        assert downloads.mirrors_are_stale(video, max_age_seconds=600) is False
 
     def test_zero_always_re_parses(self):
         recent = SimpleNamespace(last_seen_at=datetime.now(UTC))
@@ -112,7 +145,7 @@ class TestJobPayload:
             last_seen_at=datetime.now(UTC),
             media={"video": {"url": "https://v9-v2-mps-cdn.douyinvod.com/x/v.mp4"}},
         )
-        download = SimpleNamespace(id=uuid.uuid4())
+        download = SimpleNamespace(id=uuid.uuid4(), part=None)
         plan = downloads.plan_for(content, max_file_bytes=MB)
         payload = downloads.job_payload(download, content, plan)
 
@@ -125,11 +158,117 @@ class TestJobPayload:
         for forbidden in ("cookie", "Cookie", "secret", "proxy", "postgresql"):
             assert forbidden not in flat
 
+    def test_a_tiktok_job_carries_the_chain_token_and_nothing_else(self):
+        """#831: the CDN serves a video only with the fetching session's
+        tt_chain_token. Whatever else the jar holds stays on this side."""
+        content = self._tiktok_post()
+        download = SimpleNamespace(id=uuid.uuid4(), part=None)
+        plan = downloads.plan_for(content, max_file_bytes=MB)
+        jar = {"tt_chain_token": "chain-value", "sessionid": "login-value", "msToken": "m"}
+        payload = downloads.job_payload(
+            download, content, plan, cookies=planner.bound_cookies(Platform.TIKTOK, jar)
+        )
+
+        assert payload["cookies"] == [
+            {"name": "tt_chain_token", "value": "chain-value", "domain": "tiktok.com"}
+        ]
+        flat = str(payload)
+        assert "login-value" not in flat
+        assert "msToken" not in flat
+
+    def test_a_name_off_the_list_is_dropped_even_if_handed_in(self):
+        content = self._tiktok_post()
+        download = SimpleNamespace(id=uuid.uuid4(), part=None)
+        plan = downloads.plan_for(content, max_file_bytes=MB)
+        payload = downloads.job_payload(
+            download,
+            content,
+            plan,
+            cookies=[{"name": "sessionid", "value": "login-value", "domain": "tiktok.com"}],
+        )
+        assert "cookies" not in payload
+
+    def test_a_douyin_job_carries_no_cookie_whatever_it_is_handed(self):
+        content = SimpleNamespace(**{**vars(self._tiktok_post()), "platform": "douyin"})
+        content.media = {"video": {"url": "https://v9-v2-mps-cdn.douyinvod.com/x/v.mp4"}}
+        download = SimpleNamespace(id=uuid.uuid4(), part=None)
+        plan = downloads.plan_for(content, max_file_bytes=MB)
+        payload = downloads.job_payload(
+            download,
+            content,
+            plan,
+            cookies=[{"name": "tt_chain_token", "value": "chain-value", "domain": "tiktok.com"}],
+        )
+        assert "cookies" not in payload
+
+    def test_a_jar_without_the_token_sends_the_job_without_one(self):
+        assert planner.bound_cookies(Platform.TIKTOK, {"msToken": "m"}) == []
+        assert planner.bound_cookies(Platform.DOUYIN, {"tt_chain_token": "t"}) == []
+
+    @staticmethod
+    def _tiktok_post() -> SimpleNamespace:
+        return SimpleNamespace(
+            platform="tiktok",
+            content_id="7100000000000000001",
+            kind="video",
+            web_url="https://www.tiktok.com/@a/video/7100000000000000001",
+            title="t",
+            description="d",
+            platform_created_at=None,
+            duration_ms=1000,
+            author_uid="6900000000000000001",
+            author_nickname="n",
+            music_id=None,
+            music_title=None,
+            tags=[],
+            location=None,
+            last_seen_at=datetime.now(UTC),
+            media={"video": {"url": "https://v16-webapp-prime.us.tiktok.com/x?tk=tt_chain_token"}},
+        )
+
     def test_the_directory_is_relative_never_absolute(self):
         # The path inside the container is not the path on the host; storing an
         # absolute one would make the row wrong the moment the volume moves.
         content = SimpleNamespace(platform="tiktok", author_uid="1", content_id="2")
         assert downloads.directory_of(content) == "tiktok/1/2"
+
+    def test_a_later_part_is_stored_beside_the_post_not_inside_it(self):
+        """The sidecar removes a directory recursively; a part nested in the
+        post's own would go whenever the first part's files did."""
+        content = SimpleNamespace(platform="bilibili", author_uid="9", content_id="BV1xx411c7mD")
+        assert downloads.directory_of(content, 3) == "bilibili/9/BV1xx411c7mD-p3"
+        assert downloads.pending_directory("bilibili", "BV1xx411c7mD", 3) == (
+            "bilibili/_pending/BV1xx411c7mD-p3"
+        )
+
+    def test_the_sidecar_is_told_the_part_s_directory_and_number(self):
+        """It names the directory from `content_id`, so a part has to be spelt
+        there exactly as `directory_of` spells it."""
+        content = SimpleNamespace(
+            platform="bilibili",
+            content_id="BV1xx411c7mD",
+            kind="video",
+            web_url="https://www.bilibili.com/video/BV1xx411c7mD",
+            title="t",
+            description="d",
+            platform_created_at=None,
+            duration_ms=1000,
+            author_uid="9",
+            author_nickname="n",
+            music_id=None,
+            music_title=None,
+            tags=[],
+            location=None,
+            last_seen_at=datetime.now(UTC),
+            media={"video": {"url": "https://upos-sz-mirrorcos.bilivideo.com/x/v.mp4"}},
+        )
+        download = SimpleNamespace(id=uuid.uuid4(), part=3)
+        plan = downloads.plan_for(content, max_file_bytes=MB)
+        payload = downloads.job_payload(download, content, plan)
+
+        assert payload["content_id"] == "BV1xx411c7mD-p3"
+        assert payload["meta"]["part"] == 3
+        assert payload["meta"]["content_id"] == "BV1xx411c7mD"
 
 
 class TestPlanFor:
@@ -163,7 +302,18 @@ def test_a_media_download_is_not_exempt_from_the_queue_ceiling() -> None:
     from dtk.api.routes.operations import _OPERATOR_TRIGGERED, Maintenance
 
     assert Maintenance.MEDIA_DOWNLOAD.value not in _OPERATOR_TRIGGERED
+    assert Maintenance.MEDIA_TRANSCRIBE.value not in _OPERATOR_TRIGGERED
     assert Maintenance.DIAGNOSE.value in _OPERATOR_TRIGGERED
+
+
+def test_a_job_any_read_key_can_queue_is_not_exempt_either() -> None:
+    """The archive recheck and backfill are queued by a platform read scope, so
+    a viewer or a plain read key could stack them past the ceiling - each one
+    a run of real requests against the pool."""
+    from dtk.api.routes.operations import _OPERATOR_TRIGGERED, Maintenance
+
+    assert Maintenance.ARCHIVE_AVAILABILITY.value not in _OPERATOR_TRIGGERED
+    assert Maintenance.ARCHIVE_BACKFILL.value not in _OPERATOR_TRIGGERED
 
 
 class TestSharedDirectories:
@@ -205,3 +355,82 @@ class TestSharedDirectories:
 
         assert set(plan.ids) == {first.id, second.id}
         assert plan.ids_by_path[shared] == (first.id, second.id)
+
+
+class TestSearch:
+    """`q` on the downloads list. The row knows a content id and nothing a
+    person would type, so the title and the author come from the archive."""
+
+    @staticmethod
+    def where(term: str) -> tuple[str, dict]:
+        statement = downloads._apply(select(MediaDownload), downloads.DownloadFilter(query=term))
+        compiled = statement.compile(dialect=postgresql.dialect())
+        return str(compiled), compiled.params
+
+    def test_matches_the_archived_title_and_author_through_exists(self):
+        sql, _ = self.where("cats")
+        assert "EXISTS" in sql
+        assert "archived_contents.title ILIKE" in sql
+        assert "archived_contents.author_nickname ILIKE" in sql
+        assert "media_downloads.content_id ILIKE" in sql
+
+    def test_wildcards_are_text_not_a_pattern(self):
+        """`50%_off` is a caption, not a LIKE pattern; unescaped it would match
+        every row with a 50 anywhere in it."""
+        _, params = self.where("50%_off")
+        assert "%50\\%\\_off%" in params.values()
+
+    def test_blank_matches_everything(self):
+        sql, _ = self.where("   ")
+        assert "ILIKE" not in sql
+
+
+class TestStoredEntry:
+    """What the library card reads about a stored download."""
+
+    @staticmethod
+    def stored(**overrides: object) -> SimpleNamespace:
+        created = datetime(2026, 10, 1, 8, 0, tzinfo=UTC)
+        fields: dict = {
+            "id": uuid.uuid4(),
+            "bytes_total": 4096,
+            "created_at": created,
+            "finished_at": created + timedelta(minutes=2),
+            "files": [
+                {"name": "video.mp4", "kind": "video", "state": "done", "bytes": 4000},
+                {"name": "cover.jpeg", "kind": "cover", "state": "done", "bytes": 96},
+            ],
+        }
+        fields.update(overrides)
+        return SimpleNamespace(**fields)
+
+    def test_saved_at_is_when_the_files_landed(self):
+        """Not the post's last_seen_at, which a recheck moves: grouping by it
+        put a video saved a month ago into today's group."""
+        row = self.stored()
+        entry = downloads.stored_entry(row)  # type: ignore[arg-type]
+        assert entry["saved_at"] == row.finished_at.isoformat()
+        assert entry["video"] == "video.mp4"
+        assert entry["cover"] == "cover.jpeg"
+
+    def test_a_row_without_a_finish_time_falls_back_to_when_it_was_asked_for(self):
+        row = self.stored(finished_at=None)
+        entry = downloads.stored_entry(row)  # type: ignore[arg-type]
+        assert entry["saved_at"] == row.created_at.isoformat()
+
+    def test_an_album_s_live_clips_are_listed_apart_from_its_video(self):
+        """A clip is not the post's video: the library would play the first
+        five seconds of an album as if it were the post, and offer to transcribe
+        it."""
+        row = self.stored(
+            files=[
+                {"name": "image-01.webp", "kind": "image", "state": "done", "bytes": 90},
+                {"name": "image-01.mp4", "kind": "live_video", "state": "done", "bytes": 600},
+                {"name": "image-02.webp", "kind": "image", "state": "done", "bytes": 90},
+                {"name": "image-02.mp4", "kind": "live_video", "state": "failed", "bytes": 0},
+            ]
+        )
+        entry = downloads.stored_entry(row)  # type: ignore[arg-type]
+        assert entry["video"] is None
+        assert entry["images"] == ["image-01.webp", "image-02.webp"]
+        assert entry["live_videos"] == ["image-01.mp4"]

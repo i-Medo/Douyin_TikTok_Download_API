@@ -21,22 +21,27 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Final
 
 import pytest
 
 from dtk.core.errors import (
     DtkError,
     EndpointCircuitOpen,
+    IdentityLoginRequired,
     IdentityPoolExhausted,
+    InvalidParam,
     NotFound,
     UpstreamChanged,
     UpstreamRiskControl,
+    UpstreamUnreachable,
 )
-from dtk.core.types import BrowserFamily, Outcome, Platform, RejectReason
+from dtk.core.types import BrowserFamily, LoginNeed, Outcome, Platform, RejectReason
 from dtk.identity.pool import LiveIdentity
 from dtk.platforms import get_adapter
+from dtk.platforms.base import RequestSpec as PlatformRequestSpec
 from dtk.scheduler.leases import Lease
 from dtk.services import cache
 from dtk.services import fetch as fetch_module
@@ -85,11 +90,19 @@ class FakeScheduler:
         #: Every identity the service asked for, so a test can assert that a
         #: pinned request never widened to the pool.
         self.asked_for: list[str | None] = []
+        #: What each request said it would lose on a guest.
+        self.logins: list[LoginNeed] = []
 
     async def acquire(
-        self, endpoint: str, platform: Platform, *, identity_id: str | None = None
+        self,
+        endpoint: str,
+        platform: Platform,
+        *,
+        identity_id: str | None = None,
+        login: LoginNeed = LoginNeed.NONE,
     ) -> Lease:
         self.asked_for.append(identity_id)
+        self.logins.append(login)
         if self.reject is not None:
             raise self.reject
         return Lease(
@@ -124,12 +137,15 @@ class FakeTransport:
         self.answer = answer
         #: Every identity the transport was asked to send as.
         self.senders: list[Any] = []
+        #: And every request, as the transport received it.
+        self.specs: list[Any] = []
 
     def classify(self, response=None, exception=None, *, empty_body_is_normal=False):
         return classify_detailed(response, exception)
 
     async def request(self, identity: Any, spec: Any, timeout: float | None = None) -> RawResponse:
         self.senders.append(identity)
+        self.specs.append(spec)
         if isinstance(self.answer, BaseException):
             raise self.answer
         return self.answer
@@ -153,7 +169,7 @@ class FakeSession:
         return SimpleNamespace(id=key, proxy_id=self.proxy_id)
 
 
-def identity() -> LiveIdentity:
+def identity(*, authenticated: bool = False) -> LiveIdentity:
     return LiveIdentity(
         id=IDENTITY_ID,
         platform=Platform.DOUYIN,
@@ -162,11 +178,11 @@ def identity() -> LiveIdentity:
             browser_family=BrowserFamily.CHROME, browser_major=130, user_agent=CHROME_UA
         ),
         proxy_url="http://user:pass@exit.example:8080",
-        authenticated=False,
+        authenticated=authenticated,
     )
 
 
-async def signer(platform: Platform, url: str, params: dict[str, Any], sender: TransportIdentity):
+async def signer(platform: Platform, spec: PlatformRequestSpec, sender: TransportIdentity):
     """The real SignedParams, so the pipeline's signer seam is exercised."""
     return SignedParams(query="a_bogus=AAA", params={"a_bogus": "AAA"}, signer=SIGNER_BROWSER)
 
@@ -305,6 +321,22 @@ class TestPipelineOutcomes:
         # The outcome and the 404 beside it say everything; a rule name here
         # would put a red badge on every deleted video in the console.
         assert rows(session)[0].error_code is None
+
+    async def test_a_login_wall_is_reported_as_one_not_as_a_missing_post(self):
+        """TikTok's 2483 for a guest's keyword search came back as NOT_FOUND."""
+        pool = FakePool(identity())
+        svc = service(
+            response(200, {"status_code": 2483, "status_msg": "Please login your account first"}),
+            pool=pool,
+        )
+        session = FakeSession()
+
+        with pytest.raises(IdentityLoginRequired) as excinfo:
+            await run_fetch(svc, session)
+
+        assert excinfo.value.details["endpoint"] == ENDPOINT
+        # Not the guest's fault: the identity keeps its standing.
+        assert pool.recorded == [Outcome.BUSINESS_ERROR]
 
     async def test_a_proxy_auth_failure_is_retried_on_another_identity(self):
         pool = FakePool(identity())
@@ -451,6 +483,26 @@ class TestRequestLogColumns:
         assert row.http_status is None
         assert row.error_code == "transport_failure"
         assert row.outcome == Outcome.NETWORK_ERROR.value
+
+    @pytest.mark.parametrize(
+        ("proxy_url", "proxied"), [("http://exit.example:8080", True), (None, False)]
+    )
+    async def test_an_unreachable_platform_is_its_own_code_not_a_bug(self, proxy_url, proxied):
+        """It was INTERNAL, which tells the caller to report a bug, for what is
+        nearly always this host's egress - TikTok from mainland China with no
+        proxy on the identity (#781). Whether this attempt had a proxy is the
+        first thing the caller needs, so it is in the details."""
+        failure = TransportFailure(
+            "connect timeout", identity_id=IDENTITY_ID, url="https://x", elapsed_ms=1
+        )
+        sender = replace(identity(), proxy_url=proxy_url)
+
+        with pytest.raises(UpstreamUnreachable) as excinfo:
+            await run_fetch(service(failure, pool=FakePool(sender)), FakeSession())
+
+        assert excinfo.value.code.value == "UPSTREAM_UNREACHABLE"
+        assert excinfo.value.details["last_error"] == "transport_failure"
+        assert excinfo.value.details["proxied"] is proxied
 
 
 class TestDecode:
@@ -620,13 +672,23 @@ class TestTransportSpecSeam:
         assert out.params == {"aweme_id": "1"}
         assert out.url.endswith("/aweme/detail/")
 
-    def test_empty_body_becomes_none_rather_than_an_empty_object(self):
+    def test_the_body_goes_as_the_bytes_the_platform_built(self):
+        """a_bogus hashes a POST's body, so the transport must send the very
+        bytes the signer was handed - not a re-encoding of some fields, and
+        never as JSON."""
         from dtk.services.fetch import _to_transport_spec
 
-        assert _to_transport_spec(self._spec(body={}), self._signed(), "e").json_body is None
-        assert _to_transport_spec(self._spec(body={"a": 1}), self._signed(), "e").json_body == {
-            "a": 1
-        }
+        body = b"count=10&cursor=0"
+        out = _to_transport_spec(self._spec(method="POST", body=body), self._signed(), "e")
+        assert out.body is body
+        assert out.json_body is None
+        assert out.method == "POST"
+
+    def test_an_empty_body_is_no_body(self):
+        from dtk.services.fetch import _to_transport_spec
+
+        assert _to_transport_spec(self._spec(body=b""), self._signed(), "e").body is None
+        assert _to_transport_spec(self._spec(), self._signed(), "e").body is None
 
 
 async def test_the_signature_and_the_request_describe_the_same_visitor() -> None:
@@ -642,7 +704,7 @@ async def test_the_signature_and_the_request_describe_the_same_visitor() -> None
     signed_as: list[Any] = []
 
     async def recording_signer(
-        platform: Platform, url: str, params: dict[str, Any], sender: TransportIdentity
+        platform: Platform, spec: PlatformRequestSpec, sender: TransportIdentity
     ):
         signed_as.append(sender)
         return SignedParams(query="a_bogus=AAA", params={"a_bogus": "AAA"}, signer=SIGNER_BROWSER)
@@ -663,6 +725,38 @@ async def test_the_signature_and_the_request_describe_the_same_visitor() -> None
     # half a bare fingerprint would not have carried.
     assert signed_as[0].cookies == {"ttwid": "x"}
     assert signed_as[0].proxy_url == "http://user:pass@exit.example:8080"
+
+
+async def test_a_cookie_the_signature_names_goes_out_in_place_of_the_jars() -> None:
+    """The browser page seals its own msToken, so the Cookie header follows it.
+
+    TikTok rotates the token as the page loads, and X-Gnarly seals the one in
+    the query: sending the jar's beside it describes two sessions in one
+    request. The rest of the jar goes out unchanged, and the pool's record is
+    not rewritten - the override is this request's alone.
+    """
+    jar_identity = replace(identity(), cookies={"ttwid": "x", "msToken": "JAR"})
+
+    async def page_signer(platform: Platform, spec: PlatformRequestSpec, sender: TransportIdentity):
+        return SignedParams(
+            query="X-Gnarly=G",
+            params={"msToken": "PAGE", "X-Gnarly": "G"},
+            signer=SIGNER_BROWSER,
+            cookies={"msToken": "PAGE"},
+        )
+
+    transport = FakeTransport(response(200, {"status_code": 0, "aweme_detail": {"x": 1}}))
+    svc = FetchService(
+        scheduler=FakeScheduler(),  # type: ignore[arg-type]
+        pool=FakePool(jar_identity),  # type: ignore[arg-type]
+        transport=transport,  # type: ignore[arg-type]
+        sign=page_signer,
+        cooldown_base=60,
+    )
+    await run_fetch(svc, FakeSession())
+
+    assert dict(transport.senders[0].cookies) == {"ttwid": "x", "msToken": "PAGE"}
+    assert jar_identity.cookies == {"ttwid": "x", "msToken": "JAR"}
 
 
 class TestBareEnvelope:
@@ -815,6 +909,102 @@ class TestPinnedIdentity:
         assert len(scheduler.asked_for) == fetch_module.MAX_TRANSPORT_ATTEMPTS
 
 
+AUTHOR_POSTS = "douyin.author_posts"
+POSTS_PAGE = {"status_code": 0, "aweme_list": [{"aweme_id": "1"}], "max_cursor": 1, "has_more": 1}
+
+
+async def fetch_posts(svc: FetchService, *, cursor: str | None = None, **kwargs: Any):
+    params: dict[str, Any] = {"sec_user_id": "MS4wLjABAAAA"}
+    if cursor is not None:
+        params["cursor"] = cursor
+    return await svc.fetch(
+        FakeSession(),  # type: ignore[arg-type]
+        Platform.DOUYIN,
+        AUTHOR_POSTS,
+        params,
+        parse=lambda payload: payload,
+        **kwargs,
+    )
+
+
+class TestLoginNeed:
+    """Douyin pages an author's posts for signed-in accounts only (#782), and
+    leaves the newest ones out of what it shows a guest (#783)."""
+
+    async def test_a_later_page_asks_for_a_signed_in_identity(self):
+        scheduler = FakeScheduler()
+        svc = service(response(200, POSTS_PAGE), scheduler=scheduler)
+
+        await fetch_posts(svc, cursor="1787228699000")
+
+        assert scheduler.logins == [LoginNeed.REQUIRED]
+
+    @pytest.mark.parametrize("cursor", [None, "0", ""])
+    async def test_the_first_page_only_prefers_one(self, cursor):
+        scheduler = FakeScheduler()
+        svc = service(response(200, POSTS_PAGE), scheduler=scheduler)
+
+        await fetch_posts(svc, cursor=cursor)
+
+        assert scheduler.logins == [LoginNeed.PREFERRED]
+
+    async def test_an_endpoint_a_guest_reads_in_full_asks_for_nothing(self):
+        scheduler = FakeScheduler()
+        svc = service(
+            response(200, {"status_code": 0, "aweme_detail": {"x": 1}}), scheduler=scheduler
+        )
+
+        await run_fetch(svc, FakeSession())
+
+        assert scheduler.logins == [LoginNeed.NONE]
+
+    async def test_a_guest_answer_says_so_and_is_not_cached(self, monkeypatch):
+        """A guest's first page looks complete. Cached, it would go on being
+        served after a login was imported, to callers never told."""
+        written: list[str] = []
+
+        async def record(digest, payload, ttl):
+            written.append(digest)
+
+        async def miss(digest):
+            return None
+
+        monkeypatch.setattr(fetch_module.cache, "get", miss)
+        monkeypatch.setattr(fetch_module.cache, "put", record)
+        svc = service(response(200, POSTS_PAGE), pool=FakePool(identity(authenticated=False)))
+
+        result = await fetch_posts(svc, cache_ttl=300)
+
+        assert result.guest_fallback is True
+        assert written == []
+
+    async def test_a_signed_in_answer_is_ordinary(self, monkeypatch):
+        written: list[str] = []
+
+        async def record(digest, payload, ttl):
+            written.append(digest)
+
+        async def miss(digest):
+            return None
+
+        monkeypatch.setattr(fetch_module.cache, "get", miss)
+        monkeypatch.setattr(fetch_module.cache, "put", record)
+        svc = service(response(200, POSTS_PAGE), pool=FakePool(identity(authenticated=True)))
+
+        result = await fetch_posts(svc, cache_ttl=300)
+
+        assert result.guest_fallback is False
+        assert len(written) == 1
+
+    async def test_a_pinned_guest_is_not_a_fallback(self):
+        """The caller chose that session; nothing was substituted for them."""
+        svc = service(response(200, POSTS_PAGE), pool=FakePool(identity(authenticated=False)))
+
+        result = await fetch_posts(svc, ctx=FetchContext(identity_id=PINNED_ID))
+
+        assert result.guest_fallback is False
+
+
 class TestCacheKeyDiscriminators:
     """Two callers who will not receive the same answer must not share a key."""
 
@@ -915,3 +1105,243 @@ class TestRefresh:
         await run_fetch(svc, FakeSession(), ctx=FetchContext(refresh=True))
 
         assert store.reads == [] and store.writes == []
+
+
+BOOKMARKS = "douyin.author_bookmarks"
+BOOKMARKS_PAGE = {"status_code": 0, "aweme_list": [], "cursor": 0, "has_more": 0}
+
+
+class TestSessionBound:
+    """An endpoint whose answer belongs to the session that asks.
+
+    Douyin's bookmarks and folders name nobody; TikTok's bookmarks name the
+    account and answer only its own session. Rotated, either would come back
+    as some arbitrary account's private list, and the shared cache would hand
+    that list to the next caller - a demo visitor included.
+    """
+
+    async def test_an_unpinned_call_is_refused_before_it_spends_anything(self):
+        scheduler = FakeScheduler()
+        svc = service(response(200, BOOKMARKS_PAGE), scheduler=scheduler)
+
+        with pytest.raises(InvalidParam) as excinfo:
+            await svc.fetch(
+                FakeSession(),  # type: ignore[arg-type]
+                Platform.DOUYIN,
+                BOOKMARKS,
+                {},
+                parse=lambda payload: payload,
+                cache_ttl=300,
+            )
+
+        assert excinfo.value.details["field"] == "identity"
+        assert scheduler.asked_for == []
+
+    async def test_a_pinned_call_goes_through_and_is_not_cached(self, monkeypatch):
+        written: list[str] = []
+
+        async def record(digest, payload, ttl):
+            written.append(digest)
+
+        monkeypatch.setattr(fetch_module.cache, "put", record)
+        scheduler = FakeScheduler()
+        svc = service(response(200, BOOKMARKS_PAGE), scheduler=scheduler)
+
+        await svc.fetch(
+            FakeSession(),  # type: ignore[arg-type]
+            Platform.DOUYIN,
+            BOOKMARKS,
+            {},
+            parse=lambda payload: payload,
+            cache_ttl=300,
+            ctx=FetchContext(identity_id=PINNED_ID),
+        )
+
+        assert scheduler.asked_for == [PINNED_ID]
+        assert written == []
+
+
+class TestPostedBody:
+    """A POST's body is signed and sent as one set of bytes.
+
+    a_bogus hashes the body. Before this seam carried the request whole, the
+    signer saw only a URL and parameters, so a body could never have reached
+    it, and every POST would have carried a signature over an empty one -
+    unlike the page's own. Douyin did not check that binding when measured on
+    2026-10-17, which is luck rather than design.
+    """
+
+    async def test_the_signer_and_the_transport_see_the_same_bytes(self):
+        signed: list[Any] = []
+
+        async def recording_signer(
+            platform: Platform, spec: PlatformRequestSpec, sender: TransportIdentity
+        ):
+            signed.append(spec)
+            return SignedParams(query="a_bogus=AAA", params={"a_bogus": "AAA"})
+
+        transport = FakeTransport(response(200, BOOKMARKS_PAGE))
+        svc = FetchService(
+            scheduler=FakeScheduler(),  # type: ignore[arg-type]
+            pool=FakePool(identity()),  # type: ignore[arg-type]
+            transport=transport,  # type: ignore[arg-type]
+            sign=recording_signer,
+            cooldown_base=60,
+        )
+
+        result = await svc.fetch(
+            FakeSession(),  # type: ignore[arg-type]
+            Platform.DOUYIN,
+            BOOKMARKS,
+            {"cursor": "1792302641724339", "count": 10},
+            parse=lambda payload: payload,
+            ctx=FetchContext(identity_id=PINNED_ID, explain=True),
+        )
+
+        body = b"count=10&cursor=1792302641724339"
+        assert signed[0]["method"] == "POST"
+        assert signed[0]["body"] == body
+        sent = transport.specs[0]
+        assert sent.method == "POST"
+        assert sent.body is signed[0]["body"]
+        assert sent.headers["Content-Type"].startswith("application/x-www-form-urlencoded")
+        # And a curl built from the explanation replays the same body.
+        assert result.explain is not None
+        assert result.explain.body == body.decode()
+
+    async def test_a_get_carries_no_body(self):
+        transport = FakeTransport(response(200, {"status_code": 0, "aweme_detail": {"x": 1}}))
+        svc = FetchService(
+            scheduler=FakeScheduler(),  # type: ignore[arg-type]
+            pool=FakePool(identity()),  # type: ignore[arg-type]
+            transport=transport,  # type: ignore[arg-type]
+            sign=signer,
+            cooldown_base=60,
+        )
+
+        result = await run_fetch(svc, FakeSession(), ctx=FetchContext(explain=True))
+
+        assert transport.specs[0].body is None
+        assert result.explain is not None and result.explain.body is None
+
+
+#: Bilibili's answer for a folder id that does not exist.
+FOLDER_MISSING: Final = {"code": 0, "message": "OK", "ttl": 1, "data": None}
+
+
+class TestAbsentWhenNull:
+    """An endpoint whose ``data: null`` names something that is not there.
+
+    Measured 2026-10-18: Bilibili's folder contents answer a folder id that
+    does not exist with ``{"code": 0, "message": "OK", "data": null}``, and that
+    read as an empty folder - a page with no items and no error. Its folder
+    list answers an author with no folders in exactly the same shape, and
+    there an empty page IS the answer, so this is declared per endpoint.
+    """
+
+    def test_a_folder_that_does_not_exist_is_a_business_error(self):
+        classification, _ = service()._classify(
+            get_adapter(Platform.BILIBILI),
+            "bilibili.collection_posts",
+            response(200, FOLDER_MISSING),
+        )
+        assert classification.outcome is Outcome.BUSINESS_ERROR
+        assert classification.rule == "payload.absent"
+
+    def test_an_empty_folder_is_still_a_page(self):
+        empty = {"code": 0, "data": {"info": {"id": 1, "media_count": 0}, "medias": None}}
+        classification, _ = service()._classify(
+            get_adapter(Platform.BILIBILI), "bilibili.collection_posts", response(200, empty)
+        )
+        assert classification.outcome is Outcome.OK
+
+    def test_an_author_with_no_folders_is_still_a_page(self):
+        classification, _ = service()._classify(
+            get_adapter(Platform.BILIBILI),
+            "bilibili.author_collections",
+            response(200, FOLDER_MISSING),
+        )
+        assert classification.outcome is Outcome.OK
+
+    def test_a_private_douyin_likes_list_asked_by_a_login_is_a_business_error(self):
+        """A guest is told "private" with zero bytes; a login, measured
+        2026-10-20 on fourteen private lists, with ``aweme_list: null`` and no
+        ``has_more``. That read as a changed schema - a 502 asking to be
+        reported - on the identity the endpoint now requires."""
+        private = {"status_code": 0, "aweme_list": None, "log_pb": {"impr_id": "x"}}
+        classification, _ = service()._classify(
+            get_adapter(Platform.DOUYIN), "douyin.author_likes", response(200, private)
+        )
+        assert classification.outcome is Outcome.BUSINESS_ERROR
+        assert classification.rule == "payload.absent"
+
+    def test_a_douyin_likes_page_is_still_a_page(self):
+        page = {"status_code": 0, "aweme_list": [], "has_more": 0, "max_cursor": 0}
+        classification, _ = service()._classify(
+            get_adapter(Platform.DOUYIN), "douyin.author_likes", response(200, page)
+        )
+        assert classification.outcome is Outcome.OK
+
+    def test_a_douyin_sound_nobody_has_is_not_a_schema_change(self):
+        """Measured 2026-10-20: `status_code: 0` and `music_info: null`."""
+        payload = {"status_code": 0, "msg": "success", "music_info": None, "rec_list": []}
+        classification, _ = service()._classify(
+            get_adapter(Platform.DOUYIN), "douyin.music_detail", response(200, payload)
+        )
+        assert classification.outcome is Outcome.BUSINESS_ERROR
+        assert classification.rule == "payload.absent"
+
+    def test_only_measured_endpoints_declare_it(self):
+        declared = {
+            name
+            for platform in Platform
+            for name, spec in get_adapter(platform).endpoints.specs.items()
+            if spec.absent_when_null is not None
+        }
+        assert declared == {
+            "bilibili.collection_posts",
+            "douyin.author_likes",
+            "douyin.hashtag_detail",
+            "douyin.music_detail",
+        }
+
+
+class TestABrowserThatCannotSignThisIdentity:
+    """#832: browser-rpc refuses an identity whose User-Agent its page does not
+    run, and when native may not take the request either, the registry raises
+    the refusal. That is a fault on this side, not the platform judging the
+    identity, so nothing about the identity may change."""
+
+    async def test_the_identity_is_not_cooled_and_the_cause_survives(self) -> None:
+        from dtk.core.errors import SigningFailed
+        from dtk.signing.rpc import USER_AGENT_MISMATCH, is_user_agent_mismatch
+
+        async def refusing(
+            platform: Platform, spec: PlatformRequestSpec, sender: TransportIdentity
+        ):
+            raise SigningFailed(
+                "browser-rpc failed (HTTP 409)", details={"cause": USER_AGENT_MISMATCH}
+            )
+
+        pool = FakePool(identity())
+        scheduler = FakeScheduler()
+        transport = FakeTransport(response(200, {}))
+        svc = FetchService(
+            scheduler=scheduler,  # type: ignore[arg-type]
+            pool=pool,  # type: ignore[arg-type]
+            transport=transport,  # type: ignore[arg-type]
+            sign=refusing,
+            cooldown_base=60,
+        )
+        session = FakeSession()
+
+        with pytest.raises(SigningFailed) as excinfo:
+            await run_fetch(svc, session)
+
+        assert is_user_agent_mismatch(excinfo.value)
+        # Nothing went upstream, and what was recorded is the outcome that
+        # cools nothing and feeds no circuit.
+        assert transport.specs == []
+        assert set(pool.recorded) == {Outcome.BUSINESS_ERROR}
+        assert set(scheduler.released) == {Outcome.BUSINESS_ERROR}
+        assert {row.error_code for row in rows(session)} == {"SIGNING_FAILED"}

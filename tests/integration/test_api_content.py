@@ -382,6 +382,7 @@ async def test_a_failed_task_renders_as_the_matching_error_envelope(client: Any)
                 uuid.UUID(task_id),
                 error={"code": "IDENTITY_POOL_EXHAUSTED", "retry_after": 45},
             )
+        await task_service.wake_waiters(uuid.UUID(task_id))
 
     response, _ = await asyncio.gather(
         client.get("/api/v1/douyin/video", params={"aweme_id": an_id(), "wait": 5}),
@@ -533,7 +534,7 @@ async def test_missing_identifier_is_an_invalid_param(client: Any) -> None:
 
 async def test_an_unknown_platform_is_a_validation_error(client: Any) -> None:
     await signed_in(client)
-    response = await client.get("/api/v1/bilibili/video", params={"aweme_id": "1"})
+    response = await client.get("/api/v1/weibo/video", params={"aweme_id": "1"})
     assert response.status_code == 400
     assert error_code(response) == "INVALID_PARAM"
 
@@ -805,8 +806,13 @@ async def test_douyin_collections_refuse_an_author(client: Any) -> None:
 
 
 async def test_douyin_collections_without_an_author_reach_the_queue(client: Any) -> None:
+    from tests.integration.test_api_identity_pin import make_identity
+
     await signed_in(client)
-    response = await client.get("/api/v1/douyin/user/collections")
+    identity_id = await make_identity()
+    response = await client.get(
+        "/api/v1/douyin/user/collections", params={"identity": str(identity_id)}
+    )
 
     assert response.status_code == 202, response.text
 
@@ -827,3 +833,171 @@ async def test_douyin_collection_posts_reach_the_queue(client: Any) -> None:
     )
 
     assert response.status_code == 202, response.text
+
+
+# --------------------------------------------------------------------------
+# Comment order
+# --------------------------------------------------------------------------
+
+
+BILIBILI_VIDEO_ID = "BV1xx411c7mD"
+
+
+async def test_a_bilibili_comment_order_reaches_the_worker(client: Any) -> None:
+    """It is part of the question, so it is stored with it - and two callers
+    asking for different orders are never joined onto one task."""
+    await signed_in(client)
+    newest = await client.get(
+        "/api/v1/bilibili/video/comments", params={"aweme_id": BILIBILI_VIDEO_ID, "sort": "new"}
+    )
+    hottest = await client.get(
+        "/api/v1/bilibili/video/comments", params={"aweme_id": BILIBILI_VIDEO_ID, "sort": "hot"}
+    )
+
+    assert newest.status_code == hottest.status_code == 202, newest.text
+    newest_id = envelope(newest)["data"]["task_id"]
+    assert newest_id != envelope(hottest)["data"]["task_id"]
+    async with session_scope() as session:
+        row = await session.get(Task, uuid.UUID(newest_id))
+    assert row is not None
+    assert row.params["sort"] == "new"
+
+
+async def test_newest_first_is_refused_where_a_platform_cannot_serve_it(client: Any) -> None:
+    """Sent on without a sort, Douyin would answer with its hottest comments,
+    and nothing in the page would tell the caller it was not what they asked."""
+    await signed_in(client)
+    response = await client.get(
+        "/api/v1/douyin/video/comments", params={"aweme_id": an_id(), "sort": "new"}
+    )
+
+    assert error_code(response) == "INVALID_PARAM"
+    details = envelope(response)["error"]["details"]
+    assert details["field"] == "sort"
+    assert details["supported"] == ["bilibili"]
+    async with session_scope() as session:
+        assert (await session.scalars(select(Task))).all() == []
+
+
+async def test_hottest_first_is_what_douyin_serves_anyway(client: Any) -> None:
+    """So it is accepted, and not stored: the task is the one a call without
+    it makes, and the two coalesce."""
+    await signed_in(client)
+    response = await client.get(
+        "/api/v1/douyin/video/comments", params={"aweme_id": an_id(), "sort": "hot"}
+    )
+
+    assert response.status_code == 202, response.text
+    async with session_scope() as session:
+        row = await session.get(Task, uuid.UUID(envelope(response)["data"]["task_id"]))
+    assert row is not None
+    assert "sort" not in row.params
+
+
+async def test_an_order_that_does_not_exist_is_a_validation_error(client: Any) -> None:
+    await signed_in(client)
+    response = await client.get(
+        "/api/v1/bilibili/video/comments", params={"aweme_id": BILIBILI_VIDEO_ID, "sort": "old"}
+    )
+
+    assert error_code(response) == "INVALID_PARAM"
+
+
+# --------------------------------------------------------------------------
+# Bilibili's boards and parts
+# --------------------------------------------------------------------------
+
+
+async def _queued(response: Any) -> Task:
+    assert response.status_code == 202, response.text
+    async with session_scope() as session:
+        row = await session.get(Task, uuid.UUID(envelope(response)["data"]["task_id"]))
+    assert row is not None
+    return row
+
+
+@pytest.mark.parametrize(
+    ("board", "endpoint"),
+    [
+        ("hot", "bilibili.popular"),
+        ("weekly", "bilibili.popular_weekly"),
+        ("precious", "bilibili.popular_precious"),
+        ("rank", "bilibili.ranking"),
+    ],
+)
+async def test_each_board_reaches_its_own_endpoint(client: Any, board: str, endpoint: str) -> None:
+    await signed_in(client)
+    row = await _queued(await client.get("/api/v1/bilibili/popular", params={"board": board}))
+    assert row.endpoint == endpoint
+
+
+async def test_the_board_defaults_to_what_is_popular_now(client: Any) -> None:
+    await signed_in(client)
+    row = await _queued(await client.get("/api/v1/bilibili/popular"))
+    assert row.endpoint == "bilibili.popular"
+
+
+async def test_a_platform_without_boards_says_so(client: Any) -> None:
+    await signed_in(client)
+    response = await client.get("/api/v1/douyin/popular")
+
+    assert error_code(response) == "UNSUPPORTED_CONTENT"
+    assert envelope(response)["error"]["details"]["supported"] == ["bilibili"]
+
+
+async def test_a_board_that_does_not_exist_is_a_validation_error(client: Any) -> None:
+    await signed_in(client)
+    response = await client.get("/api/v1/bilibili/popular", params={"board": "monthly"})
+    assert error_code(response) == "INVALID_PARAM"
+
+
+async def test_the_parts_of_a_video_reach_the_queue(client: Any) -> None:
+    await signed_in(client)
+    row = await _queued(
+        await client.get("/api/v1/bilibili/video/parts", params={"aweme_id": BILIBILI_VIDEO_ID})
+    )
+    assert row.endpoint == "bilibili.content_parts"
+
+
+async def test_tiktok_has_no_parts(client: Any) -> None:
+    await signed_in(client)
+    response = await client.get("/api/v1/tiktok/video/parts", params={"aweme_id": an_id()})
+    assert error_code(response) == "UNSUPPORTED_CONTENT"
+
+
+async def test_a_part_of_a_video_is_asked_for_by_number(client: Any) -> None:
+    await signed_in(client)
+    row = await _queued(
+        await client.get(
+            "/api/v1/bilibili/video", params={"aweme_id": BILIBILI_VIDEO_ID, "part": 3}
+        )
+    )
+    assert row.params["part"] == 3
+
+
+async def test_a_link_to_a_later_part_asks_for_that_part(client: Any) -> None:
+    await signed_in(client)
+    row = await _queued(
+        await client.get(
+            "/api/v1/bilibili/video",
+            params={"url": f"https://www.bilibili.com/video/{BILIBILI_VIDEO_ID}?p=4"},
+        )
+    )
+    assert row.params["part"] == 4
+
+
+async def test_the_first_part_is_the_ordinary_detail(client: Any) -> None:
+    """Spelt as part 1 it is the same question as no part, and coalesces."""
+    await signed_in(client)
+    row = await _queued(
+        await client.get(
+            "/api/v1/bilibili/video", params={"aweme_id": BILIBILI_VIDEO_ID, "part": 1}
+        )
+    )
+    assert "part" not in row.params
+
+
+async def test_a_douyin_post_has_no_parts(client: Any) -> None:
+    await signed_in(client)
+    response = await client.get("/api/v1/douyin/video", params={"aweme_id": an_id(), "part": 2})
+    assert error_code(response) == "INVALID_PARAM"

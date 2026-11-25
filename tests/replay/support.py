@@ -33,7 +33,103 @@ FIXTURE_NAMES: tuple[str, ...] = (
     "comment_replies_page1",
     "risk_control_empty",
     "risk_control_captcha",
+    "related_posts",
+    "music_detail",
+    "music_detail_missing",
+    "music_posts_page1",
+    "hashtag_detail",
+    "hashtag_detail_missing",
+    "author_mixes",
+    "live_room_on",
+    "live_room_off",
+    "live_room_missing",
+    # The same rooms by the broadcast's own id: Douyin's reflow answer,
+    # TikTok's webcast host. Bilibili numbers a room once.
+    "live_room_by_id_on",
+    "live_room_by_id_missing",
+    # Many broadcasts at once, both on the webcast host. Bilibili has no such
+    # call.
+    "live_status",
 )
+
+#: Bilibili's set differs where the platform does. It has no image albums, and
+#: a deleted or private video is answered with an error code (``-404``,
+#: ``62002``) rather than a payload a parser could read - those shapes are in
+#: ``tests/unit/test_absence_matrix.py``, where the classifier meets them. Its
+#: risk page is HTML and cannot be a JSON fixture; ``risk_control_voucher`` is
+#: the JSON refusal. The rest are the shapes it has that the others do not: the
+#: ``playurl`` answer, a multi-part video, the guest's one-page comment list and
+#: the folder endpoints.
+BILIBILI_FIXTURE_NAMES: tuple[str, ...] = (
+    "video_normal",
+    "video_long_desc",
+    "video_multipart",
+    "content_streams",
+    "user_profile",
+    "user_posts_page1",
+    "user_posts_empty",
+    "comments_with_replies",
+    "comments_guest_first_page",
+    "comment_replies_page1",
+    "user_collections",
+    "user_collections_none",
+    "collection_posts_page1",
+    "risk_control_voucher",
+    "content_parts",
+    "content_parts_missing",
+    "popular_hot_page1",
+    "popular_hot_end",
+    "popular_weekly_index",
+    "popular_weekly_issue",
+    "popular_weekly_missing",
+    "popular_precious",
+    "ranking_all",
+    "related_posts",
+    "search_posts_page1",
+    "search_authors_page1",
+    "search_authors_none",
+    "author_mixes",
+    "mix_posts_page1",
+    "mix_posts_missing",
+    "live_room_on",
+    "live_room_off",
+    "live_room_missing",
+    "live_streams",
+    "trending",
+)
+
+
+#: Douyin's set is the common one plus the shapes only it has: an album of
+#: live photos, whose slides each carry a clip of their own (#792), the hot
+#: board and a live room's audience ranking.
+DOUYIN_FIXTURE_NAMES: tuple[str, ...] = (
+    *FIXTURE_NAMES,
+    "video_live_photo",
+    "trending_hot",
+    # A broadcast's audience ranking, which only Douyin has measured.
+    "live_ranking",
+    "live_ranking_missing",
+)
+
+#: TikTok's adds the posts under a hashtag, which Douyin serves only to a
+#: signed-in session and no capture of that exists.
+TIKTOK_FIXTURE_NAMES: tuple[str, ...] = (
+    *FIXTURE_NAMES,
+    "hashtag_posts_page1",
+    # And search, which Douyin refuses to a guest.
+    "search_posts_page1",
+    "search_posts_end",
+    "search_authors_page1",
+    "author_mixes_none",
+)
+
+
+def fixture_names(platform: str) -> tuple[str, ...]:
+    """The fixtures ``platform`` ships."""
+    if platform == "bilibili":
+        return BILIBILI_FIXTURE_NAMES
+    return DOUYIN_FIXTURE_NAMES if platform == "douyin" else TIKTOK_FIXTURE_NAMES
+
 
 #: Key names that must never appear in a fixture. Fixtures come from real
 #: captured traffic, and a single echoed credential in a committed file is a
@@ -128,10 +224,14 @@ def keys_in(payload: Any) -> set[str]:
 
 
 __all__ = [
+    "BILIBILI_FIXTURE_NAMES",
+    "DOUYIN_FIXTURE_NAMES",
     "FETCHED_AT",
     "FIXTURES",
     "FIXTURE_NAMES",
     "FORBIDDEN_KEY_PATTERN",
+    "TIKTOK_FIXTURE_NAMES",
+    "fixture_names",
     "keys_in",
     "load",
     "nulled",

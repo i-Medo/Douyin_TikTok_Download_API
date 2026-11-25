@@ -17,6 +17,7 @@ masking, really do run.
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from typing import Any
 
@@ -41,6 +42,7 @@ from dtk.ops.masking import (
     scrub,
     short_id,
 )
+from dtk.transport.base import RawResponse
 
 #: Long enough for Cipher, and obviously not a real key.
 TEST_SECRET = "test-secret-key-that-is-long-enough-0123456789"
@@ -706,6 +708,57 @@ class TestConfig:
         assert "sensitive setting" in result.output
         assert "cancelled" in result.output
 
+    def test_set_reads_the_value_from_stdin(
+        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A credential given on stdin never appears in the process list."""
+        import dtk.services.settings_store as store
+
+        recorded: dict[str, Any] = {}
+
+        async def fake_set_value(key: str, value: Any, **_kwargs: Any) -> Any:
+            recorded["key"], recorded["value"] = key, value
+            return value
+
+        monkeypatch.setattr(store, "set_value", fake_set_value)
+        install_context(monkeypatch, FakeSession())
+        result = runner.invoke(
+            app,
+            ["config", "set", "security.webhook_secret", "--stdin", "--yes"],
+            input="a-webhook-secret-0123456789\r\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert recorded == {
+            "key": "security.webhook_secret",
+            "value": "a-webhook-secret-0123456789",
+        }
+        assert "a-webhook-secret-0123456789" not in result.output
+
+    def test_set_takes_the_value_one_way_only(
+        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        install_context(monkeypatch, FakeSession())
+        both = runner.invoke(
+            app, ["config", "set", "cache.content_ttl", "60", "--stdin"], input="70\n"
+        )
+        assert both.exit_code == 2
+        neither = runner.invoke(app, ["config", "set", "cache.content_ttl"])
+        assert neither.exit_code == 2
+        assert "--stdin" in neither.output
+
+    def test_the_sensitive_prompt_does_not_echo_a_secret(
+        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        install_context(monkeypatch, FakeSession())
+        result = runner.invoke(
+            app,
+            ["config", "set", "security.webhook_secret", "--stdin"],
+            input="a-webhook-secret-0123456789\nn\n",
+        )
+        assert result.exit_code == 1
+        assert "sensitive setting" in result.output
+        assert "a-webhook-secret-0123456789" not in result.output
+
     def test_channel_credentials_are_redacted(self) -> None:
         value = [{"type": "telegram", "url": "https://api.telegram.org/bot123:ABCDEF/send"}]
         rendered = settings_cmd.render(settings_cmd.redact("notify.channels", value))
@@ -720,6 +773,25 @@ class TestConfig:
 # ---------------------------------------------------------------------------
 # identities
 # ---------------------------------------------------------------------------
+
+
+class _SpiTransport:
+    """Answers every request with one finger/spi payload."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._body = json.dumps(payload).encode()
+        self.closed = False
+
+    async def request(self, _identity: Any, _spec: Any, _timeout: float | None = None) -> Any:
+        return RawResponse(
+            status=200, headers={"content-type": "application/json"}, body=self._body
+        )
+
+    async def evict(self, _identity_id: str) -> None:
+        return None
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class TestIdentities:
@@ -764,6 +836,35 @@ class TestIdentities:
         result = runner.invoke(app, ["identity", "mint", "--platform", "douyin"])
         assert result.exit_code == 1
         assert "browser-rpc is not configured" in result.output
+
+    def test_mint_bilibili_needs_no_browser(
+        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Bilibili guest comes from finger/spi over plain HTTP, as the worker mints it."""
+        transport = _SpiTransport(
+            {"code": 0, "data": {"b_3": "SYNTHETIC-b3", "b_4": "SYNTHETIC-b4"}}
+        )
+        monkeypatch.setattr(identities, "WreqTransport", lambda: transport)
+        session = FakeSession()
+        install_context(monkeypatch, session)
+        result = runner.invoke(app, ["identity", "mint", "--platform", "bilibili"])
+        assert result.exit_code == 0, result.output
+        assert "minted 1 bilibili" in result.output
+        assert "SYNTHETIC-b3" not in result.output
+        stored = [row for row in session.added if isinstance(row, Identity)]
+        assert [row.platform for row in stored] == ["bilibili"]
+        assert transport.closed
+
+    def test_mint_bilibili_reports_a_refusal(
+        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        transport = _SpiTransport({"code": -412, "message": "intercepted", "data": None})
+        monkeypatch.setattr(identities, "WreqTransport", lambda: transport)
+        install_context(monkeypatch, FakeSession())
+        result = runner.invoke(app, ["identity", "mint", "--platform", "bilibili"])
+        assert result.exit_code == 1
+        assert "minting failed" in result.output
+        assert transport.closed
 
     def test_retire_needs_a_known_identity(
         self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
@@ -834,9 +935,54 @@ class TestTargets:
         from dtk.ops.pipeline import target_for
         from dtk.urls import identify
 
-        kind = identify("https://live.douyin.com/123456789")
+        # A Douyin mix link: /parse refuses it too, which is the point - the
+        # CLI and /parse answer the same links.
+        kind = identify("https://www.douyin.com/collection/7123456789012345678")
         with pytest.raises(UnsupportedContent):
             target_for(kind)
+
+    @pytest.mark.parametrize(
+        ("url", "endpoint", "params"),
+        [
+            (
+                "https://www.douyin.com/music/7661456186985761599",
+                "douyin.music_detail",
+                {"music_id": "7661456186985761599"},
+            ),
+            # The tag link carries a name, so it goes in as one even when it
+            # is all digits - the same rule /parse follows.
+            ("https://www.tiktok.com/tag/2024", "tiktok.hashtag_detail", {"name": "2024"}),
+            (
+                "https://live.douyin.com/615171448842",
+                "douyin.live_room",
+                {"room_id": "615171448842"},
+            ),
+            ("https://live.bilibili.com/545068", "bilibili.live_room", {"room_id": "545068"}),
+            # A share link from the app, once expanded: the broadcast, by its id.
+            (
+                "https://webcast.amemv.com/douyin/webcast/reflow/7318296342189919011",
+                "douyin.live_room_by_id",
+                {"live_id": "7318296342189919011"},
+            ),
+            (
+                "https://www.tiktok.com/@ventisfit/live",
+                "tiktok.live_room",
+                {"room_id": "ventisfit"},
+            ),
+        ],
+    )
+    def test_a_link_parse_answers_is_one_dtk_fetch_answers(
+        self, url: str, endpoint: str, params: dict[str, str]
+    ) -> None:
+        """`dtk fetch` refused every link but a post and a profile, after /parse
+        had learned sounds, hashtags and live rooms."""
+        from dtk.ops.pipeline import target_for
+        from dtk.urls import identify
+
+        target = target_for(identify(url))
+        assert target.endpoint == endpoint
+        assert target.params == params
+        assert target.endpoint.endswith(target.capability.value)
 
 
 # ---------------------------------------------------------------------------

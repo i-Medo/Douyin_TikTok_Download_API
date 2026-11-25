@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
@@ -16,6 +17,7 @@ from dtk.core.errors import (
     DtkError,
     ErrorCode,
     InvalidParam,
+    MediaWithheld,
     UpstreamChanged,
     UpstreamRiskControl,
 )
@@ -123,6 +125,9 @@ def test_video_normal_every_field() -> None:
     assert media.video.format == "mp4"
     assert media.video.size_bytes is None
     assert media.video.watermark is False
+    # The video's links say tk=tt_chain_token: a caller cannot fetch them (#831).
+    assert media.access.session_bound is True
+    assert media.access.referer == "https://www.tiktok.com/"
 
     assert [(s.bitrate, s.format, s.size_bytes) for s in media.streams] == [
         (1043057, "h264", 2737510),
@@ -170,6 +175,8 @@ def test_photo_mode_album() -> None:
     assert content.duration_ms is None
     assert content.media.video is None
     assert content.media.streams == []
+    # Slides are on the image edges, which bind nothing to a session.
+    assert content.media.access.session_bound is False
     assert len(content.media.images) == 3
     assert content.media.images[0].url == (
         "https://p16-sign-va.example-cdn.invalid/obj/tos-useast-i-0068/"
@@ -220,14 +227,81 @@ def test_muted_audio_is_not_a_takedown() -> None:
     assert excinfo.value.path == "itemInfo.itemStruct.video.playAddr"
 
 
+def test_a_shop_video_without_media_is_withheld_not_a_schema_change() -> None:
+    """The web API sends a TikTok Shop video bare, signed in or not (#819).
+
+    UPSTREAM_CHANGED asked for a bug report about a field nobody renamed, and a
+    download of the post failed with it.
+    """
+    payload = fixture("video_normal")
+    item = payload["itemInfo"]["itemStruct"]
+    item["isECVideo"] = 1
+    item["video"]["playAddr"] = ""
+    item["video"].pop("downloadAddr", None)
+    item["video"].pop("bitrateInfo", None)
+
+    with pytest.raises(MediaWithheld) as excinfo:
+        parser.parse_content(payload, fetched_at=FETCHED_AT)
+    assert excinfo.value.code is ErrorCode.MEDIA_WITHHELD
+    assert excinfo.value.details == {"content_id": NORMAL_ID, "reason": "shop_video"}
+
+
+def test_a_shop_video_that_does_carry_media_parses_as_usual() -> None:
+    payload = fixture("video_normal")
+    payload["itemInfo"]["itemStruct"]["isECVideo"] = 1
+    content = parser.parse_content(payload, fetched_at=FETCHED_AT)
+    assert content.media.video is not None
+
+
 def test_a_stated_zero_like_total_is_not_turned_into_none() -> None:
     """0 likes received is a measurement; only an absent field is None."""
     payload = fixture("user_profile")
-    payload["userInfo"]["stats"]["heartCount"] = 0
-    payload["userInfo"]["stats"].pop("heart", None)
+    payload["userInfo"]["statsV2"]["heartCount"] = "0"
+    payload["userInfo"]["statsV2"].pop("heart", None)
     stats = parser.parse_author(payload).stats
     assert stats is not None
     assert stats.total_digg == 0
+
+
+def test_author_counters_prefer_stats_v2_over_stats() -> None:
+    """#804: ``stats`` sat in front of ``statsV2``, so the exact copy was never read.
+
+    The disagreement below is the kind posts and hashtags already showed when
+    measured: a numeric ``stats`` that is zero or rounded beside the string
+    ``statsV2`` that carries the real figure.
+    """
+    payload = fixture("user_profile")
+    payload["userInfo"]["stats"].update(
+        followerCount=128000, videoCount=0, heartCount=2147483647, heart=2147483647
+    )
+    payload["userInfo"]["statsV2"].update(
+        followerCount="128401", videoCount="214", heartCount="3894513", heart="3894513"
+    )
+    assert parser.parse_author(payload).stats == AuthorStats(
+        follower_count=128401,
+        following_count=42,
+        content_count=214,
+        total_digg=3894513,
+    )
+
+
+def test_author_counters_fall_back_to_stats_field_by_field() -> None:
+    """A counter ``statsV2`` does not state is still read from ``stats``."""
+    payload = fixture("user_profile")
+    del payload["userInfo"]["statsV2"]["followingCount"]
+    payload["userInfo"]["stats"]["followingCount"] = 43
+    stats = parser.parse_author(payload).stats
+    assert stats is not None
+    assert stats.following_count == 43
+    assert stats.follower_count == 128400
+
+    del payload["userInfo"]["statsV2"]
+    assert parser.parse_author(payload).stats == AuthorStats(
+        follower_count=128400,
+        following_count=43,
+        content_count=213,
+        total_digg=3894512,
+    )
 
 
 def test_private_video_parses_instead_of_raising() -> None:
@@ -341,6 +415,73 @@ def test_last_post_page_has_no_cursor() -> None:
     assert page.cursor is None
 
 
+def _strip_media(item: dict) -> None:
+    """What #819 captured: ``playAddr`` an empty string, nothing beside it."""
+    item["video"]["playAddr"] = ""
+    item["video"].pop("downloadAddr", None)
+    item["video"].pop("bitrateInfo", None)
+    item.pop("imagePost", None)
+
+
+@pytest.mark.parametrize(
+    ("parse", "name", "key"),
+    [
+        (parser.parse_author_posts, "user_posts_page1", "itemList"),
+        (parser.parse_search_posts, "search_posts_page1", "item_list"),
+    ],
+)
+def test_one_post_without_media_does_not_sink_its_page(parse: Any, name: str, key: str) -> None:
+    """#819: one post TikTok sends without a media address cost the whole page.
+
+    The item comes back with what it has - metadata, no streams - and the rest
+    of the page beside it. The detail endpoint stays strict.
+    """
+    payload = fixture(name)
+    _strip_media(payload[key][0])
+
+    page = parse(payload, fetched_at=FETCHED_AT)
+
+    assert [item.content_id for item in page.items] == [NORMAL_ID, ALBUM_ID]
+    bare, album = page.items
+    assert bare.media.video is None
+    assert bare.media.streams == []
+    assert bare.is_deleted is False
+    assert album.media.images
+
+
+@pytest.mark.parametrize(
+    ("parse", "name", "key"),
+    [
+        (parser.parse_author_posts, "user_posts_page1", "itemList"),
+        (parser.parse_search_posts, "search_posts_page1", "item_list"),
+    ],
+)
+def test_a_page_with_no_media_anywhere_is_still_a_schema_change(
+    parse: Any, name: str, key: str
+) -> None:
+    """Every post on the page without media is the field moving, not a few posts."""
+    payload = fixture(name)
+    for item in payload[key]:
+        _strip_media(item)
+
+    with pytest.raises(UpstreamChanged) as excinfo:
+        parse(payload, fetched_at=FETCHED_AT)
+    assert excinfo.value.path == f"{key}[0].video.playAddr"
+
+
+def test_a_page_of_shop_videos_without_media_is_not_a_schema_change() -> None:
+    """A seller's page can be all shop videos, and a guest gets none of their media."""
+    payload = fixture("user_posts_page1")
+    for item in payload["itemList"]:
+        _strip_media(item)
+        item["isECVideo"] = 1
+
+    page = parser.parse_author_posts(payload, fetched_at=FETCHED_AT)
+
+    assert len(page.items) == 2
+    assert all(item.media.video is None for item in page.items)
+
+
 def test_empty_post_list_is_not_risk_control() -> None:
     payload = fixture("user_posts_page1")
     payload["itemList"] = []
@@ -447,6 +588,15 @@ def test_an_absent_collection_list_is_an_empty_page_not_a_broken_payload() -> No
     page = parser.parse_author_collections({"hasMore": False, "statusCode": 0})
     assert page.items == []
     assert page.has_more is False
+    assert page.cursor is None
+
+
+def test_a_null_collection_list_is_an_empty_page_too() -> None:
+    """Null and absent are the same answer; see #790 for the Douyin twin."""
+    page = parser.parse_author_collections(
+        {"collectionList": None, "hasMore": False, "statusCode": 0}
+    )
+    assert page.items == []
     assert page.cursor is None
 
 
@@ -887,6 +1037,22 @@ def test_author_list_reads_the_user_and_stats_pair() -> None:
     assert page.cursor == "1788830136"
 
 
+def test_author_list_counters_prefer_stats_v2() -> None:
+    page = parser.parse_author_list(
+        {
+            "userList": [
+                {
+                    "user": {"id": "123", "uniqueId": "someone", "nickname": "Someone"},
+                    "stats": {"followerCount": 0, "followingCount": 3, "heartCount": 45},
+                    "statsV2": {"followerCount": "12", "heartCount": "46"},
+                }
+            ],
+            "hasMore": False,
+        }
+    )
+    assert page.items[0].stats == AuthorStats(follower_count=12, following_count=3, total_digg=46)
+
+
 def test_an_absent_user_list_is_an_empty_page_not_a_broken_payload() -> None:
     """A hidden following list omits the key rather than sending an empty list.
 
@@ -899,6 +1065,14 @@ def test_an_absent_user_list_is_an_empty_page_not_a_broken_payload() -> None:
     assert page.items == []
     assert page.has_more is False
     assert page.cursor is None
+
+
+def test_a_null_user_list_is_an_empty_page_too() -> None:
+    page = parser.parse_author_list(
+        {"userList": None, "hasMore": False, "minCursor": -1, "statusCode": 0}
+    )
+    assert page.items == []
+    assert page.has_more is False
 
 
 def test_a_present_user_list_is_still_strict() -> None:

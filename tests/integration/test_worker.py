@@ -31,7 +31,7 @@ from dtk.core.types import (
     Platform,
     TaskState,
 )
-from dtk.db.models import CONTINUOUS_AGGREGATES, Identity, Proxy, RequestLog, Task
+from dtk.db.models import CONTINUOUS_AGGREGATES, Identity, Proxy, RequestLog, Task, Transcription
 from dtk.identity import mint_log
 from dtk.identity.minting import BrowserRpcUnavailable
 from dtk.identity.pool import IdentityPool
@@ -326,6 +326,32 @@ async def test_a_finished_task_is_never_run_a_second_time(db_engine, redis_clien
         await _drop_task(task_id)
 
 
+@pytest.mark.parametrize("outcome", ["done", "failed"])
+async def test_a_waiter_is_woken_only_once_the_answer_is_committed(
+    db_engine, redis_client, monkeypatch, outcome
+):
+    """Woken earlier, a `?wait=` caller read the row before the commit, saw it
+    still running, and blocked for five more seconds: a request the scheduler
+    refused in milliseconds answered in five."""
+    task_id = await _submit()
+    store = DatabaseTaskStore()
+    seen: list[str] = []
+
+    async def look(woken: uuid.UUID) -> None:
+        async with session_scope() as other:
+            seen.append((await tasks.get(other, woken)).state.value)
+
+    monkeypatch.setattr(tasks, "wake_waiters", look)
+    try:
+        if outcome == "done":
+            await store.complete(task_id, {"data": {}, "meta": {}})
+        else:
+            await store.fail(task_id, {"code": "IDENTITY_LOGIN_REQUIRED"})
+        assert seen == [outcome]
+    finally:
+        await _drop_task(task_id)
+
+
 # --------------------------------------------------------------------------
 # maintenance
 # --------------------------------------------------------------------------
@@ -374,6 +400,129 @@ async def test_a_running_task_inside_the_window_is_left_alone(db_engine, redis_c
         assert (await _task_row(task_id)).state == TaskState.RUNNING.value
     finally:
         await _drop_task(task_id)
+
+
+async def _running_since(task_id: uuid.UUID, minutes_ago: int) -> None:
+    async with session_scope() as session:
+        row = _require(await session.get(Task, task_id), "the submitted task")
+        row.state = TaskState.RUNNING.value
+        row.started_at = datetime.now(UTC) - timedelta(minutes=minutes_ago)
+
+
+async def test_a_transcription_inside_its_own_window_is_left_running(db_engine, redis_client):
+    """A transcription holds its task for as long as the sidecar takes.
+
+    At the general 900 s threshold the sweep handed a live one to a second
+    worker, the two polled the same sidecar job, and the loser overwrote the
+    winner's transcript with "no such job".
+    """
+    transcription = await _submit("media.transcribe", transcription_id=str(uuid.uuid4()))
+    ordinary = await _submit()
+    await _running_since(transcription, 20)
+    await _running_since(ordinary, 20)
+
+    job = Maintenance(
+        cipher=Cipher(SECRET),
+        config=Config.defaults(),
+        options=MaintenanceConfig(
+            stale_task_seconds=900, long_task_seconds={"media.transcribe": 4500}
+        ),
+    )
+    try:
+        await job.requeue_stale_tasks(MaintenanceReport())
+        assert (await _task_row(transcription)).state == TaskState.RUNNING.value
+        assert (await _task_row(ordinary)).state == TaskState.QUEUED.value
+    finally:
+        await _drop_task(transcription)
+        await _drop_task(ordinary)
+
+
+async def test_a_transcription_past_its_own_window_is_requeued(db_engine, redis_client):
+    transcription = await _submit("media.transcribe", transcription_id=str(uuid.uuid4()))
+    await _running_since(transcription, 80)
+
+    job = Maintenance(
+        cipher=Cipher(SECRET),
+        config=Config.defaults(),
+        options=MaintenanceConfig(
+            stale_task_seconds=900, long_task_seconds={"media.transcribe": 4500}
+        ),
+    )
+    try:
+        await job.requeue_stale_tasks(MaintenanceReport())
+        assert (await _task_row(transcription)).state == TaskState.QUEUED.value
+    finally:
+        await _drop_task(transcription)
+
+
+async def _transcription(task_id: uuid.UUID | None, *, state: str) -> uuid.UUID:
+    identifier = uuid.uuid4()
+    async with session_scope() as session:
+        session.add(
+            Transcription(
+                id=identifier,
+                platform="douyin",
+                content_id="7408915107113127222",
+                state=state,
+                model="test-model",
+                source_name="video.mp4",
+                source_sha256="c" * 64,
+                source_bytes=5,
+                task_id=task_id,
+            )
+        )
+    return identifier
+
+
+async def test_a_transcription_whose_task_ended_without_it_is_failed(db_engine, redis_client):
+    """A live row behind a finished task is one no worker will come back for.
+
+    A worker settles the row before it completes the task, so the task ending
+    is the proof. The case that produced these: a task failed by the attempt
+    counter, leaving a row that held the in-flight index for good.
+    """
+    ended = await _submit("media.transcribe", transcription_id=str(uuid.uuid4()))
+    running = await _submit("media.transcribe", transcription_id=str(uuid.uuid4()))
+    # DELETE /api/v1/tasks/{id} on a queued task: FAILED, with code CANCELLED.
+    withdrawn = await _submit("media.transcribe", transcription_id=str(uuid.uuid4()))
+    async with session_scope() as session:
+        _require(await session.get(Task, ended), "the ended task").state = TaskState.FAILED.value
+        row = _require(await session.get(Task, withdrawn), "the withdrawn task")
+        row.state = TaskState.FAILED.value
+        row.error = {"code": ErrorCode.CANCELLED.value, "message": "cancelled"}
+    await _running_since(running, 1)
+    orphan = await _transcription(ended, state="running")
+    alive = await _transcription(running, state="running")
+    settled = await _transcription(ended, state="done")
+    cancelled = await _transcription(withdrawn, state="queued")
+
+    job = Maintenance(cipher=Cipher(SECRET), config=Config.defaults())
+    report = MaintenanceReport()
+    try:
+        await job.fail_orphaned_transcriptions(report)
+
+        assert report.orphaned_transcriptions_failed == 2
+        async with session_scope() as session:
+            states = {
+                identifier: _require(await session.get(Transcription, identifier), "a row").state
+                for identifier in (orphan, alive, settled, cancelled)
+            }
+        assert states == {
+            orphan: "failed",
+            alive: "running",
+            settled: "done",
+            # Withdrawn by its caller, which "the worker never reported" would misstate.
+            cancelled: "cancelled",
+        }
+    finally:
+        async with session_scope() as session:
+            await session.execute(
+                delete(Transcription).where(
+                    Transcription.id.in_((orphan, alive, settled, cancelled))
+                )
+            )
+        for task_id in (ended, running, withdrawn):
+            await _drop_task(task_id)
 
 
 async def test_retention_windows_reach_timescaledb(db_engine, redis_client):
@@ -479,6 +628,8 @@ async def test_a_dead_proxy_cools_its_identities_and_leaves_them_where_they_are(
         identity = _require(await session.get(Identity, identity_id), "the identity")
         assert proxy.healthy is False
         assert proxy.last_check_at is not None
+        # The reason is kept where the console can show it, not only logged.
+        assert proxy.last_error == "connect timeout"
         # Cooling, not retired, and still on the same proxy.
         assert identity.state == IdentityState.COOLING.value
         assert identity.proxy_id == proxy_id
@@ -490,6 +641,9 @@ async def test_a_healthy_probe_records_geoip(db_engine, redis_client, cleanup_pr
     cipher = Cipher(SECRET)
     proxy_id = await _make_proxy(cipher)
     cleanup_proxies.append(proxy_id)
+    async with session_scope() as session:
+        stale = _require(await session.get(Proxy, proxy_id), "the proxy")
+        stale.last_error = "ProxyError: 400 Bad Request"
 
     prober = ProxyProber(
         cipher=cipher,
@@ -504,6 +658,7 @@ async def test_a_healthy_probe_records_geoip(db_engine, redis_client, cleanup_pr
         assert proxy.healthy is True
         assert proxy.country == "DE"
         assert proxy.timezone == "CET"
+        assert proxy.last_error is None
 
 
 async def test_three_network_errors_trigger_one_probe(db_engine, redis_client, cleanup_proxies):
@@ -685,6 +840,55 @@ async def test_a_real_mint_leaves_a_trail_the_console_can_read(
     assert snapshot["recent"][0]["identity_id"] == str(result.identity_id)
 
 
+async def test_the_direct_egress_takes_one_identity_once_the_proxies_are_taken(
+    db_engine, redis_client, cleanup_identities, cleanup_proxies
+):
+    """#807 against the real tables: the proxy first, then the direct egress
+    once, then a skip - recorded as one, not as a failed attempt."""
+    from dtk.db.repositories import ProxyRepository
+
+    cipher = Cipher(SECRET)
+    pool = IdentityPool(cipher)
+    proxy_id = await _make_proxy(cipher)
+    cleanup_proxies.append(proxy_id)
+    async with session_scope() as session:
+        bound = await pool.add(
+            session,
+            platform=Platform.DOUYIN,
+            cookies={"ttwid": "abc"},
+            fingerprint=Fingerprint(browser_family=BrowserFamily.CHROME, browser_major=131),
+            source=IdentitySource.MINTED,
+            proxy_id=proxy_id,
+        )
+    cleanup_identities.append(bound)
+    async with session_scope() as session:
+        proxies = ProxyRepository(session)
+        if await proxies.list_unbound(Platform.DOUYIN) or not await proxies.direct_unbound(
+            Platform.DOUYIN
+        ):
+            pytest.skip("another test left a free proxy or a direct Douyin identity behind")
+    await redis_client.delete(MINT_LOCK_KEY, mint_log.RECENT_KEY)
+    await redis_client.delete(mint_log.skip_key(Platform.DOUYIN))
+
+    filler = PoolFiller(pool=pool, rpc=RecordingRpc(), cipher=cipher, config=Config.defaults())
+    first = await filler.top_up_once(Platform.DOUYIN)
+
+    assert first.minted is True
+    assert first.identity_id is not None
+    cleanup_identities.append(first.identity_id)
+    assert first.proxy_id is None
+    async with session_scope() as session:
+        row = _require(await session.get(Identity, first.identity_id), "the direct identity")
+        assert row.proxy_id is None
+
+    second = await filler.top_up_once(Platform.DOUYIN)
+
+    assert second.reason == "no_free_proxy"
+    snapshot = await mint_log.snapshot()
+    assert snapshot["skips"]["douyin"]["reason"] == "no_free_proxy"
+    assert [entry["reason"] for entry in snapshot["recent"]] == ["minted"]
+
+
 async def test_a_failing_mint_records_the_reason_and_the_backoff(db_engine, redis_client):
     """The case the panel exists for: nothing else in the system says this."""
     cipher = Cipher(SECRET)
@@ -746,6 +950,105 @@ async def test_the_pool_level_query_runs_against_the_real_table(db_engine, redis
     # Disabled minting still surveys the pool, which is what raises the alerts.
     result = await filler.tick()
     assert result.reason == "disabled"
+
+
+async def _identity_with_streak(
+    pool: IdentityPool,
+    platform: Platform,
+    streak: int,
+    *,
+    source: IdentitySource = IdentitySource.MINTED,
+    authenticated: bool = False,
+) -> uuid.UUID:
+    async with session_scope() as session:
+        identity_id = await pool.add(
+            session,
+            platform=platform,
+            cookies={"ttwid": "abc"},
+            fingerprint=Fingerprint(browser_family=BrowserFamily.CHROME, browser_major=131),
+            source=source,
+            authenticated=authenticated,
+        )
+        row = _require(await session.get(Identity, identity_id), "the new identity")
+        row.consecutive_fails = streak
+    return identity_id
+
+
+async def _state_of(identity_id: uuid.UUID) -> str:
+    async with session_scope() as session:
+        return _require(await session.get(Identity, identity_id), "the identity").state
+
+
+async def test_a_guest_the_platform_keeps_refusing_is_retired(
+    db_engine, redis_client, cleanup_identities
+):
+    """The demo's pool on 2026-11-02: hundreds of guests at a streak of ten and
+    more, cooling and coming back for ever, and a few healthy ones beside them."""
+    cipher = Cipher(SECRET)
+    pool = IdentityPool(cipher)
+    healthy = await _identity_with_streak(pool, Platform.DOUYIN, 0)
+    probation = await _identity_with_streak(pool, Platform.DOUYIN, 5)
+    burned = await _identity_with_streak(pool, Platform.DOUYIN, 12)
+    login = await _identity_with_streak(
+        pool, Platform.DOUYIN, 12, source=IdentitySource.IMPORTED, authenticated=True
+    )
+    cleanup_identities.extend([healthy, probation, burned, login])
+
+    async with session_scope() as session:
+        retired = await pool.retire_burned(
+            session, Platform.DOUYIN, streak=10, max_fail_streak=3, limit=1000
+        )
+
+    assert retired >= 1
+    assert await _state_of(burned) == IdentityState.RETIRED.value
+    async with session_scope() as session:
+        row = _require(await session.get(Identity, burned), "the burned identity")
+        assert row.cookies_encrypted == b""
+        assert row.retire_reason == "auto: 12 consecutive failures with no success"
+    assert await _state_of(healthy) == IdentityState.ACTIVE.value
+    assert await _state_of(probation) == IdentityState.ACTIVE.value
+    # Somebody's account: theirs to give up on, not the worker's.
+    assert await _state_of(login) == IdentityState.ACTIVE.value
+
+
+async def test_nothing_is_retired_while_the_platform_refuses_everyone(
+    db_engine, redis_client, cleanup_identities
+):
+    cipher = Cipher(SECRET)
+    pool = IdentityPool(cipher)
+    async with session_scope() as session:
+        if await pool.usable_count(session, Platform.TIKTOK, max_fail_streak=3):
+            pytest.skip("another test left a usable TikTok identity behind")
+    burned = await _identity_with_streak(pool, Platform.TIKTOK, 15)
+    cleanup_identities.append(burned)
+
+    async with session_scope() as session:
+        retired = await pool.retire_burned(session, Platform.TIKTOK, streak=10, max_fail_streak=3)
+
+    assert retired == 0
+    assert await _state_of(burned) == IdentityState.ACTIVE.value
+
+
+async def test_the_maintenance_job_never_retires_below_the_usable_mark(
+    db_engine, redis_client, cleanup_identities
+):
+    """A retire streak under pool.max_fail_streak acts as that mark: an identity
+    still counted usable is not retired from under the level the filler holds."""
+    cipher = Cipher(SECRET)
+    pool = IdentityPool(cipher)
+    healthy = await _identity_with_streak(pool, Platform.BILIBILI, 0)
+    counted = await _identity_with_streak(pool, Platform.BILIBILI, 2)
+    cleanup_identities.extend([healthy, counted])
+
+    maintenance = Maintenance(
+        cipher=cipher,
+        config=Config({"pool.retire_fail_streak": 2, "pool.max_fail_streak": 3}),
+    )
+    report = MaintenanceReport()
+    await maintenance.retire_burned_identities(report)
+
+    assert await _state_of(counted) == IdentityState.ACTIVE.value
+    assert not report.errors
 
 
 async def test_identities_of_a_dead_proxy_recover_on_their_own(
@@ -979,3 +1282,168 @@ async def test_retention_never_deletes_a_task_that_has_not_finished(db_engine, r
     async with session_scope() as session:
         assert await session.get(Task, queued_id) is not None
         assert await session.get(Task, done_id) is None
+
+
+async def test_a_device_id_is_kept_beside_the_fingerprint_it_belongs_to(
+    db_engine, redis_client, cleanup_identities
+):
+    """#831: TikTok's links open only for the device id their session was
+    issued, so once read it has to come back on every later load - and leave
+    the rest of the fingerprint as it was."""
+    pool = IdentityPool(Cipher(SECRET))
+    async with session_scope() as session:
+        identity_id = await pool.add(
+            session,
+            platform=Platform.TIKTOK,
+            cookies={"tt_chain_token": "chain"},
+            fingerprint=Fingerprint(
+                browser_family=BrowserFamily.CHROME, browser_major=146, screen="1920x1080"
+            ),
+            source=IdentitySource.MINTED,
+        )
+    cleanup_identities.append(identity_id)
+
+    async with session_scope() as session:
+        await pool.remember_device_id(session, str(identity_id), "7311111111111111111")
+        await session.commit()
+
+    async with session_scope() as session:
+        loaded = await pool.load(session, str(identity_id))
+    assert loaded is not None
+    assert loaded.fingerprint.device_id == "7311111111111111111"
+    assert loaded.fingerprint.screen == "1920x1080"
+    assert loaded.fingerprint.browser_major == 146
+
+
+async def test_rotated_cookies_are_kept_encrypted_and_read_back(
+    db_engine, redis_client, cleanup_identities
+):
+    """What a response sets reaches the next load of the identity, in the
+    caller's own transaction, and a bootstrap msToken never replaces the
+    session's usable one."""
+    pool = IdentityPool(Cipher(SECRET))
+    usable = "u" * 152
+    async with session_scope() as session:
+        identity_id = await pool.add(
+            session,
+            platform=Platform.TIKTOK,
+            cookies={"msToken": usable, "odin_tt": "old", "tt_chain_token": "chain"},
+            fingerprint=Fingerprint(browser_family=BrowserFamily.CHROME, browser_major=146),
+            source=IdentitySource.MINTED,
+        )
+    cleanup_identities.append(identity_id)
+
+    async with session_scope() as session:
+        # Loaded first, as a request does, so the row is already in the
+        # session's identity map when the response comes back.
+        await pool.load(session, str(identity_id))
+        changed = await pool.absorb_cookies(
+            session,
+            str(identity_id),
+            {"odin_tt": "rotated", "msToken": "b" * 128, "tt_chain_token": "chain"},
+        )
+        await session.commit()
+
+    assert changed == ("odin_tt",)
+    async with session_scope() as session:
+        loaded = await pool.load(session, str(identity_id))
+        row = await session.get(Identity, identity_id)
+    assert loaded is not None
+    assert loaded.cookies == {"msToken": usable, "odin_tt": "rotated", "tt_chain_token": "chain"}
+    assert row is not None and b"rotated" not in row.cookies_encrypted
+
+
+async def test_a_retired_identity_learns_no_cookies(db_engine, redis_client, cleanup_identities):
+    """Retiring wipes the credential; a response read after it must not put one back."""
+    pool = IdentityPool(Cipher(SECRET))
+    async with session_scope() as session:
+        identity_id = await pool.add(
+            session,
+            platform=Platform.DOUYIN,
+            cookies={"ttwid": "t"},
+            fingerprint=Fingerprint(browser_family=BrowserFamily.CHROME, browser_major=146),
+            source=IdentitySource.MINTED,
+        )
+    cleanup_identities.append(identity_id)
+
+    async with session_scope() as session:
+        await pool.retire(session, str(identity_id), "test")
+        changed = await pool.absorb_cookies(session, str(identity_id), {"ttwid": "late"})
+        await session.commit()
+
+    assert changed == ()
+    async with session_scope() as session:
+        row = await session.get(Identity, identity_id)
+    assert row is not None and row.cookies_encrypted == b""
+
+
+@pytest.mark.parametrize("first_tiktok_call", [False, True], ids=["known-device", "first-call"])
+async def test_a_retire_that_lands_mid_request_is_not_undone(
+    db_engine, redis_client, cleanup_identities, first_tiktok_call
+):
+    """Found in review: the request held a copy of the row from before the
+    retire, and writing the rotated jar back gave a retired identity its
+    cookies again. On a TikTok identity's first call the device id makes that
+    copy dirty, which pins it in the session for the whole request."""
+    pool = IdentityPool(Cipher(SECRET))
+    async with session_scope() as session:
+        identity_id = await pool.add(
+            session,
+            platform=Platform.TIKTOK,
+            cookies={"sessionid": "a-login", "odin_tt": "old"},
+            fingerprint=Fingerprint(browser_family=BrowserFamily.CHROME, browser_major=146),
+            source=IdentitySource.IMPORTED,
+            authenticated=True,
+        )
+    cleanup_identities.append(identity_id)
+
+    async with session_scope() as request:
+        await pool.load(request, str(identity_id))
+        if first_tiktok_call:
+            await pool.remember_device_id(request, str(identity_id), "7311111111111111111")
+        # An operator retires it while the request is on the wire.
+        async with session_scope() as console:
+            await pool.retire(console, str(identity_id), "retired from the console")
+            await console.commit()
+        changed = await pool.absorb_cookies(request, str(identity_id), {"odin_tt": "rotated"})
+        await pool.record_outcome(
+            request, str(identity_id), Outcome.OK, cooldown_base=60, cooldown_max=600
+        )
+        await request.commit()
+
+    assert changed == ()
+    async with session_scope() as session:
+        row = await session.get(Identity, identity_id)
+    assert row is not None
+    assert row.state == IdentityState.RETIRED.value
+    assert row.cookies_encrypted == b""
+
+
+async def test_the_device_id_survives_the_fresh_read(db_engine, redis_client, cleanup_identities):
+    """absorb_cookies re-reads the row from the database; the device id the
+    same request remembered a moment earlier must be flushed, not refreshed
+    away."""
+    pool = IdentityPool(Cipher(SECRET))
+    async with session_scope() as session:
+        identity_id = await pool.add(
+            session,
+            platform=Platform.TIKTOK,
+            cookies={"odin_tt": "old"},
+            fingerprint=Fingerprint(browser_family=BrowserFamily.CHROME, browser_major=146),
+            source=IdentitySource.MINTED,
+        )
+    cleanup_identities.append(identity_id)
+
+    async with session_scope() as request:
+        await pool.load(request, str(identity_id))
+        await pool.remember_device_id(request, str(identity_id), "7311111111111111111")
+        assert await pool.absorb_cookies(request, str(identity_id), {"odin_tt": "new"}) == (
+            "odin_tt",
+        )
+        await request.commit()
+
+    async with session_scope() as session:
+        loaded = await pool.load(session, str(identity_id))
+    assert loaded is not None
+    assert loaded.fingerprint.device_id == "7311111111111111111"
+    assert loaded.cookies == {"odin_tt": "new"}

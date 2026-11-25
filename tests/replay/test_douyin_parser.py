@@ -8,13 +8,16 @@ while the parser silently drops half the payload, which is the exact failure
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
 from dtk.core.errors import (
     ErrorCode,
+    InvalidParam,
     UnsupportedContent,
     UpstreamChanged,
     UpstreamRiskControl,
@@ -32,6 +35,7 @@ ALBUM_ID = "7000000000000000002"
 DELETED_ID = "7000000000000000003"
 PRIVATE_ID = "7000000000000000004"
 LONG_ID = "7000000000000000005"
+LIVE_ID = "7000000000000000006"
 
 AVATAR = (
     "https://p3-pc-sign.example-cdn.invalid/aweme/1080x1080/douyin-avatar/synthetic-author-01.jpeg"
@@ -68,6 +72,7 @@ def test_content_model_has_no_unasserted_fields() -> None:
         "music",
         "tags",
         "location",
+        "parts",
         "fetched_at",
         "raw",
     }
@@ -93,6 +98,7 @@ def test_video_normal_every_field() -> None:
     assert content.is_private is False
     assert content.tags == ["sunrise", "harbour"]
     assert content.location == "Synthetic Harbour Lookout"
+    assert content.parts == []
     assert content.fetched_at == FETCHED_AT
     assert content.raw == payload["aweme_detail"]
 
@@ -149,6 +155,9 @@ def test_video_normal_every_field() -> None:
     assert media.video.format == "mp4"
     assert media.video.size_bytes == 4183220
     assert media.video.watermark is False
+    # douyinvod.com answers 403 without it (#829), and a caller has to know.
+    assert media.access.referer == "https://www.douyin.com/"
+    assert media.access.session_bound is False
     assert media.video.bitrate is None
 
     assert [(s.bitrate, s.width, s.watermark) for s in media.streams] == [
@@ -194,6 +203,87 @@ def test_image_album() -> None:
     assert len(content.media.covers) == 3
     assert content.tags == ["filmphotography", "market"]
     assert content.location is None
+
+
+def test_a_live_photo_slide_carries_its_clip() -> None:
+    """#792: the clip behind each live photo was reachable only through
+    ``include_raw``, which multiplies the response for one field.
+
+    The fixture mixes two live slides around a still, because the clip hangs
+    off the slide and not the post: the still in the middle keeps ``None``.
+    """
+    content = parser.parse_content(fixture("video_live_photo"), fetched_at=FETCHED_AT)
+
+    assert content.kind is ContentKind.IMAGE_ALBUM
+    assert content.web_url == f"https://www.douyin.com/note/{LIVE_ID}"
+    # The post-level `video` of a post of slides plays its music. It is not a
+    # clip and must not turn the album into a video.
+    assert content.media.video is None
+    assert content.media.streams == []
+    assert content.duration_ms is None
+
+    first, still, third = content.media.images
+    assert first.video is not None
+    clip = "tos-cn-ve-15/synthetic-live-clip-1/?a=6383"
+    assert first.video.url == f"https://v5-dy-o.example-cdn.invalid/video/tos/cn/{clip}"
+    assert first.video.urls == [
+        f"https://v5-dy-o.example-cdn.invalid/video/tos/cn/{clip}",
+        f"https://v3-dy-o.example-cdn.invalid/video/tos/cn/{clip}",
+        "https://www.example-cdn.invalid/aweme/v1/play/?video_id=v0300fg10000synthetic000live1",
+    ]
+    assert (first.video.width, first.video.height) == (720, 1280)
+    assert first.video.size_bytes == 620001
+    assert first.video.watermark is False
+    # The still is untouched beside it: its own picture at its own size.
+    assert first.url.endswith("synthetic-live-1~tplv-dy-aweme-images:q75.webp")
+    assert (first.width, first.height) == (1080, 1920)
+
+    assert still.video is None
+    assert still.url.endswith("synthetic-live-2~tplv-dy-aweme-images:q75.webp")
+    assert third.video is not None
+    assert "synthetic-live-clip-3" in third.video.url
+
+
+def test_an_album_of_stills_has_no_clips() -> None:
+    content = parser.parse_content(fixture("video_image_album"), fetched_at=FETCHED_AT)
+    assert [image.video for image in content.media.images] == [None, None, None]
+
+
+@pytest.mark.parametrize(
+    ("change", "path"),
+    [
+        (lambda p: without(p, "aweme_detail.images[2].video"), "aweme_detail.images[2].video"),
+        (lambda p: nulled(p, "aweme_detail.images[2].video"), "aweme_detail.images[2].video"),
+        (
+            lambda p: without(p, "aweme_detail.images[2].video.play_addr"),
+            "aweme_detail.images[2].video.play_addr",
+        ),
+        (
+            lambda p: nulled(p, "aweme_detail.images[2].video.play_addr.url_list"),
+            "aweme_detail.images[2].video.play_addr.url_list",
+        ),
+    ],
+)
+def test_a_live_slide_without_its_clip_raises(
+    change: Callable[[dict[str, Any]], dict[str, Any]], path: str
+) -> None:
+    """A slide that says it is live and has no clip is a changed shape.
+
+    Returning the still alone is the half answer #792 was about, and it is
+    the kind that goes unnoticed: the album still parses, it just stops moving.
+    """
+    with pytest.raises(UpstreamChanged) as excinfo:
+        parser.parse_content(change(fixture("video_live_photo")), fetched_at=FETCHED_AT)
+    assert excinfo.value.path == path
+
+
+def test_a_private_live_album_parses_without_its_clips() -> None:
+    """Restricted posts lose their media, clips included, and that is no change."""
+    payload = without(fixture("video_live_photo"), "aweme_detail.images[0].video")
+    payload["aweme_detail"]["status"]["private_status"] = 1
+    content = parser.parse_content(payload, fetched_at=FETCHED_AT)
+    assert content.is_private is True
+    assert content.media.images[0].video is None
 
 
 def test_deleted_video_parses_instead_of_raising() -> None:
@@ -574,6 +664,34 @@ def test_a_null_item_in_the_post_list_is_reported_not_skipped() -> None:
     assert excinfo.value.path == "aweme_list[1]"
 
 
+def test_a_post_with_no_visible_comments_is_an_empty_page() -> None:
+    """Measured 2026-11-02 on a post its author had made visible to themselves
+    only: the detail answered `filter_reason: status_audit_self_see`, the
+    comment list this. It was read as a changed schema - a 502 the demo's users
+    retried eleven times on one post."""
+    page = parser.parse_comments(
+        {
+            "status_code": 0,
+            "comments": None,
+            "has_more": 0,
+            "extra": {"now": 1793601868000, "fatal_item_ids": None, "scenes": None},
+            "log_pb": {"impr_id": "202611021444287A4FE48558C358000B6C"},
+            "comment_insert_bars": None,
+        }
+    )
+    assert page.items == []
+    assert page.has_more is False
+    assert page.cursor is None
+
+
+def test_no_comment_list_while_claiming_more_is_still_a_changed_schema() -> None:
+    """Only the empty shape is relaxed. A page that says there is more and
+    carries nothing would page for ever on nothing."""
+    with pytest.raises(UpstreamChanged) as excinfo:
+        parser.parse_comments({"status_code": 0, "comments": None, "has_more": 1, "cursor": 5})
+    assert excinfo.value.path == "comments"
+
+
 def test_a_null_comment_is_reported_not_skipped() -> None:
     payload = fixture("comments_with_replies")
     payload["comments"].append(None)
@@ -797,6 +915,46 @@ def test_an_unmeasured_status_is_unknown_not_private() -> None:
     assert [c.is_public for c in page.items] == [None, None]
 
 
+def test_an_account_with_no_folders_is_an_empty_page() -> None:
+    """The answer from #790, verbatim apart from the log ids.
+
+    An account that never made a folder gets `collects_list: null` beside
+    `status_code: 0` and `total_number: 0`. That is a complete, successful
+    answer, and it was reported to the caller as UPSTREAM_CHANGED - telling
+    them Douyin had changed its schema when the account was simply empty.
+    """
+    page = ADAPTER.parse_author_collections(
+        {
+            "collects_list": None,
+            "cursor": 0,
+            "extra": {"fatal_item_ids": [], "logid": "redacted", "now": 1792222479000},
+            "has_more": False,
+            "log_pb": {"impr_id": "redacted"},
+            "status_code": 0,
+            "total_number": 0,
+        }
+    )
+
+    assert page.items == []
+    assert page.has_more is False
+    assert page.cursor is None
+
+
+def test_an_absent_folder_list_is_an_empty_page_too() -> None:
+    page = ADAPTER.parse_author_collections({"has_more": False, "status_code": 0})
+    assert page.items == []
+
+
+def test_a_present_folder_list_is_still_strict() -> None:
+    """Tolerating null must not tolerate a malformed folder."""
+    payload = deepcopy(_COLLECTS_LIST)
+    del payload["collects_list"][0]["collects_id_str"]
+    del payload["collects_list"][0]["collects_id"]
+    with pytest.raises(UpstreamChanged) as excinfo:
+        ADAPTER.parse_author_collections(payload)
+    assert excinfo.value.path.startswith("collects_list[0].")
+
+
 def test_build_collection_posts_request_uses_douyins_spelling() -> None:
     """`collects_id`, with the s. The canonical name is collection_id."""
     spec = ADAPTER.build_request(endpoints.COLLECTION_POSTS, collection_id="6910000000000000202")
@@ -829,6 +987,88 @@ def test_collection_posts_pages_by_cursor_not_max_cursor() -> None:
 
     with pytest.raises(UpstreamChanged):
         ADAPTER.parse_author_posts(payload, fetched_at=FETCHED_AT)
+
+
+# --------------------------------------------------------------------------
+# Bookmarks: POST listcollection (#790)
+# --------------------------------------------------------------------------
+
+
+def _listcollection(*, cursor: int, has_more: int) -> dict:
+    """The envelope measured on POST listcollection, 2026-10-17, ids redacted.
+
+    The items are this suite's own synthetic posts. The live answer was one
+    account's bookmarks, which are nobody else's business and do not belong in
+    a fixture; the envelope is what this endpoint adds, and it is all here.
+    """
+    return {
+        "aweme_list": fixture("user_posts_page1")["aweme_list"],
+        "cursor": cursor,
+        "extra": {"fatal_item_ids": [], "logid": "redacted", "now": 1792303188000},
+        "has_more": has_more,
+        "invalid_item_count": 0,
+        "invalid_item_text": "",
+        "is_clear_invalid_item": 0,
+        "log_pb": {"impr_id": "redacted"},
+        "sec_uid": "redacted",
+        "status_code": 0,
+        "uid": "redacted",
+    }
+
+
+def test_build_author_bookmarks_request_is_a_form_post() -> None:
+    """POST, with the page in the body and nowhere else.
+
+    A GET is answered 404 "Unsupported path(Janus)", which is how this read as
+    a retired endpoint for a while. The body is what the page sends, byte for
+    byte and in its order, because a_bogus hashes it - checked against two
+    captured signatures from the page itself.
+    """
+    spec = ADAPTER.build_request(endpoints.AUTHOR_BOOKMARKS, count=10, cursor="1792302641724339")
+
+    assert spec["method"] == "POST"
+    assert spec["url"] == "https://www.douyin.com/aweme/v1/web/aweme/listcollection/"
+    assert spec["body"] == b"count=10&cursor=1792302641724339"
+    assert spec["headers"]["Content-Type"] == "application/x-www-form-urlencoded; charset=UTF-8"
+    assert "count" not in spec["params"]
+    assert "cursor" not in spec["params"]
+    assert spec["params"]["aid"] == "6383"
+    # Measured: a POST with neither a Referer nor an Origin got 7 bytes back.
+    assert spec["headers"]["Referer"].startswith("https://www.douyin.com/user/self")
+    assert spec["headers"]["Origin"] == "https://www.douyin.com"
+
+
+def test_build_author_bookmarks_request_defaults_to_the_first_page() -> None:
+    spec = ADAPTER.build_request(endpoints.AUTHOR_BOOKMARKS)
+    assert spec["body"] == b"count=20&cursor=0"
+
+
+def test_author_bookmarks_cannot_be_pointed_at_anyone() -> None:
+    """The endpoint answers about the session; an author would be ignored."""
+    with pytest.raises(InvalidParam):
+        ADAPTER.build_request(endpoints.AUTHOR_BOOKMARKS, sec_user_id=SEC_UID)
+
+
+def test_bookmarks_page_by_cursor_through_the_registry() -> None:
+    """Through the registry, because that is where the parser is chosen.
+
+    Bookmarks went to `parse_author_posts` while only TikTok had them, and on
+    Douyin that parser demands a `max_cursor` this envelope does not have - so
+    every account with more than one page would have read as UPSTREAM_CHANGED.
+    Measured on a 16-post account: 10, then 6 with `has_more: 0, cursor: 0`.
+    """
+    from dtk.worker.registry import ENDPOINTS
+
+    definition = ENDPOINTS["douyin.author_bookmarks"]
+
+    first = definition.parse(_listcollection(cursor=1792302641724339, has_more=1))
+    assert first.has_more is True
+    assert first.cursor == "1792302641724339"
+    assert [item.platform for item in first.items] == [Platform.DOUYIN] * 2
+
+    last = definition.parse(_listcollection(cursor=0, has_more=0))
+    assert last.has_more is False
+    assert last.cursor is None
 
 
 def test_douyin_has_no_collection_detail() -> None:

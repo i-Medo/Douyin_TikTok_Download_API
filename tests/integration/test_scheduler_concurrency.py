@@ -12,8 +12,8 @@ import asyncio
 
 import pytest
 
-from dtk.core.errors import IdentityPoolExhausted, InvalidParam
-from dtk.core.types import IdentityState, Outcome, Platform
+from dtk.core.errors import IdentityLoginRequired, IdentityPoolExhausted, InvalidParam
+from dtk.core.types import IdentityState, LoginNeed, Outcome, Platform
 from dtk.scheduler import circuit
 from dtk.scheduler.health import HealthInput
 from dtk.scheduler.leases import release, try_acquire
@@ -50,13 +50,17 @@ class ListSource:
         return [c for c in self._candidates if c.platform == platform and c.state == state]
 
 
-def make_candidate(i, *, state=IdentityState.ACTIVE, last_used=None, fails=0):
+def make_candidate(
+    i, *, state=IdentityState.ACTIVE, last_used=None, fails=0, rotation=None, signed_in=False
+):
     return Candidate(
         identity_id=f"identity-{i}",
         platform=Platform.DOUYIN,
         state=state,
         last_used_at=last_used,
         health=HealthInput(20, 20, 60, 0, fails),
+        rotation_endpoints=rotation,
+        authenticated=signed_in,
     )
 
 
@@ -355,3 +359,382 @@ async def test_a_pin_of_the_wrong_platform_is_not_reachable(redis_client):
 
     with pytest.raises(InvalidParam):
         await sched.acquire("douyin.author_posts", Platform.DOUYIN, identity_id="identity-tt")
+
+
+# --------------------------------------------------------------------------
+# Keeping an identity out of rotation (#789)
+#
+# An account imported to read one thing is put at risk by every other request
+# rotation hands it. Reserving it has to keep unpinned traffic off it without
+# ever refusing the requests that name it - that is the whole point of keeping
+# it.
+# --------------------------------------------------------------------------
+
+
+async def test_unpinned_traffic_never_reaches_a_reserved_identity(redis_client):
+    cfg = SchedulerConfig()
+    reserved = make_candidate(1, rotation=())
+    ordinary = make_candidate(2, fails=4)
+    sched = Scheduler(ListSource([reserved, ordinary]), cfg, clock=AdvancingClock(step=0.0))
+
+    for _ in range(3):
+        lease = await sched.acquire("douyin.author_posts", Platform.DOUYIN)
+        assert lease.identity_id == "identity-2"
+        await sched.release(lease, Outcome.OK)
+
+
+async def test_a_reserved_identity_still_serves_the_request_that_names_it(redis_client):
+    cfg = SchedulerConfig()
+    sched = Scheduler(
+        ListSource([make_candidate(1, rotation=()), make_candidate(2)]),
+        cfg,
+        clock=AdvancingClock(step=0.0),
+    )
+
+    lease = await sched.acquire("douyin.author_posts", Platform.DOUYIN, identity_id="identity-1")
+
+    assert lease.identity_id == "identity-1"
+
+
+async def test_an_endpoint_list_puts_the_identity_back_for_those_endpoints_only(redis_client):
+    cfg = SchedulerConfig(max_wait_seconds=0.0)
+    listed = make_candidate(1, rotation=("douyin.author_posts",))
+    sched = Scheduler(ListSource([listed]), cfg, clock=AdvancingClock(step=0.0))
+
+    lease = await sched.acquire("douyin.author_posts", Platform.DOUYIN)
+    assert lease.identity_id == "identity-1"
+    await sched.release(lease, Outcome.OK)
+
+    with pytest.raises(IdentityPoolExhausted):
+        await sched.acquire("douyin.content_detail", Platform.DOUYIN)
+
+
+async def test_a_reserved_active_identity_does_not_keep_degraded_ones_idle(redis_client):
+    """The degraded fallback is for "nothing healthy may serve this", and a
+    healthy identity that is reserved may not."""
+    cfg = SchedulerConfig()
+    sched = Scheduler(
+        ListSource(
+            [make_candidate(1, rotation=()), make_candidate(9, state=IdentityState.DEGRADED)]
+        ),
+        cfg,
+        clock=AdvancingClock(step=0.0),
+    )
+
+    lease = await sched.acquire("douyin.content_detail", Platform.DOUYIN)
+
+    assert lease.identity_id == "identity-9"
+
+
+async def test_exhaustion_says_the_rest_are_reserved(redis_client):
+    """Otherwise "no identity" sits beside a pool page full of active ones.
+
+    In ``details``, not only the message: the API replaces the message with a
+    localized generic one, so a count left in the text never reaches a caller.
+    """
+    sched = Scheduler(
+        ListSource([make_candidate(1, rotation=()), make_candidate(2, rotation=())]),
+        SchedulerConfig(max_wait_seconds=0.0),
+        clock=AdvancingClock(step=0.0),
+    )
+
+    with pytest.raises(IdentityPoolExhausted) as exc:
+        await sched.acquire("douyin.content_detail", Platform.DOUYIN)
+
+    assert "2 more are reserved" in str(exc.value)
+    assert exc.value.details["reserved"] == 2
+
+
+async def test_exhaustion_without_reserved_identities_does_not_mention_them(redis_client):
+    sched = Scheduler(
+        ListSource([]), SchedulerConfig(max_wait_seconds=0.0), clock=AdvancingClock(step=0.0)
+    )
+
+    with pytest.raises(IdentityPoolExhausted) as exc:
+        await sched.acquire("douyin.content_detail", Platform.DOUYIN)
+
+    assert "reserved" not in exc.value.details
+
+
+# --------------------------------------------------------------------------
+# signed-in identities (#782, #783)
+#
+# Douyin pages an author's posts for signed-in accounts only and leaves the
+# newest ones out of a guest's first page. Rotation used to ignore whether an
+# identity was signed in, so an imported login sat idle while guests were sent
+# to be refused.
+# --------------------------------------------------------------------------
+
+POSTS = "douyin.author_posts"
+
+
+async def test_a_page_that_needs_a_login_never_reaches_a_guest(redis_client):
+    """The guest is the healthier, never-used candidate, and still loses."""
+    sched = Scheduler(
+        ListSource([make_candidate(1), make_candidate(2, signed_in=True, last_used=NOW, fails=2)]),
+        SchedulerConfig(),
+        clock=AdvancingClock(step=0.0),
+    )
+
+    for _ in range(3):
+        lease = await sched.acquire(POSTS, Platform.DOUYIN, login=LoginNeed.REQUIRED)
+        assert lease.identity_id == "identity-2"
+        await sched.release(lease, Outcome.OK)
+
+
+async def test_with_no_login_at_all_the_refusal_says_so_at_once(redis_client):
+    """Not IDENTITY_POOL_EXHAUSTED, and not after the wait: no mint produces a
+    signed-in identity, so waiting out max_wait_seconds only delays it."""
+    sched = Scheduler(
+        ListSource([make_candidate(1), make_candidate(2)]),
+        SchedulerConfig(max_wait_seconds=30.0),
+        clock=AdvancingClock(),
+    )
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    with pytest.raises(IdentityLoginRequired) as exc:
+        await sched.acquire(POSTS, Platform.DOUYIN, login=LoginNeed.REQUIRED)
+
+    assert loop.time() - started < 1.0
+    assert exc.value.details["reject_reason"] == "no_login"
+    assert exc.value.details["cooling"] == 0
+
+
+async def test_the_refusal_counts_signed_in_identities_that_are_cooling(redis_client):
+    """ "Import one" is the wrong advice to someone whose login is resting."""
+    sched = Scheduler(
+        ListSource(
+            [
+                make_candidate(1),
+                make_candidate(2, signed_in=True, state=IdentityState.COOLING),
+                make_candidate(3, state=IdentityState.COOLING),
+            ]
+        ),
+        SchedulerConfig(),
+        clock=AdvancingClock(step=0.0),
+    )
+
+    with pytest.raises(IdentityLoginRequired) as exc:
+        await sched.acquire(POSTS, Platform.DOUYIN, login=LoginNeed.REQUIRED)
+
+    assert exc.value.details["cooling"] == 1
+
+
+async def test_a_login_kept_out_of_rotation_is_not_used_for_paging(redis_client):
+    sched = Scheduler(
+        ListSource([make_candidate(1, signed_in=True, rotation=())]),
+        SchedulerConfig(),
+        clock=AdvancingClock(step=0.0),
+    )
+
+    with pytest.raises(IdentityLoginRequired) as exc:
+        await sched.acquire(POSTS, Platform.DOUYIN, login=LoginNeed.REQUIRED)
+
+    assert exc.value.details["reserved"] == 1
+
+
+async def test_a_login_kept_for_author_posts_only_serves_them(redis_client):
+    """The setting the docs recommend for a logged-in account."""
+    sched = Scheduler(
+        ListSource([make_candidate(1, signed_in=True, rotation=(POSTS,)), make_candidate(2)]),
+        SchedulerConfig(),
+        clock=AdvancingClock(step=0.0),
+    )
+
+    paged = await sched.acquire(POSTS, Platform.DOUYIN, login=LoginNeed.REQUIRED)
+    assert paged.identity_id == "identity-1"
+    await sched.release(paged, Outcome.OK)
+
+    other = await sched.acquire("douyin.content_detail", Platform.DOUYIN)
+    assert other.identity_id == "identity-2"
+
+
+async def test_a_first_page_goes_to_a_login_when_there_is_one(redis_client):
+    sched = Scheduler(
+        ListSource([make_candidate(1), make_candidate(2, signed_in=True, last_used=NOW)]),
+        SchedulerConfig(),
+        clock=AdvancingClock(step=0.0),
+    )
+
+    lease = await sched.acquire(POSTS, Platform.DOUYIN, login=LoginNeed.PREFERRED)
+
+    assert lease.identity_id == "identity-2"
+
+
+async def test_a_degraded_login_beats_an_active_guest(redis_client):
+    """A degraded account still sees the newest posts; a guest never does."""
+    sched = Scheduler(
+        ListSource(
+            [make_candidate(1), make_candidate(2, signed_in=True, state=IdentityState.DEGRADED)]
+        ),
+        SchedulerConfig(),
+        clock=AdvancingClock(step=0.0),
+    )
+
+    lease = await sched.acquire(POSTS, Platform.DOUYIN, login=LoginNeed.PREFERRED)
+
+    assert lease.identity_id == "identity-2"
+
+
+async def test_a_first_page_falls_back_to_a_guest_when_there_is_no_login(redis_client):
+    sched = Scheduler(
+        ListSource([make_candidate(1)]), SchedulerConfig(), clock=AdvancingClock(step=0.0)
+    )
+
+    lease = await sched.acquire(POSTS, Platform.DOUYIN, login=LoginNeed.PREFERRED)
+
+    assert lease.identity_id == "identity-1"
+
+
+async def test_a_busy_login_is_waited_for_not_swapped_for_a_guest(redis_client):
+    """Falling back whenever the login is mid-request would hand most first
+    pages to guests on any instance with traffic - the bug, intermittently."""
+    login = make_candidate(2, signed_in=True)
+    sched = Scheduler(
+        ListSource([make_candidate(1), login]),
+        SchedulerConfig(max_wait_seconds=0.2, poll_interval_seconds=0.01),
+        # Advancing, so the wait has a deadline: frozen, the second acquire
+        # waited out the 120 s in-flight lock and then got the login.
+        clock=AdvancingClock(),
+    )
+    held = await sched.acquire(POSTS, Platform.DOUYIN, login=LoginNeed.REQUIRED)
+    assert held.identity_id == "identity-2"
+
+    with pytest.raises(IdentityPoolExhausted):
+        await sched.acquire(POSTS, Platform.DOUYIN, login=LoginNeed.PREFERRED)
+
+
+async def test_a_pin_overrides_the_login_need(redis_client):
+    """Naming a guest is the caller deciding which session answers."""
+    sched = Scheduler(
+        ListSource([make_candidate(1), make_candidate(2, signed_in=True)]),
+        SchedulerConfig(),
+        clock=AdvancingClock(step=0.0),
+    )
+
+    lease = await sched.acquire(
+        POSTS, Platform.DOUYIN, identity_id="identity-1", login=LoginNeed.REQUIRED
+    )
+
+    assert lease.identity_id == "identity-1"
+
+
+async def test_ordinary_endpoints_still_ignore_the_login(redis_client):
+    """Comments page fine for a guest; routing them onto the operator's few
+    logged-in accounts would wear those out for nothing."""
+    sched = Scheduler(
+        ListSource([make_candidate(1), make_candidate(2, signed_in=True, last_used=NOW)]),
+        SchedulerConfig(),
+        clock=AdvancingClock(step=0.0),
+    )
+
+    lease = await sched.acquire("douyin.comments", Platform.DOUYIN)
+
+    assert lease.identity_id == "identity-1"
+
+
+def guests_first(*platforms: Platform):
+    """The worker's ``pool.<platform>.guests_first``, on for these platforms."""
+    return lambda platform: platform in platforms
+
+
+async def test_guests_first_answers_an_ordinary_endpoint_with_a_guest(redis_client):
+    """The login is the least recently used and would win on recency alone."""
+    sched = Scheduler(
+        ListSource([make_candidate(1, signed_in=True), make_candidate(2, last_used=NOW)]),
+        SchedulerConfig(),
+        clock=AdvancingClock(step=0.0),
+        guests_first=guests_first(Platform.DOUYIN),
+    )
+
+    lease = await sched.acquire("douyin.comments", Platform.DOUYIN)
+
+    assert lease.identity_id == "identity-2"
+
+
+async def test_without_guests_first_a_login_shares_ordinary_endpoints(redis_client):
+    """The setting off is the old behaviour: recency decides, login or not."""
+    sched = Scheduler(
+        ListSource([make_candidate(1, signed_in=True), make_candidate(2, last_used=NOW)]),
+        SchedulerConfig(),
+        clock=AdvancingClock(step=0.0),
+        guests_first=guests_first(),
+    )
+
+    lease = await sched.acquire("douyin.comments", Platform.DOUYIN)
+
+    assert lease.identity_id == "identity-1"
+
+
+async def test_guests_first_still_reaches_a_login_when_no_guest_can(redis_client):
+    """A preference, never a refusal: the pool could serve this, so it does."""
+    sched = Scheduler(
+        ListSource([make_candidate(1, signed_in=True)]),
+        SchedulerConfig(),
+        clock=AdvancingClock(step=0.0),
+        guests_first=guests_first(Platform.DOUYIN),
+    )
+
+    lease = await sched.acquire("douyin.comments", Platform.DOUYIN)
+
+    assert lease.identity_id == "identity-1"
+
+
+async def test_guests_first_lets_a_busy_guest_give_way_to_an_idle_login(redis_client):
+    """The first version returned the guests alone, so with every guest
+    mid-request a call waited out its deadline beside a login doing nothing."""
+    sched = Scheduler(
+        ListSource([make_candidate(1, signed_in=True), make_candidate(2)]),
+        SchedulerConfig(max_wait_seconds=0.2, poll_interval_seconds=0.01),
+        clock=AdvancingClock(),
+        guests_first=guests_first(Platform.DOUYIN),
+    )
+    held = await sched.acquire("douyin.comments", Platform.DOUYIN)
+    assert held.identity_id == "identity-2"
+
+    lease = await sched.acquire("douyin.comments", Platform.DOUYIN)
+
+    assert lease.identity_id == "identity-1"
+
+
+async def test_guests_first_puts_a_degraded_guest_ahead_of_a_login(redis_client):
+    """A degraded guest failing costs a mint; a login failing costs an account."""
+    sched = Scheduler(
+        ListSource(
+            [make_candidate(1, signed_in=True), make_candidate(2, state=IdentityState.DEGRADED)]
+        ),
+        SchedulerConfig(),
+        clock=AdvancingClock(step=0.0),
+        guests_first=guests_first(Platform.DOUYIN),
+    )
+
+    lease = await sched.acquire("douyin.comments", Platform.DOUYIN)
+
+    assert lease.identity_id == "identity-2"
+
+
+async def test_guests_first_leaves_an_endpoint_that_wants_a_login_alone(redis_client):
+    sched = Scheduler(
+        ListSource([make_candidate(1), make_candidate(2, signed_in=True, last_used=NOW)]),
+        SchedulerConfig(),
+        clock=AdvancingClock(step=0.0),
+        guests_first=guests_first(Platform.DOUYIN),
+    )
+
+    lease = await sched.acquire(POSTS, Platform.DOUYIN, login=LoginNeed.PREFERRED)
+
+    assert lease.identity_id == "identity-2"
+
+
+async def test_guests_first_is_decided_per_platform(redis_client):
+    sched = Scheduler(
+        ListSource([make_candidate(1, signed_in=True), make_candidate(2, last_used=NOW)]),
+        SchedulerConfig(),
+        clock=AdvancingClock(step=0.0),
+        guests_first=guests_first(Platform.TIKTOK),
+    )
+
+    lease = await sched.acquire("douyin.comments", Platform.DOUYIN)
+
+    assert lease.identity_id == "identity-1"
